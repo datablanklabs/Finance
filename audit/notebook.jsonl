@@ -1,0 +1,9 @@
+{"asof": "2026-07-27 00:00:00", "dry_run": true, "equity": 25000.0, "event": "plan_received", "host": "iMac", "n_intents": 5, "pid": 95454, "plan_id": "6ec5169c94f65b32", "strategy": "xsmom_252_5_5", "ts": "2026-07-27T15:59:23.424890+00:00", "turnover": 0.798}
+{"account": "MOCK-AGENTIC-1", "cash": 25000.0, "equity": 25000.0, "event": "account_read", "host": "iMac", "is_agentic": true, "n_positions": 0, "pid": 95454, "plan_id": "6ec5169c94f65b32", "ts": "2026-07-27T15:59:23.431350+00:00"}
+{"event": "preflight_passed", "host": "iMac", "notes": "equity drift 0.00%; plan notional 19,951; turnover 79.8%", "pid": 95454, "plan_id": "6ec5169c94f65b32", "ts": "2026-07-27T15:59:23.435874+00:00"}
+{"event": "intent_blocked", "host": "iMac", "intent": "XLE:buy", "notional": 3990.15, "pid": 95454, "plan_id": "6ec5169c94f65b32", "reason": "order_notional", "ts": "2026-07-27T15:59:23.441123+00:00"}
+{"event": "intent_blocked", "host": "iMac", "intent": "XLK:buy", "notional": 3990.15, "pid": 95454, "plan_id": "6ec5169c94f65b32", "reason": "order_notional", "ts": "2026-07-27T15:59:23.450541+00:00"}
+{"event": "intent_blocked", "host": "iMac", "intent": "IWM:buy", "notional": 3990.15, "pid": 95454, "plan_id": "6ec5169c94f65b32", "reason": "order_notional", "ts": "2026-07-27T15:59:23.452270+00:00"}
+{"event": "intent_blocked", "host": "iMac", "intent": "EEM:buy", "notional": 3990.15, "pid": 95454, "plan_id": "6ec5169c94f65b32", "reason": "order_notional", "ts": "2026-07-27T15:59:23.461058+00:00"}
+{"event": "intent_blocked", "host": "iMac", "intent": "DBC:buy", "notional": 3990.15, "pid": 95454, "plan_id": "6ec5169c94f65b32", "reason": "order_notional", "ts": "2026-07-27T15:59:23.464274+00:00"}
+{"breached": "DBC, IWM, XLK, EEM, XLE", "event": "reconciled", "host": "iMac", "max_drift": 0.1596, "n_breaches": 5, "pid": 95454, "plan_id": "6ec5169c94f65b32", "ts": "2026-07-27T15:59:23.470309+00:00"}

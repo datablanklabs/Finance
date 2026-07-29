@@ -1,0 +1,453 @@
+"""Validation suite. The null test is the one that matters."""
+
+import numpy as np
+import pandas as pd
+
+from qbt import (
+    Backtester, CalendarSeasonality, Composite, CostModel,
+    CrossSectionalMomentum, DayTradeLedger, EqualWeightBuyHold,
+    ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
+    MultiFactorCrossSectional, PairsTrading, PortfolioState, RiskGate,
+    RiskParityAllocation, ShortHorizonReversal, SyntheticRepository,
+    TimeSeriesMomentum, TrendFilter, compare, ic_grid, ic_summary,
+    information_coefficient, expected_max_sharpe, forward_returns,
+    rebalance_dates, return_autocorrelation, trailing_signal,
+    walk_forward_splits, ParameterSweep, sharpe_haircut,
+)
+
+FAILS = []
+
+
+def check(name, cond, detail=""):
+    status = "PASS" if cond else "FAIL"
+    if not cond:
+        FAILS.append(name)
+    print(f"[{status}] {name}" + (f"  -- {detail}" if detail else ""))
+
+
+print("=" * 72)
+print("1. Panel and look-ahead firewall")
+print("=" * 72)
+
+repo = SyntheticRepository(n_symbols=30, seed=11)
+panel = repo.fetch(start="2015-01-01", end="2024-12-31")
+print(panel.describe())
+
+mid = panel.dates[1000]
+view = panel.as_of(mid)
+check("as_of truncates at date", view.last_date() == mid,
+      f"{view.last_date().date()}")
+check("as_of drops all future bars", len(view) == 1001, f"len={len(view)}")
+check("as_of preserves symbols", view.symbols == panel.symbols)
+
+
+class PeekingStrategy:
+    """Tries to read tomorrow. Should be unable to."""
+    name = "peeker"
+
+    def __init__(self):
+        self.max_seen = None
+
+    @property
+    def min_history(self):
+        return 10
+
+    def target_weights(self, view):
+        last = view.last_date()
+        self.max_seen = last if self.max_seen is None else max(self.max_seen, last)
+        return pd.Series(1.0 / len(view.symbols), index=view.symbols)
+
+
+peeker = PeekingStrategy()
+bt = Backtester(panel=panel, strategy=peeker, risk_gate=None,
+                rebalance="M", initial_equity=25_000)
+res = bt.run()
+last_decision = res.targets.index.max()
+check("strategy never sees beyond its decision bar",
+      peeker.max_seen == last_decision,
+      f"max_seen={peeker.max_seen.date()} last_decision={last_decision.date()}")
+
+print()
+print("=" * 72)
+print("2. Null test: structureless data must produce no edge")
+print("=" * 72)
+
+null_repo = SyntheticRepository(
+    n_symbols=40, seed=3, mu_persistence=0.0, mu_scale=0.0,
+    reversal_theta=0.0, drift=0.0,
+)
+null_panel = null_repo.fetch(start="2010-01-01", end="2024-12-31")
+
+null_results = {}
+for strat, rebal in [
+    (CrossSectionalMomentum(lookback=126, top_n=10), "M"),
+    (ShortHorizonReversal(lookback=5, top_n=5), "M"),
+    (PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8), "M"),
+    (MultiFactorCrossSectional(top_n=10), "M"),
+    (RiskParityAllocation(cov_lookback=126, max_names=20), "M"),
+    (CalendarSeasonality(pre_days=3, post_days=3), "D"),
+]:
+    r = Backtester(
+        panel=null_panel, strategy=strat,
+        risk_gate=RiskGate(target_vol=0.12, max_drawdown=None),
+        cost_model=CostModel(slippage_bps=0.0, sell_fee_bps=0.0),
+        rebalance=rebal, initial_equity=100_000,
+    ).run()
+    null_results[strat.name] = r
+    s = r.summary()
+    # t-stat of the mean daily return
+    rr = r.returns[r.returns != 0]
+    t = rr.mean() / rr.std() * np.sqrt(len(rr)) if len(rr) > 2 else np.nan
+    print(f"  {strat.name:26s} sharpe={s['sharpe']:+.2f}  t={t:+.2f}  "
+          f"cagr={s['cagr']:+.2%}")
+    check(f"null: |sharpe| < 0.6 for {strat.name}", abs(s["sharpe"]) < 0.6,
+          f"sharpe={s['sharpe']:.2f}")
+    check(f"null: |t| < 2.6 for {strat.name}", abs(t) < 2.6, f"t={t:.2f}")
+
+print()
+print("=" * 72)
+print("3. Engine mechanics")
+print("=" * 72)
+
+bh = Backtester(
+    panel=panel, strategy=EqualWeightBuyHold(), risk_gate=None,
+    cost_model=CostModel(slippage_bps=0.0, sell_fee_bps=0.0, commission_bps=0.0),
+    execution=ExecutionConfig(delay_bars=1, price="close"),
+    rebalance=252,  # roughly annual: buy and mostly hold
+    initial_equity=50_000,
+).run()
+check("equity starts at initial capital",
+      abs(bh.equity.iloc[0] - 50_000) < 1e-6, f"{bh.equity.iloc[0]:.2f}")
+check("buy-and-hold equity grows", bh.equity.iloc[-1] > bh.equity.iloc[0],
+      f"{bh.equity.iloc[-1]:,.0f}")
+check("no NaNs in equity curve", bh.equity.notna().all())
+check("holdings never exceed 100% gross without margin",
+      bh.exposure.max() < 1.05, f"max={bh.exposure.max():.3f}")
+
+# Costs must reduce returns, monotonically in slippage.
+sharpes = {}
+for slip in (0.0, 10.0, 50.0):
+    r = Backtester(
+        panel=panel, strategy=CrossSectionalMomentum(lookback=63, top_n=8),
+        risk_gate=RiskGate(target_vol=0.12, max_drawdown=None),
+        cost_model=CostModel(slippage_bps=slip),
+        rebalance="W", initial_equity=50_000,
+    ).run()
+    sharpes[slip] = r.summary()["cagr"]
+print("  CAGR by slippage:", {k: f"{v:.2%}" for k, v in sharpes.items()})
+check("higher slippage lowers CAGR",
+      sharpes[0.0] > sharpes[10.0] > sharpes[50.0])
+
+# Execution delay must matter, and delay=0 should flatter the strategy.
+delayed = {}
+for d in (0, 1):
+    r = Backtester(
+        panel=panel, strategy=ShortHorizonReversal(lookback=3, top_n=6, min_z=0.5),
+        risk_gate=RiskGate(target_vol=0.15, max_drawdown=None),
+        cost_model=CostModel(slippage_bps=0.0, sell_fee_bps=0.0),
+        execution=ExecutionConfig(delay_bars=d, price="close"),
+        rebalance="D", initial_equity=50_000,
+    ).run()
+    delayed[d] = r.summary()["sharpe"]
+print(f"  reversal sharpe: delay=0 -> {delayed[0]:.2f}, delay=1 -> {delayed[1]:.2f}")
+check("delay=0 inflates a same-close signal", delayed[0] > delayed[1],
+      "this is exactly the look-ahead bug the default guards against")
+
+print()
+print("=" * 72)
+print("4. Risk gate")
+print("=" * 72)
+
+gate = RiskGate(target_vol=0.10, max_weight=0.20, max_gross=1.0,
+                max_drawdown=0.15)
+r_gated = Backtester(
+    panel=panel, strategy=CrossSectionalMomentum(lookback=126, top_n=3),
+    risk_gate=gate, rebalance="M", initial_equity=50_000,
+).run()
+max_w = r_gated.targets.abs().to_numpy().max()
+check("per-name cap enforced", max_w <= 0.20 + 1e-9, f"max target weight={max_w:.4f}")
+check("gross cap enforced", r_gated.targets.abs().sum(axis=1).max() <= 1.0 + 1e-9)
+check("audit log populated", len(r_gated.audit) == len(r_gated.targets),
+      f"{len(r_gated.audit)} rows")
+check("audit records reasons",
+      r_gated.audit["notes"].astype(str).str.len().gt(0).any())
+print("  sample audit notes:")
+for note in r_gated.audit["notes"].replace("", np.nan).dropna().head(3):
+    print(f"    - {note}")
+
+# Vol targeting should compress realised vol toward the target.
+vols = {}
+for tv in (0.06, 0.12, None):
+    r = Backtester(
+        panel=panel, strategy=CrossSectionalMomentum(lookback=126, top_n=10),
+        risk_gate=RiskGate(target_vol=tv, max_drawdown=None, max_vol_scale=1.0),
+        rebalance="M", initial_equity=50_000,
+    ).run()
+    vols[tv] = r.summary()["ann_vol"]
+print("  realised ann vol by target:",
+      {str(k): f"{v:.2%}" for k, v in vols.items()})
+check("lower vol target -> lower realised vol", vols[0.06] < vols[0.12])
+
+# Drawdown breaker must be able to fire and flatten the book.
+crash = SyntheticRepository(n_symbols=20, seed=5, drift=-0.0020,
+                            mu_persistence=0.0, mu_scale=0.0).fetch(
+    start="2018-01-01", end="2022-12-31")
+r_crash = Backtester(
+    panel=crash, strategy=EqualWeightBuyHold(),
+    risk_gate=RiskGate(target_vol=None, max_drawdown=0.10, resume_at=0.95),
+    rebalance="W", initial_equity=50_000,
+).run()
+check("drawdown breaker fires in a bear market",
+      bool(r_crash.audit["halted"].any()),
+      f"halted on {int(r_crash.audit['halted'].sum())} of "
+      f"{len(r_crash.audit)} rebalances")
+check("breaker flattens the book",
+      r_crash.exposure.tail(200).min() < 0.02)
+
+print()
+print("=" * 72)
+print("5. Strategies and composition")
+print("=" * 72)
+
+strategies = [
+    EqualWeightBuyHold(),
+    CrossSectionalMomentum(lookback=126, skip=5, top_n=10),
+    CrossSectionalMomentum(lookback=126, top_n=10, weighting="rank"),
+    TimeSeriesMomentum(lookback=200),
+    ShortHorizonReversal(lookback=5, top_n=5),
+    TrendFilter(CrossSectionalMomentum(lookback=126, top_n=10), lookback=200),
+    InverseVolWeighted(CrossSectionalMomentum(lookback=126, top_n=10)),
+    Composite([
+        (CrossSectionalMomentum(lookback=126, top_n=10), 0.6),
+        (ShortHorizonReversal(lookback=5, top_n=5), 0.4),
+    ]),
+    PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8),
+    MultiFactorCrossSectional(top_n=10),
+    RiskParityAllocation(cov_lookback=126, max_names=20),
+]
+
+results = {}
+for strat in strategies:
+    r = Backtester(
+        panel=panel, strategy=strat,
+        risk_gate=RiskGate(target_vol=0.12, max_drawdown=0.25),
+        cost_model=CostModel(slippage_bps=5.0),
+        rebalance="M", initial_equity=50_000,
+    ).run()
+    results[strat.name] = r
+    check(f"{strat.name} runs and produces finite equity",
+          np.isfinite(r.equity).all() and (r.equity > 0).all())
+
+# CalendarSeasonality only expresses its logic under sub-monthly rebalancing.
+calendar = CalendarSeasonality(pre_days=3, post_days=3)
+r_cal = Backtester(
+    panel=panel, strategy=calendar, risk_gate=None,
+    cost_model=CostModel(slippage_bps=5.0),
+    rebalance="D", initial_equity=50_000,
+).run()
+results[calendar.name] = r_cal
+check(f"{calendar.name} runs and produces finite equity",
+      np.isfinite(r_cal.equity).all() and (r_cal.equity > 0).all())
+check("calendar strategy is flat most of the month",
+      0.05 < r_cal.exposure.gt(0.01).mean() < 0.5,
+      f"time invested={r_cal.exposure.gt(0.01).mean():.2%}")
+
+tbl = compare(results)
+print()
+print(tbl[["cagr", "ann_vol", "sharpe", "max_drawdown", "turnover_ann",
+           "avg_exposure", "n_trades"]].round(3).to_string())
+
+check("trend filter reduces exposure vs unfiltered",
+      results["xsmom_126_5_10+trend200"].summary()["avg_exposure"]
+      < results["xsmom_126_5_10"].summary()["avg_exposure"])
+
+# Pairs trading should be roughly dollar-neutral at every rebalance.
+pairs_strat = PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8)
+pv = panel.as_of(panel.dates[1500])
+pw = pairs_strat.target_weights(pv)
+check("pairs trading is dollar-neutral", abs(pw.sum()) < 1e-9, f"sum={pw.sum():.2e}")
+check("pairs trading gross matches configured level",
+      abs(pw.abs().sum() - pairs_strat.gross) < 1e-9 or pw.abs().sum() == 0.0,
+      f"gross={pw.abs().sum():.3f}")
+
+# Risk parity should tilt away from high-vol names, unlike equal weight.
+rp_strat = RiskParityAllocation(cov_lookback=126, max_names=20)
+rpw = rp_strat.target_weights(pv)
+held = rpw[rpw.abs() > 1e-9]
+vol = pv.select(list(held.index)).realised_vol(rp_strat.cov_lookback)
+rp_corr = float(np.corrcoef(held.reindex(vol.index), vol)[0, 1])
+check("risk parity weight is anti-correlated with volatility",
+      rp_corr < -0.3, f"corr(weight, vol)={rp_corr:.2f}")
+check("risk parity weights sum to gross",
+      abs(float(rpw.sum()) - rp_strat.gross) < 1e-6, f"sum={rpw.sum():.4f}")
+
+print()
+print("=" * 72)
+print("6. Research diagnostics")
+print("=" * 72)
+
+sig = trailing_signal(panel, 126, skip=5)
+fwd = forward_returns(panel, 21)
+ic = information_coefficient(sig, fwd, step=21)
+summ = ic_summary(ic)
+print("  momentum IC (126d signal, 21d fwd, non-overlapping):")
+print("   ", {k: round(v, 4) for k, v in summ.items()})
+check("IC series produced", len(ic) > 20, f"{len(ic)} obs")
+check("synthetic momentum is detected", summ["mean_ic"] > 0,
+      f"mean_ic={summ['mean_ic']:.4f} t={summ['t_stat']:.2f}")
+
+mean_ic, t_ic = ic_grid(panel, lookbacks=(5, 21, 126), horizons=(1, 5, 21))
+print("\n  mean IC grid (rows=lookback, cols=horizon):")
+print(mean_ic.round(4).to_string())
+check("ic_grid shape correct", mean_ic.shape == (3, 3))
+rev_only = SyntheticRepository(
+    n_symbols=40, seed=21, mu_persistence=0.0, mu_scale=0.0,
+    reversal_theta=0.25, drift=0.0,
+).fetch(start="2012-01-01", end="2024-12-31")
+rev_ic, rev_t = ic_grid(rev_only, lookbacks=(3, 5, 21), horizons=(1, 5, 21))
+print("\n  mean IC grid on a reversal-only panel:")
+print(rev_ic.round(4).to_string())
+check("reversal-only panel shows negative short-horizon IC",
+      rev_ic.loc[5, 1] < 0 and rev_t.loc[5, 1] < -2,
+      f"IC(5,1)={rev_ic.loc[5, 1]:.4f} t={rev_t.loc[5, 1]:.2f}")
+check("mixed panel shows reversal at short/short, momentum at long/long",
+      mean_ic.loc[5, 1] < 0 < mean_ic.loc[126, 21],
+      f"IC(5,1)={mean_ic.loc[5, 1]:+.4f}  IC(126,21)={mean_ic.loc[126, 21]:+.4f}")
+
+ac = return_autocorrelation(panel, lags=[1, 2, 5, 10])
+print("\n  pooled return autocorrelation:")
+print(ac.round(4).to_string())
+check("lag-1 autocorrelation is negative (reversal built in)",
+      ac.loc[1, "autocorr"] < 0, f"{ac.loc[1, 'autocorr']:.4f}")
+
+splits = walk_forward_splits(panel.dates, train_bars=756, test_bars=252)
+check("walk-forward splits generated", len(splits) >= 2, f"{len(splits)} splits")
+check("no train/test overlap",
+      all(tr[-1] < te[0] for tr, te in splits))
+
+ems = expected_max_sharpe(n_trials=48, sharpe_dispersion=0.35)
+hc = sharpe_haircut(0.95, n_trials=48, sharpe_dispersion=0.35)
+print(f"\n  expected max sharpe under null (48 trials, sd=0.35): {ems:.2f}")
+print(f"  haircut of an observed 0.95: {hc}")
+check("expected_max_sharpe is positive and sensible", 0.3 < ems < 1.5)
+
+sweep = ParameterSweep(
+    grid={"lookback": [63, 126], "top_n": [5, 10]},
+    evaluate=lambda lookback, top_n: {
+        "sharpe": Backtester(
+            panel=panel,
+            strategy=CrossSectionalMomentum(lookback=lookback, top_n=top_n),
+            risk_gate=RiskGate(target_vol=0.12, max_drawdown=None),
+            rebalance="M", initial_equity=50_000,
+        ).run().summary()["sharpe"]
+    },
+)
+sw = sweep.run()
+print("\n  sweep results:")
+print(sw.round(3).to_string(index=False))
+check("sweep returns one row per combination", len(sw) == 4)
+print("  stability:", ParameterSweep.stability(sw).round(3).to_dict())
+
+print()
+print("=" * 72)
+print("7. Live parity: same objects, same numbers")
+print("=" * 72)
+
+strategy = CrossSectionalMomentum(lookback=126, skip=5, top_n=10)
+live_gate = RiskGate(target_vol=0.12, max_weight=0.20, max_drawdown=0.25)
+
+runner = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                          min_trade_notional=10.0, max_turnover=None)
+state = PortfolioState(cash=50_000.0,
+                       shares=pd.Series(0.0, index=panel.symbols),
+                       peak_equity=50_000.0)
+plan = runner.plan(panel, state)
+print(f"  {plan!r}")
+print(plan.to_frame().head(6).round(4).to_string(index=False))
+check("live plan produces intents", len(plan.intents) > 0)
+check("all intents are buys from a flat book",
+      all(i.side == "buy" for i in plan.intents))
+check("live intents sum close to target gross",
+      abs(sum(i.notional for i in plan.intents) / plan.equity
+          - plan.target_weights.abs().sum()) < 0.02)
+
+# Parity: the runner's target weights must equal what the gate produced in a
+# backtest that decided on the same bar with the same equity and no history.
+bare_gate = RiskGate(target_vol=0.12, max_weight=0.20, max_drawdown=0.25)
+from qbt.risk import RiskContext
+v = panel.as_of(panel.last_date())
+ctx = RiskContext(date=v.last_date(), equity=50_000.0, peak_equity=50_000.0,
+                  prices=v.last_close(), returns=v.returns(),
+                  positions=state.shares, day_trades_remaining=3)
+direct = bare_gate.apply(strategy.target_weights(v), ctx).weights
+check("live runner weights match a direct gate call",
+      np.allclose(plan.target_weights.reindex(direct.index).fillna(0.0).to_numpy(),
+                  direct.to_numpy(), atol=1e-12),
+      "single code path confirmed")
+
+print("\n  audit record:", plan.audit_record())
+
+# Turnover guard should withhold an oversized plan.
+guarded = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                           max_turnover=0.05)
+gplan = guarded.plan(panel, state)
+check("turnover guard withholds oversized plans",
+      len(gplan.intents) == 0 and any("turnover" in w for w in gplan.warnings),
+      gplan.warnings[0] if gplan.warnings else "")
+
+print()
+print("=" * 72)
+print("8. Edge cases")
+print("=" * 72)
+
+ledger = DayTradeLedger(limit=3, equity_threshold=25_000)
+d = pd.Timestamp("2024-06-10")
+for k in range(3):
+    ledger.record(d + pd.Timedelta(days=k))
+check("PDT ledger counts within window", ledger.count(d + pd.Timedelta(days=2)) == 3)
+check("PDT blocks at limit under threshold",
+      ledger.remaining(d + pd.Timedelta(days=2), 10_000) == 0)
+check("PDT unrestricted above equity threshold",
+      ledger.remaining(d + pd.Timedelta(days=2), 30_000) > 3)
+check("PDT window rolls off",
+      ledger.count(d + pd.Timedelta(days=30)) == 0)
+
+short = panel.as_of(panel.dates[50])
+r_short = Backtester(panel=short,
+                     strategy=CrossSectionalMomentum(lookback=126, top_n=5),
+                     rebalance="M", initial_equity=10_000).run()
+check("insufficient history yields no trades, no crash",
+      len(r_short.trades) == 0 and abs(r_short.equity.iloc[-1] - 10_000) < 1e-6)
+
+sparse = panel.close.copy()
+sparse.iloc[:400, :5] = np.nan
+from qbt.data import PricePanel
+gappy = PricePanel(close=sparse, open_=panel.open_, volume=panel.volume)
+r_gappy = Backtester(panel=gappy,
+                     strategy=CrossSectionalMomentum(lookback=126, top_n=10),
+                     risk_gate=RiskGate(), rebalance="M",
+                     initial_equity=50_000).run()
+check("handles symbols that start late",
+      np.isfinite(r_gappy.equity).all() and (r_gappy.equity > 0).all())
+
+check("integer share mode works",
+      Backtester(panel=panel, strategy=EqualWeightBuyHold(),
+                 execution=ExecutionConfig(allow_fractional=False, price="close"),
+                 rebalance="M", initial_equity=50_000
+                 ).run().equity.iloc[-1] > 0)
+
+rb_m = rebalance_dates(panel.dates, "M")
+rb_w = rebalance_dates(panel.dates, "W")
+check("monthly schedule ~= 12/yr",
+      110 <= len(rb_m) <= 125, f"{len(rb_m)} over 10y")
+check("weekly schedule ~= 52/yr", 490 <= len(rb_w) <= 530, f"{len(rb_w)}")
+check("all rebalance dates are real trading days",
+      set(rb_m).issubset(set(panel.dates)))
+
+print()
+print("=" * 72)
+if FAILS:
+    print(f"{len(FAILS)} FAILURE(S): {FAILS}")
+else:
+    print("ALL CHECKS PASSED")
+print("=" * 72)
