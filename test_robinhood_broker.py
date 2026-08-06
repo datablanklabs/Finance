@@ -28,6 +28,18 @@ silently regress any of the bugs this session found:
   ``prop.get("type") == "array"`` check can never match a list, so
   get_quotes() fell through to comma-joining a list of 18 symbols into one
   string and got 'has type "string", want one of "null, array"' back.
+* get_orders declares "account_number" as required too, same as
+  review/place/cancel -- but get_orders() built its request args without
+  ever resolving/including an account key at all (unlike _positions() and
+  _portfolio_figures(), which both do), so OrderManager.recover()'s call to
+  it failed MCP-side with 'missing properties: ["account_number"]'.
+* place_equity_order's real response is {"order": {"id": ..., "state":
+  "unconfirmed", ...}} -- a single object wrapped under "order", not under
+  "data" like portfolio. "order" wasn't a candidate key in
+  _unwrap_object(), so a real, filled order came back unparseable and
+  place_order() (correctly) raised rather than fabricate an id -- which
+  meant a genuinely successful live order got treated as an unknown
+  outcome.
 
 
 Account numbers and dollar values below are fabricated, not the real ones
@@ -267,8 +279,8 @@ ob2.review_order("XLF", "buy", 2.7255578430183576)
 sent_quantity = captured2["review"]["quantity"]
 check("quantity is coerced to a string to match the schema's declared type",
       isinstance(sent_quantity, str))
-check("the coerced string preserves the exact value",
-      sent_quantity == "2.7255578430183576")
+check("the coerced string is rounded to Robinhood's 8-decimal-place limit",
+      sent_quantity == "2.72555784")
 
 # The schema-declared-type check must be genuinely schema-driven, not a
 # hardcoded "quantity is always a string" special case -- swap the schema
@@ -344,6 +356,114 @@ string_quotes_broker._call_sync = _fake_string_quotes_call
 string_quotes_broker.get_quotes(["AAPL", "MSFT"])
 check("a schema that genuinely wants a string still gets one, comma-joined",
       string_captured["args"]["symbols"] == "AAPL,MSFT")
+
+print()
+print("=" * 72)
+print("6. get_orders() includes account_number, same as review/place/cancel")
+print("=" * 72)
+
+ORDERS_SCHEMA = {
+    "properties": {
+        "account_number": {"type": "string"},
+        "created_after": {"type": "string"},
+    },
+    "required": ["account_number"],
+}
+
+
+def _orders_broker():
+    b = RobinhoodMCPBroker(token="fake")
+    b.bindings = {
+        "accounts": ToolBinding("accounts", "get_accounts", {}),
+        "positions": ToolBinding("positions", "get_equity_positions", {}),
+        "orders": ToolBinding("orders", "get_equity_orders", ORDERS_SCHEMA),
+    }
+    captured = {}
+
+    def fake_call_sync(capability, arguments):
+        if capability == "accounts":
+            return REAL_ACCOUNTS_PAYLOAD
+        if capability == "positions":
+            return {"data": {"positions": []}}
+        if capability == "orders":
+            captured["orders"] = arguments
+            return {"data": {"orders": []}}
+        raise AssertionError(f"unexpected capability {capability!r}")
+
+    b._call_sync = fake_call_sync
+    return b, captured
+
+
+orders_broker, orders_captured = _orders_broker()
+orders_broker.get_account()
+orders_broker.get_orders()
+check("get_orders includes account_number once get_account() has run",
+      orders_captured.get("orders", {}).get("account_number") == "100000002")
+
+fresh_orders_broker = RobinhoodMCPBroker(token="fake")
+fresh_orders_broker.bindings = {"orders": ToolBinding("orders", "get_equity_orders", ORDERS_SCHEMA)}
+try:
+    fresh_orders_broker.get_orders()
+    check("calling get_orders before get_account() raises, doesn't send a null account_number", False)
+except RuntimeError as exc:
+    check("calling get_orders before get_account() raises, doesn't send a null account_number",
+          "get_account()" in str(exc), str(exc))
+
+print()
+print("=" * 72)
+print("7. place_order() parses the real {\"order\": {...}} response shape")
+print("=" * 72)
+
+PLACE_SCHEMA = {
+    "properties": {
+        "account_number": {"type": "string"}, "symbol": {"type": "string"},
+        "side": {"type": "string"}, "type": {"type": "string"},
+        "quantity": {"type": "string"},
+    },
+    "required": ["account_number", "symbol", "side", "type", "quantity"],
+}
+# The exact shape confirmed live (2026-08): a single order object wrapped
+# under "order", not "data" -- field names verbatim, id/timestamps fabricated.
+REAL_PLACE_RESPONSE = {
+    "order": {
+        "id": "6a74e504-ec28-4ec9-9df3-8b31afe4f305",
+        "instrument_id": "c787074b-0abb-4940-846b-dbee221dd10f",
+        "symbol": "",
+        "side": "buy",
+        "type": "market",
+        "state": "filled",
+        "quantity": "1.000000",
+        "cumulative_quantity": "1.000000",
+        "price": "107.260000",
+        "average_price": "107.255000",
+        "created_at": "2026-08-06T19:48:20.555945Z",
+    }
+}
+
+place_broker = RobinhoodMCPBroker(token="fake")
+place_broker.bindings = {
+    "accounts": ToolBinding("accounts", "get_accounts", {}),
+    "positions": ToolBinding("positions", "get_equity_positions", {}),
+    "place": ToolBinding("place", "place_equity_order", PLACE_SCHEMA),
+}
+def _fake_place_call(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    if capability == "place":
+        return REAL_PLACE_RESPONSE
+    raise AssertionError(f"unexpected capability {capability!r}")
+place_broker._call_sync = _fake_place_call
+place_broker.get_account()
+
+placed = place_broker.place_order("EFA", "buy", 1.0)
+check("place_order parses the id out of the {\"order\": {...}} wrapper, doesn't raise",
+      placed.order_id == "6a74e504-ec28-4ec9-9df3-8b31afe4f305")
+check("state is read from inside the unwrapped 'order' object",
+      placed.state == "filled")
+check("average_price is read from inside the unwrapped 'order' object",
+      placed.average_price == 107.255)
 
 print()
 print("=" * 72)

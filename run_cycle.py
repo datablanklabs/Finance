@@ -132,6 +132,15 @@ def main() -> int:
             )
             broker = RobinhoodMCPBroker(auth=oauth, require_agentic=True)
         broker.connect()
+        # Resolve the account now, before recovery -- recover() reads the
+        # broker's orders (get_orders()), which requires account_number on
+        # the real API the same as review/place/cancel do. get_account() is
+        # what caches self.account_id on the broker; recover() running
+        # first (it has to -- unresolved in-flight orders must be settled
+        # before a new plan is built) needs that already done. The plan
+        # step below reuses this same `account` rather than calling
+        # get_account() a second time.
+        account = broker.get_account()
     except Exception as exc:
         audit.emit("broker_connect_failed", error=repr(exc))
         return 3
@@ -168,7 +177,6 @@ def main() -> int:
     # ---- plan -----------------------------------------------------------
     peak_file = mode_path("state/peak_equity.txt", args.synthetic)
     try:
-        account = broker.get_account()
         peak = load_peak(peak_file, account.equity)
         state = PortfolioState(
             cash=account.cash,

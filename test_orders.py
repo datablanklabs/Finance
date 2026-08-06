@@ -409,6 +409,156 @@ r3 = retry_om.execute(retry_plan, strategy_name="retry-test", now=now)
 check("after recover(), the intent stays permanently resolved (never retried)",
       call_count["n"] == 1)
 
+# A synchronous "cannot include fractional shares" rejection (confirmed
+# live, 2026-08, on a real instrument) is not the ambiguous kind of
+# failure recover() exists for -- the order was definitely never created.
+# execute() should correct and resubmit once at a whole-share size, close
+# the journal chain either way, and keep processing the rest of the plan
+# rather than abandoning it, since the old unknown-outcome/break path used
+# to leave a dangling "submitting" entry that a later recover() would
+# resolve as not_at_broker and HALT the *next* cycle for, even though the
+# outcome was already fully known here.
+#
+# Raised as a real nested ExceptionGroup, not a flat RuntimeError -- the
+# actual broker call goes through anyio task groups, and str() on that
+# nested shape collapses to "unhandled errors in a TaskGroup
+# (1 sub-exception)" with no mention of "fractional shares" at all; only
+# repr() recurses into it. A flat RuntimeError here would pass even a
+# str()-only match and miss the exact bug this session hit (XLK's rejection
+# was caught, XLV's identical one wasn't, because the earlier fix checked
+# str(exc) instead of repr(exc)).
+def _fractional_shares_error():
+    inner = RuntimeError(
+        'MCP tool error: [TextContent(type=\'text\', text=\'API error 400: '
+        '{"quantity":["Order quantity cannot include fractional shares."]}\')]')
+    return ExceptionGroup("unhandled errors in a TaskGroup",
+                          [ExceptionGroup("unhandled errors in a TaskGroup", [inner])])
+
+
+frac_path = fresh("fractional_retry")
+frac_broker = MockBroker(prices=pd.Series({"AAA": 100.0, "BBB": 50.0}), cash=100_000.0)
+frac_broker.connect()
+_real_frac_place = frac_broker.place_order
+frac_calls = []
+def _frac_place(symbol, side, quantity, *a, **kw):
+    frac_calls.append((symbol, quantity))
+    if symbol == "AAA" and quantity > 2:
+        raise _fractional_shares_error()
+    return _real_frac_place(symbol, side, quantity, *a, **kw)
+frac_broker.place_order = _frac_place
+
+frac_om = OrderManager(
+    frac_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(frac_path, "KILL")),
+    AuditLog(os.path.join(frac_path, "a.jsonl"), stdout=False),
+    os.path.join(frac_path, "j.jsonl"),
+)
+frac_intents = [
+    OrderIntent(symbol="AAA", side="buy", shares=2.7255578430183576, reference_price=100.0,
+               notional=272.56, current_weight=0.0, target_weight=0.01),
+    OrderIntent(symbol="BBB", side="buy", shares=5.0, reference_price=50.0,
+               notional=250.0, current_weight=0.0, target_weight=0.01),
+]
+frac_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=frac_intents,
+                     target_weights=pd.Series({"AAA": 0.01, "BBB": 0.01}),
+                     current_weights=pd.Series({"AAA": 0.0, "BBB": 0.0}), decision=None)
+frac_report = frac_om.execute(frac_plan, strategy_name="frac-test", now=now)
+
+check("fractional rejection retries once at the floored whole-share size",
+      frac_calls[:2] == [("AAA", 2.7255578430183576), ("AAA", 2.0)], frac_calls)
+check("the retried whole-share order lands as submitted",
+      any(o.symbol == "AAA" for o in frac_report.submitted))
+check("the rest of the plan still executes after a fractional rejection, not abandoned",
+      any(o.symbol == "BBB" for o in frac_report.submitted))
+
+frac_recover = frac_om.recover()
+check("recover() finds nothing dangling after a fractional-rejection retry succeeded",
+      frac_recover.empty)
+
+# A target size that rounds down to zero whole shares can't be corrected --
+# must skip cleanly (terminal "rejected" in the journal), not retry at 0.
+tiny_path = fresh("fractional_tiny")
+tiny_broker = MockBroker(prices=pd.Series({"CCC": 300.0}), cash=100_000.0)
+tiny_broker.connect()
+def _tiny_place(symbol, side, quantity, *a, **kw):
+    raise _fractional_shares_error()
+tiny_broker.place_order = _tiny_place
+
+tiny_om = OrderManager(
+    tiny_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(tiny_path, "KILL")),
+    AuditLog(os.path.join(tiny_path, "a.jsonl"), stdout=False),
+    os.path.join(tiny_path, "j.jsonl"),
+)
+tiny_intent = OrderIntent(symbol="CCC", side="buy", shares=0.848263, reference_price=300.0,
+                          notional=254.48, current_weight=0.0, target_weight=0.01)
+tiny_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[tiny_intent],
+                     target_weights=pd.Series({"CCC": 0.01}),
+                     current_weights=pd.Series({"CCC": 0.0}), decision=None)
+tiny_report = tiny_om.execute(tiny_plan, strategy_name="frac-tiny", now=now)
+check("a sub-one-share fractional rejection is skipped cleanly, not retried at 0 shares",
+      any("rounds down to 0" in s[1] for s in tiny_report.skipped))
+
+tiny_recover = tiny_om.recover()
+check("a definitively-rejected sub-share order leaves nothing dangling -- recover() "
+      "can't misresolve it as not_at_broker and HALT the next cycle",
+      tiny_recover.empty)
+
+# The exact real-money scenario this session hit: a fractional-share
+# rejection triggers a retry at a whole-share size, the retry *itself* then
+# throws for an unrelated reason (there, an unparseable place_order
+# response) even though the order actually landed at the broker. execute()
+# must write a second "submitting" entry at the retried quantity, and
+# recover() must fingerprint against that retried quantity (the *last*
+# "submitting" entry), not the stale original one -- otherwise a real fill
+# gets misresolved as not_at_broker.
+landed_path = fresh("fractional_retry_landed")
+landed_broker = MockBroker(prices=pd.Series({"EFA": 100.0}), cash=100_000.0)
+landed_broker.connect()
+_real_landed_place = landed_broker.place_order
+landed_calls = []
+def _landed_place(symbol, side, quantity, *a, **kw):
+    landed_calls.append(quantity)
+    if len(landed_calls) == 1:
+        raise _fractional_shares_error()
+    # The retry: really lands at the broker (so get_orders() will find it
+    # later)...
+    order = _real_landed_place(symbol, side, quantity, *a, **kw)
+    # ...but the call site still blows up, the same way an unparseable
+    # response did for the real EFA order -- execute() never sees `order`.
+    raise RuntimeError(f"place_order response for {symbol} {side} {quantity} "
+                       "could not be parsed into an order id")
+landed_broker.place_order = _landed_place
+
+landed_om = OrderManager(
+    landed_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(landed_path, "KILL")),
+    AuditLog(os.path.join(landed_path, "a.jsonl"), stdout=False),
+    os.path.join(landed_path, "j.jsonl"),
+)
+landed_intent = OrderIntent(symbol="EFA", side="buy", shares=1.4621337438577722,
+                            reference_price=100.0, notional=146.21,
+                            current_weight=0.0, target_weight=0.01)
+landed_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[landed_intent],
+                       target_weights=pd.Series({"EFA": 0.01}),
+                       current_weights=pd.Series({"EFA": 0.0}), decision=None)
+landed_report = landed_om.execute(landed_plan, strategy_name="frac-landed", now=now)
+check("the retry itself failing is reported as an unknown outcome, same as any other",
+      any("unknown outcome" in s[1] for s in landed_report.skipped))
+
+landed_entries = [e for e in landed_om._journal_entries() if e.get("intent_key") == "EFA:buy"]
+submitting_quantities = [e["quantity"] for e in landed_entries if e.get("stage") == "submitting"]
+check("execute() writes a second write-ahead entry at the retried whole-share quantity",
+      submitting_quantities == [1.4621337438577722, 1.0], submitting_quantities)
+
+landed_recover = landed_om.recover()
+check("recover() finds the order that actually landed, not_at_broker",
+      (landed_recover["outcome"] == "found_at_broker").all(),
+      landed_recover.to_dict("records"))
+
 print()
 print("=" * 72)
 print("6. Reconciliation and audit stream")
