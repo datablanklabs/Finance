@@ -4,16 +4,15 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    Backtester, CalendarSeasonality, Composite, CostModel,
-    CrossSectionalMomentum, DayTradeLedger, EqualWeightBuyHold,
-    ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
-    MultiFactorCrossSectional, PairsTrading, PortfolioState, RiskGate,
-    RiskParityAllocation, ShortHorizonReversal, SyntheticRepository,
-    TimeSeriesMomentum, TrendFilter, compare, ic_grid, ic_summary,
-    information_coefficient, expected_max_sharpe, forward_returns,
+    Backtester, Composite, CostModel, CrossSectionalMomentum, DayTradeLedger,
+    EqualWeightBuyHold, ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
+    PortfolioState, PricePanel, RiskGate, ShortHorizonReversal,
+    SyntheticRepository, TimeSeriesMomentum, TrendFilter, compare, ic_grid,
+    ic_summary, information_coefficient, expected_max_sharpe, forward_returns,
     rebalance_dates, return_autocorrelation, trailing_signal,
     walk_forward_splits, ParameterSweep, sharpe_haircut,
 )
+from qbt.risk import RiskContext
 
 FAILS = []
 
@@ -52,7 +51,7 @@ class PeekingStrategy:
     def min_history(self):
         return 10
 
-    def target_weights(self, view):
+    def target_weights(self, view, fundamentals=None, macros=None, corps=None, options=None):
         last = view.last_date()
         self.max_seen = last if self.max_seen is None else max(self.max_seen, last)
         return pd.Series(1.0 / len(view.symbols), index=view.symbols)
@@ -79,19 +78,15 @@ null_repo = SyntheticRepository(
 null_panel = null_repo.fetch(start="2010-01-01", end="2024-12-31")
 
 null_results = {}
-for strat, rebal in [
-    (CrossSectionalMomentum(lookback=126, top_n=10), "M"),
-    (ShortHorizonReversal(lookback=5, top_n=5), "M"),
-    (PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8), "M"),
-    (MultiFactorCrossSectional(top_n=10), "M"),
-    (RiskParityAllocation(cov_lookback=126, max_names=20), "M"),
-    (CalendarSeasonality(pre_days=3, post_days=3), "D"),
+for strat in [
+    CrossSectionalMomentum(lookback=126, top_n=10),
+    ShortHorizonReversal(lookback=5, top_n=5),
 ]:
     r = Backtester(
         panel=null_panel, strategy=strat,
         risk_gate=RiskGate(target_vol=0.12, max_drawdown=None),
         cost_model=CostModel(slippage_bps=0.0, sell_fee_bps=0.0),
-        rebalance=rebal, initial_equity=100_000,
+        rebalance="M", initial_equity=100_000,
     ).run()
     null_results[strat.name] = r
     s = r.summary()
@@ -204,6 +199,74 @@ check("drawdown breaker fires in a bear market",
 check("breaker flattens the book",
       r_crash.exposure.tail(200).min() < 0.02)
 
+# The breaker must be able to reset, not just fire. A book that goes flat
+# has frozen equity, so a real reset needs a "shadow" recovery signal --
+# this is the scenario that used to be permanently broken (resume_at could
+# never be reached because the real, halted equity can't move on its own).
+_n = 6
+_dates = pd.bdate_range("2020-01-01", periods=300)
+_down = np.full(50, -0.007)   # steep crash, ~30% trough
+_up = np.full(150, 0.0045)    # genuine, strong recovery afterward
+_flat = np.zeros(len(_dates) - 200)
+_daily_ret = np.concatenate([_down, _up, _flat])
+_rng = np.random.default_rng(3)
+_idio = _rng.normal(0, 0.003, size=(len(_dates), _n))
+_close = pd.DataFrame(
+    100.0 * np.exp(np.cumsum(_daily_ret[:, None] + _idio, axis=0)),
+    index=_dates, columns=[f"V{i}" for i in range(_n)],
+)
+v_panel = PricePanel(close=_close)
+v_gate = RiskGate(target_vol=None, max_drawdown=0.20, resume_at=0.90)
+r_vshape = Backtester(
+    panel=v_panel, strategy=EqualWeightBuyHold(), risk_gate=v_gate,
+    rebalance="D", initial_equity=50_000,
+    execution=ExecutionConfig(price="close"),
+).run()
+_reset_mask = r_vshape.audit["notes"].str.contains("breaker reset", na=False)
+check("drawdown breaker actually resets after a genuine recovery",
+      bool(_reset_mask.any()))
+check("breaker was genuinely halted for a stretch, not the whole run",
+      0 < int(r_vshape.audit["halted"].sum()) < len(r_vshape.audit))
+if _reset_mask.any():
+    check("reset happens strictly after the trip, not immediately",
+          r_vshape.audit.index[_reset_mask][0] > r_vshape.audit.index[r_vshape.audit["halted"]][0])
+
+# PDT limit must actually block new entries at the gate, not just log a note.
+pdt_gate = RiskGate(target_vol=None, max_weight=None, max_gross=None, max_drawdown=None)
+_syms = ["PA", "PB", "PC"]
+_proposed = pd.Series([0.3, 0.3, 0.3], index=_syms)
+_positions_a_only = pd.Series([100.0, 0.0, 0.0], index=_syms)
+_pdt_returns = pd.DataFrame({s: [0.001] * 30 for s in _syms})
+_pdt_prices = pd.Series([50.0, 60.0, 70.0], index=_syms)
+
+_ctx_no_budget = RiskContext(
+    date=pd.Timestamp("2024-01-01"), equity=50_000, peak_equity=50_000,
+    prices=_pdt_prices, returns=_pdt_returns, positions=_positions_a_only,
+    day_trades_remaining=0,
+)
+_decision_blocked = pdt_gate.apply(_proposed, _ctx_no_budget)
+check("PDT limit blocks new entries at the gate",
+      _decision_blocked.weights["PB"] == 0.0 and _decision_blocked.weights["PC"] == 0.0)
+check("PDT limit leaves the already-held name alone",
+      _decision_blocked.weights["PA"] == 0.3)
+check("PDT block is recorded in the audit notes",
+      any("PDT limit reached" in n for n in _decision_blocked.notes))
+
+_ctx_with_budget = RiskContext(
+    date=pd.Timestamp("2024-01-01"), equity=50_000, peak_equity=50_000,
+    prices=_pdt_prices, returns=_pdt_returns, positions=_positions_a_only,
+    day_trades_remaining=3,
+)
+_decision_ok = pdt_gate.apply(_proposed, _ctx_with_budget)
+check("PDT limit doesn't interfere when budget is available",
+      (_decision_ok.weights == _proposed).all())
+
+_decision_close = pdt_gate.apply(
+    pd.Series([0.0, 0.0, 0.0], index=_syms), _ctx_no_budget
+)
+check("PDT limit still allows closing an existing position",
+      (_decision_close.weights == 0.0).all())
+
 print()
 print("=" * 72)
 print("5. Strategies and composition")
@@ -221,9 +284,6 @@ strategies = [
         (CrossSectionalMomentum(lookback=126, top_n=10), 0.6),
         (ShortHorizonReversal(lookback=5, top_n=5), 0.4),
     ]),
-    PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8),
-    MultiFactorCrossSectional(top_n=10),
-    RiskParityAllocation(cov_lookback=126, max_names=20),
 ]
 
 results = {}
@@ -238,20 +298,6 @@ for strat in strategies:
     check(f"{strat.name} runs and produces finite equity",
           np.isfinite(r.equity).all() and (r.equity > 0).all())
 
-# CalendarSeasonality only expresses its logic under sub-monthly rebalancing.
-calendar = CalendarSeasonality(pre_days=3, post_days=3)
-r_cal = Backtester(
-    panel=panel, strategy=calendar, risk_gate=None,
-    cost_model=CostModel(slippage_bps=5.0),
-    rebalance="D", initial_equity=50_000,
-).run()
-results[calendar.name] = r_cal
-check(f"{calendar.name} runs and produces finite equity",
-      np.isfinite(r_cal.equity).all() and (r_cal.equity > 0).all())
-check("calendar strategy is flat most of the month",
-      0.05 < r_cal.exposure.gt(0.01).mean() < 0.5,
-      f"time invested={r_cal.exposure.gt(0.01).mean():.2%}")
-
 tbl = compare(results)
 print()
 print(tbl[["cagr", "ann_vol", "sharpe", "max_drawdown", "turnover_ann",
@@ -260,26 +306,6 @@ print(tbl[["cagr", "ann_vol", "sharpe", "max_drawdown", "turnover_ann",
 check("trend filter reduces exposure vs unfiltered",
       results["xsmom_126_5_10+trend200"].summary()["avg_exposure"]
       < results["xsmom_126_5_10"].summary()["avg_exposure"])
-
-# Pairs trading should be roughly dollar-neutral at every rebalance.
-pairs_strat = PairsTrading(formation=126, z_window=21, entry_z=1.5, n_pairs=8)
-pv = panel.as_of(panel.dates[1500])
-pw = pairs_strat.target_weights(pv)
-check("pairs trading is dollar-neutral", abs(pw.sum()) < 1e-9, f"sum={pw.sum():.2e}")
-check("pairs trading gross matches configured level",
-      abs(pw.abs().sum() - pairs_strat.gross) < 1e-9 or pw.abs().sum() == 0.0,
-      f"gross={pw.abs().sum():.3f}")
-
-# Risk parity should tilt away from high-vol names, unlike equal weight.
-rp_strat = RiskParityAllocation(cov_lookback=126, max_names=20)
-rpw = rp_strat.target_weights(pv)
-held = rpw[rpw.abs() > 1e-9]
-vol = pv.select(list(held.index)).realised_vol(rp_strat.cov_lookback)
-rp_corr = float(np.corrcoef(held.reindex(vol.index), vol)[0, 1])
-check("risk parity weight is anti-correlated with volatility",
-      rp_corr < -0.3, f"corr(weight, vol)={rp_corr:.2f}")
-check("risk parity weights sum to gross",
-      abs(float(rpw.sum()) - rp_strat.gross) < 1e-6, f"sum={rpw.sum():.4f}")
 
 print()
 print("=" * 72)
@@ -319,6 +345,19 @@ print("\n  pooled return autocorrelation:")
 print(ac.round(4).to_string())
 check("lag-1 autocorrelation is negative (reversal built in)",
       ac.loc[1, "autocorr"] < 0, f"{ac.loc[1, 'autocorr']:.4f}")
+# n treats every (symbol, date) pair as an independent draw, which overstates
+# the sample size by roughly the symbol count since returns are strongly
+# cross-sectionally correlated -- n_effective (distinct dates) is what the
+# t-stat should actually be built on.
+check("n_effective is far smaller than the raw pooled n",
+      ac.loc[1, "n_effective"] < ac.loc[1, "n"] / 10,
+      f"n={ac.loc[1, 'n']:.0f}  n_effective={ac.loc[1, 'n_effective']:.0f}")
+check("n / n_effective roughly matches the symbol count",
+      abs(ac.loc[1, "n"] / ac.loc[1, "n_effective"] - len(panel.symbols)) < 1,
+      f"ratio={ac.loc[1, 'n'] / ac.loc[1, 'n_effective']:.1f}  "
+      f"n_symbols={len(panel.symbols)}")
+check("t_stat is built from n_effective, not the inflated raw n",
+      abs(ac.loc[1, "t_stat"] - ac.loc[1, "autocorr"] * np.sqrt(ac.loc[1, "n_effective"])) < 1e-6)
 
 splits = walk_forward_splits(panel.dates, train_bars=756, test_bars=252)
 check("walk-forward splits generated", len(splits) >= 2, f"{len(splits)} splits")
@@ -374,7 +413,6 @@ check("live intents sum close to target gross",
 # Parity: the runner's target weights must equal what the gate produced in a
 # backtest that decided on the same bar with the same equity and no history.
 bare_gate = RiskGate(target_vol=0.12, max_weight=0.20, max_drawdown=0.25)
-from qbt.risk import RiskContext
 v = panel.as_of(panel.last_date())
 ctx = RiskContext(date=v.last_date(), equity=50_000.0, peak_equity=50_000.0,
                   prices=v.last_close(), returns=v.returns(),
@@ -387,13 +425,27 @@ check("live runner weights match a direct gate call",
 
 print("\n  audit record:", plan.audit_record())
 
-# Turnover guard should withhold an oversized plan.
+# Turnover guard should withhold an oversized plan -- except `state` here is
+# a flat book (all-zero shares), and allow_full_turnover_from_flat defaults
+# to True, so the raw withholding mechanism needs the exemption off to
+# actually exercise it.
 guarded = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
-                           max_turnover=0.05)
+                           max_turnover=0.05,
+                           allow_full_turnover_from_flat=False)
 gplan = guarded.plan(panel, state)
 check("turnover guard withholds oversized plans",
       len(gplan.intents) == 0 and any("turnover" in w for w in gplan.warnings),
       gplan.warnings[0] if gplan.warnings else "")
+
+# Same cap, same flat state, default settings this time: the first buildout
+# from cash is exempt rather than withheld.
+exempt_runner = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                                 max_turnover=0.05)
+exempt_plan = exempt_runner.plan(panel, state)
+check("a flat account's first buildout is exempt from the turnover cap by default",
+      len(exempt_plan.intents) > 0
+      and any("exempt" in w for w in exempt_plan.warnings),
+      "; ".join(exempt_plan.warnings))
 
 print()
 print("=" * 72)
@@ -421,7 +473,6 @@ check("insufficient history yields no trades, no crash",
 
 sparse = panel.close.copy()
 sparse.iloc[:400, :5] = np.nan
-from qbt.data import PricePanel
 gappy = PricePanel(close=sparse, open_=panel.open_, volume=panel.volume)
 r_gappy = Backtester(panel=gappy,
                      strategy=CrossSectionalMomentum(lookback=126, top_n=10),
@@ -443,6 +494,19 @@ check("monthly schedule ~= 12/yr",
 check("weekly schedule ~= 52/yr", 490 <= len(rb_w) <= 530, f"{len(rb_w)}")
 check("all rebalance dates are real trading days",
       set(rb_m).issubset(set(panel.dates)))
+
+# An unrecognized freq string used to silently fall back to rebalancing
+# every single day instead of raising -- a plausible typo ("3M", meaning
+# "every 3 months") would produce far more trading than intended, silently.
+for lenient in ("Monthly", "monthly", "Q1", "Daily"):
+    check(f"still accepts {lenient!r} (first-letter match)",
+          len(rebalance_dates(panel.dates, lenient)) > 0)
+for bad_freq in ("3M", "biweekly", "X"):
+    try:
+        rebalance_dates(panel.dates, bad_freq)
+        check(f"rejects unrecognized freq {bad_freq!r}", False)
+    except ValueError:
+        check(f"rejects unrecognized freq {bad_freq!r}", True)
 
 print()
 print("=" * 72)

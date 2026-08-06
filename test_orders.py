@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    CrossSectionalMomentum, LiveSignalRunner, PortfolioState, RiskGate,
-    SyntheticRepository,
+    CrossSectionalMomentum, LiveSignalRunner, LivePlan, OrderIntent,
+    PortfolioState, RiskGate, SyntheticRepository,
 )
 from qbt.broker import BrokerOrder, MockBroker
 from qbt.orders import AuditLog, ExecutionPolicy, OrderManager
@@ -162,6 +162,56 @@ rep = om.execute(plan, now=MARKET_HOURS)
 check("turnover cap aborts the plan",
       rep.aborted and "turnover" in rep.aborted_reason, rep.aborted_reason)
 
+# A flat account's first-ever buildout is structurally ~100% turnover --
+# current weights are all zero, so turnover and gross exposure are the same
+# number. allow_full_turnover_from_flat (default True) exempts exactly that
+# case; a non-flat account with the same turnover must still be blocked.
+_flat_prices = pd.Series({"S0": 100.0, "S1": 100.0})
+_flat_intents = [
+    OrderIntent(symbol=s, side="buy", shares=1.577, reference_price=100.0,
+                notional=157.7, current_weight=0.0, target_weight=0.1577)
+    for s in ("S0", "S1")
+]
+_flat_plan = LivePlan(
+    asof=pd.Timestamp("2026-08-06"), equity=400.0, intents=_flat_intents,
+    target_weights=pd.Series({"S0": 0.1577, "S1": 0.1577}),
+    current_weights=pd.Series(dtype=float), decision=None, warnings=[],
+)  # notional 315.4 / equity 400 = 78.9% turnover, same shape as the real case
+
+_flat_broker = MockBroker(prices=_flat_prices, cash=400.0, positions=pd.Series(dtype=float))
+_flat_broker.connect()
+_flat_policy = ExecutionPolicy(max_plan_turnover=0.67, require_market_open=False,
+                               kill_switch_path=os.path.join(fresh("flat"), "KILL"))
+_flat_om = OrderManager(broker=_flat_broker, policy=_flat_policy,
+                        journal_path=os.path.join(WORK, "flat", "journal.jsonl"))
+_flat_ok, _flat_notes = _flat_om.preflight(_flat_plan, _flat_broker.get_account(), now=MARKET_HOURS)
+check("flat account's first buildout is exempt from the turnover cap by default",
+      _flat_ok, "; ".join(_flat_notes))
+check("the exemption is recorded in the preflight notes, not silent",
+      any("exempt" in n for n in _flat_notes))
+
+_holding_broker = MockBroker(prices=_flat_prices, cash=42.3, positions=pd.Series({"S0": 3.577}))
+_holding_broker.connect()  # equity = 42.3 + 3.577*100 = 400.0, same as the flat case
+_holding_policy = ExecutionPolicy(max_plan_turnover=0.67, require_market_open=False,
+                                  kill_switch_path=os.path.join(fresh("holding"), "KILL"))
+_holding_om = OrderManager(broker=_holding_broker, policy=_holding_policy,
+                           journal_path=os.path.join(WORK, "holding", "journal.jsonl"))
+_holding_ok, _holding_notes = _holding_om.preflight(
+    _flat_plan, _holding_broker.get_account(), now=MARKET_HOURS
+)
+check("an account that already holds a position is NOT exempt at the same turnover",
+      not _holding_ok and any("turnover" in n and "exceeds" in n for n in _holding_notes),
+      "; ".join(_holding_notes))
+
+_strict_policy = ExecutionPolicy(max_plan_turnover=0.67, require_market_open=False,
+                                 kill_switch_path=os.path.join(fresh("strict"), "KILL"),
+                                 allow_full_turnover_from_flat=False)
+_strict_om = OrderManager(broker=_flat_broker, policy=_strict_policy,
+                          journal_path=os.path.join(WORK, "strict", "journal.jsonl"))
+_strict_ok, _strict_notes = _strict_om.preflight(_flat_plan, _flat_broker.get_account(), now=MARKET_HOURS)
+check("the exemption can be disabled via allow_full_turnover_from_flat=False",
+      not _strict_ok, "; ".join(_strict_notes))
+
 om, broker, path = make("notional", dry_run=False, max_plan_notional=100.0)
 rep = om.execute(plan, now=MARKET_HOURS)
 check("plan notional cap aborts",
@@ -273,6 +323,92 @@ check("recover() flags the one that did not",
 check("recover() closes out the journal entries",
       om.recover().empty, "second call finds nothing unresolved")
 
+# recover()'s broker query window must anchor to when the unresolved
+# attempt actually happened, not to "today at midnight" -- otherwise
+# recover() running on a later calendar day than the crash (process down
+# over a weekend, restarted after a Friday-close crash) would never even
+# ask the broker about an order from before today.
+window_path = fresh("recover_window")
+window_broker = MockBroker(prices=pd.Series({"AAA": 100.0}), cash=100_000.0)
+window_broker.connect()
+window_om = OrderManager(window_broker, journal_path=os.path.join(window_path, "j.jsonl"))
+window_om._journal(stage="submitting", plan_id="p1", intent_key="AAA:buy",
+                   symbol="AAA", side="buy", quantity=10.0)
+window_om.recover()
+since_used = pd.Timestamp(
+    next(c[1]["since"] for c in window_broker.call_log if c[0] == "get_orders")
+)
+submitting_ts = pd.Timestamp(
+    next(e for e in window_om._journal_entries() if e.get("stage") == "submitting")["ts"]
+)
+check("recover() anchors the broker query to the actual submitting time",
+      since_used < submitting_ts and (submitting_ts - since_used).total_seconds() < 3600,
+      f"since={since_used}, submitted={submitting_ts}")
+
+# Two unresolved entries sharing the same fingerprint (symbol/side/
+# quantity-bucket) -- two ghost entries from one crash -- must not both
+# claim the one broker order that actually landed.
+dup_path = fresh("recover_dup")
+dup_broker = MockBroker(prices=pd.Series({"AAA": 100.0}), cash=100_000.0)
+dup_broker.connect()
+dup_broker.place_order("AAA", "buy", 10.0)  # exactly one real order landed
+dup_om = OrderManager(dup_broker, journal_path=os.path.join(dup_path, "j.jsonl"))
+dup_om._journal(stage="submitting", plan_id="p1", intent_key="AAA:buy",
+                symbol="AAA", side="buy", quantity=10.0)
+dup_om._journal(stage="submitting", plan_id="p2", intent_key="AAA:buy",
+                symbol="AAA", side="buy", quantity=10.0)
+dup_rec = dup_om.recover()
+check("only one ghost entry claims the one order that actually landed",
+      (dup_rec["outcome"] == "found_at_broker").sum() == 1
+      and (dup_rec["outcome"] == "not_at_broker").sum() == 1)
+
+# A retry through execute() itself -- not a hand-crafted journal entry --
+# before recover() has run must not resubmit. This is the actual bug: the
+# except-block around place_order used to only log the unknown outcome,
+# leaving nothing in the journal to stop a second execute() call on the
+# same plan from blindly resubmitting.
+retry_path = fresh("retry")
+retry_broker = MockBroker(prices=pd.Series({"AAA": 100.0}), cash=100_000.0)
+retry_broker.connect()
+call_count = {"n": 0}
+_real_place = retry_broker.place_order
+def _flaky_place(*a, **kw):
+    call_count["n"] += 1
+    if call_count["n"] == 1:
+        raise TimeoutError("simulated network timeout -- unknown outcome")
+    return _real_place(*a, **kw)
+retry_broker.place_order = _flaky_place
+
+retry_om = OrderManager(
+    retry_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(retry_path, "KILL")),
+    AuditLog(os.path.join(retry_path, "a.jsonl"), stdout=False),
+    os.path.join(retry_path, "j.jsonl"),
+)
+now = pd.Timestamp.now(tz="UTC")
+retry_intent = OrderIntent(symbol="AAA", side="buy", shares=10.0, reference_price=100.0,
+                           notional=1000.0, current_weight=0.0, target_weight=0.01)
+retry_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[retry_intent],
+                      target_weights=pd.Series({"AAA": 0.01}),
+                      current_weights=pd.Series({"AAA": 0.0}), decision=None)
+
+r1 = retry_om.execute(retry_plan, strategy_name="retry-test", now=now)
+check("first attempt hits the flaky broker and reports unknown outcome",
+      call_count["n"] == 1 and any("unknown outcome" in s[1] for s in r1.skipped))
+
+r2 = retry_om.execute(retry_plan, strategy_name="retry-test", now=now)
+check("retry before recover() is blocked, not resubmitted",
+      call_count["n"] == 1,
+      f"place_order called {call_count['n']} time(s), expected exactly 1")
+check("retry is skipped with a pending_recovery reason",
+      any("run recover() first" in s[1] for s in r2.skipped))
+
+retry_om.recover()
+r3 = retry_om.execute(retry_plan, strategy_name="retry-test", now=now)
+check("after recover(), the intent stays permanently resolved (never retried)",
+      call_count["n"] == 1)
+
 print()
 print("=" * 72)
 print("6. Reconciliation and audit stream")
@@ -349,6 +485,87 @@ check("resolves quantity -> shares",
       b.resolve_arg("quantity", ("quantity", "shares", "qty")) == "shares")
 check("returns None for an absent argument",
       b.resolve_arg("stop_price", ("stop_price",)) is None)
+
+# An ambiguous substring match -- two properties both contain "quantity" --
+# must not silently pick whichever one iterates first; it should skip that
+# candidate and let the next one in the list resolve unambiguously.
+ambiguous = ToolBinding("place", "place_equity_order", {
+    "properties": {"order_quantity": {}, "max_quantity_per_order": {}, "qty": {}},
+    "required": []})
+check("ambiguous substring match falls through to the next candidate",
+      ambiguous.resolve_arg("quantity", ("quantity", "qty")) == "qty")
+
+truly_ambiguous = ToolBinding("place", "place_equity_order", {
+    "properties": {"order_quantity": {}, "max_quantity_per_order": {}},
+    "required": []})
+check("no unambiguous candidate anywhere returns None, not a guess",
+      truly_ambiguous.resolve_arg("quantity", ("quantity",)) is None)
+
+# A schema that only exposes a dollar-notional "amount" field (not a share
+# count) must fail loudly, never silently bind quantity to it -- "amount"
+# commonly means dollar notional on real brokerage APIs, so accepting it as
+# a quantity fallback could turn a 10-share order into a $10 one.
+from qbt.broker import RobinhoodMCPBroker
+
+amount_only = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+amount_only.account_id = None
+amount_only.bindings = {
+    "place": ToolBinding("place", "place_equity_order", {
+        "properties": {"symbol": {}, "side": {}, "amount": {}, "order_type": {}},
+        "required": ["symbol", "side", "amount", "order_type"],
+    })
+}
+try:
+    amount_only._order_args("place", "AAPL", "buy", 10.0, "market", {})
+    check("amount-only schema is rejected rather than guessed at", False)
+except RuntimeError as exc:
+    check("amount-only schema is rejected rather than guessed at",
+          "amount" in str(exc))
+
+genuine_shares = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+genuine_shares.account_id = None
+genuine_shares.bindings = {
+    "place": ToolBinding("place", "place_equity_order", {
+        "properties": {"symbol": {}, "side": {}, "shares": {}, "order_type": {}},
+        "required": ["symbol", "side", "shares", "order_type"],
+    })
+}
+args = genuine_shares._order_args("place", "AAPL", "buy", 10.0, "market", {})
+check("a genuine share-count field still resolves normally",
+      args.get("shares") == 10.0)
+
+# An unparseable place_order response (no id/order_id field at all) must
+# raise -- not return a plausible-looking BrokerOrder with a blank id that
+# every downstream caller would mistake for a normal pending order.
+unparseable = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+unparseable.account_id = None
+unparseable.bindings = genuine_shares.bindings
+unparseable._call_sync = lambda capability, arguments: {}
+try:
+    unparseable.place_order("AAPL", "buy", 10.0)
+    check("place_order raises on an unparseable response", False)
+except RuntimeError as exc:
+    check("place_order raises on an unparseable response",
+          "order id" in str(exc))
+
+# cancel_order must not read an error payload as success -- bool(raw) alone
+# treats any non-empty response as a successful cancel.
+cancel_broker = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+cancel_broker.bindings = {
+    "cancel": ToolBinding("cancel", "cancel_equity_order", {
+        "properties": {"order_id": {}}, "required": ["order_id"]})
+}
+cancel_broker._call_sync = lambda capability, arguments: {"error": "already filled"}
+check("an error payload is not read as a successful cancel",
+      cancel_broker.cancel_order("mock-1") is False)
+
+cancel_broker._call_sync = lambda capability, arguments: {"success": True}
+check("an explicit success field is honored",
+      cancel_broker.cancel_order("mock-1") is True)
+
+cancel_broker._call_sync = lambda capability, arguments: {"success": False}
+check("an explicit success=False is honored, not just truthiness of the payload",
+      cancel_broker.cancel_order("mock-1") is False)
 
 print()
 print("=" * 72)
