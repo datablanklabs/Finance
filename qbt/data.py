@@ -429,6 +429,8 @@ class SyntheticRepository:
 
 def align_panels(*panels: PricePanel) -> list[PricePanel]:
     """Reindex panels onto their common dates and symbols."""
+    if not panels:
+        raise ValueError("align_panels requires at least one panel")
     dates = panels[0].dates
     cols: Iterable[str] = panels[0].symbols
     for p in panels[1:]:

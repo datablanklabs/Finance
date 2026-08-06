@@ -220,6 +220,7 @@ class MockBroker:
     def review_order(self, symbol: str, side: str, quantity: float,
                      order_type: str = "market", **kw) -> dict:
         self._require()
+        side = side.lower()
         self.call_log.append(("review_order", {"symbol": symbol, "side": side,
                                                "quantity": quantity}))
         px = float(self.prices.get(symbol, np.nan))
@@ -228,7 +229,13 @@ class MockBroker:
             warnings.append("symbol not tradeable")
         if not np.isfinite(px):
             warnings.append("no quote available")
-        est = abs(quantity) * (px if np.isfinite(px) else 0.0)
+        # Estimate against the same slippage-adjusted fill price place_order
+        # will actually use -- checking buying power against the raw quote
+        # lets an order sized to exactly self.cash pass review and then push
+        # cash negative once slippage is applied on the real fill.
+        sign = 1.0 if side == "buy" else -1.0
+        fill_px = px * (1.0 + sign * self.slippage_bps / 1e4) if np.isfinite(px) else 0.0
+        est = abs(quantity) * fill_px
         if side == "buy" and est > self.cash:
             warnings.append("insufficient buying power")
         held = float(self.positions.get(symbol, 0.0))
@@ -236,7 +243,7 @@ class MockBroker:
             warnings.append("sell exceeds position")
         return {
             "ok": not warnings,
-            "estimated_price": px,
+            "estimated_price": fill_px,
             "estimated_notional": est,
             "warnings": warnings,
         }
@@ -244,6 +251,7 @@ class MockBroker:
     def place_order(self, symbol: str, side: str, quantity: float,
                     order_type: str = "market", **kw) -> BrokerOrder:
         self._require()
+        side = side.lower()
         self.call_log.append(("place_order", {"symbol": symbol, "side": side,
                                               "quantity": quantity}))
         self._seq += 1
@@ -264,9 +272,11 @@ class MockBroker:
         if self.rng.random() < self.partial_rate:
             fill_frac = float(self.rng.uniform(0.3, 0.8))
 
-        px = float(self.prices[symbol])
+        # Reuse the exact price review_order already computed rather than
+        # recomputing the same slippage formula a second time -- keeps the
+        # two from ever drifting apart.
         sign = 1.0 if side == "buy" else -1.0
-        fill_px = px * (1.0 + sign * self.slippage_bps / 1e4)
+        fill_px = review["estimated_price"]
         filled = quantity * fill_frac
 
         self.cash -= sign * filled * fill_px
@@ -295,6 +305,27 @@ class MockBroker:
 # ---------------------------------------------------------------------------
 
 
+def _schema_types(prop: dict) -> set[str]:
+    """The set of JSON types a schema property declares as acceptable.
+
+    JSON Schema allows ``"type"`` to be either a single string
+    (``"string"``) or a list of strings for a union (``["null",
+    "array"]``) -- confirmed live (2026-08): Robinhood's real
+    ``get_equity_quotes`` schema uses the list form for ``symbols``
+    (nullable array), which a plain ``prop.get("type") == "array"``
+    comparison can never match, since the value is a list, not the string
+    ``"array"``. Normalising both shapes into a set here means every
+    caller checks membership the same way instead of each reimplementing
+    (and each potentially getting wrong) its own parsing of this field.
+    """
+    t = (prop or {}).get("type")
+    if isinstance(t, str):
+        return {t}
+    if isinstance(t, (list, tuple, set)):
+        return {x for x in t if isinstance(x, str)}
+    return set()
+
+
 @dataclass
 class ToolBinding:
     """A capability bound to a concrete tool the server advertises."""
@@ -313,18 +344,58 @@ class ToolBinding:
         """Find the server's parameter name for a logical argument.
 
         Handles the common case where a server calls it ``ticker`` and you
-        assumed ``symbol``. Matching is exact-then-substring over the schema's
-        declared properties.
+        assumed ``symbol``. Matching is exact-then-substring over the
+        schema's declared properties. If a candidate's substring appears in
+        more than one property (e.g. both ``order_quantity`` and
+        ``max_quantity_per_order`` for candidate ``"quantity"``), that's
+        ambiguous -- picking whichever one happened to iterate first is how
+        you silently bind to the wrong field, so it's treated as no match
+        for that candidate and the next candidate is tried instead.
         """
         props = {k.lower(): k for k in self.properties()}
         for c in candidates:
             if c.lower() in props:
                 return props[c.lower()]
         for c in candidates:
-            for low, orig in props.items():
-                if c.lower() in low:
-                    return orig
+            matches = [orig for low, orig in props.items() if c.lower() in low]
+            if len(matches) == 1:
+                return matches[0]
         return None
+
+    def coerce(self, key: str, value: Any) -> Any:
+        """Coerce a Python value to match this tool's declared JSON type for ``key``.
+
+        Confirmed live (2026-08), twice, in two different shapes:
+        Robinhood's order tools declare ``quantity`` as a JSON *string*,
+        not a number (``... has type "number", want "string"``); and
+        ``get_equity_quotes`` declares ``symbols`` as a nullable *array*
+        (``"type": ["null", "array"]``) -- see :func:`_schema_types` for
+        why a naive ``.get("type") == "array"`` check can't see that form.
+        Rather than hardcode either shape, this reads the tool's *actual*
+        declared type(s) for whichever field ``key`` resolved to and
+        coerces to match, so it keeps working if a field's declared type
+        differs across tools or changes later.
+        """
+        types = _schema_types(self.properties().get(key, {}))
+        if isinstance(value, (list, tuple)):
+            if "array" in types:
+                return list(value)
+            if "string" in types:
+                return ",".join(str(v) for v in value)
+            return value
+        if "string" in types and not isinstance(value, str):
+            return str(value)
+        if "number" in types and isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return value
+        if "integer" in types and isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return value
+        return value
 
 
 # Candidate names per capability, most likely first. Discovery matches against
@@ -517,7 +588,17 @@ class RobinhoodMCPBroker:
         chosen = None
         for a in accounts:
             aid = str(_pick(a, "account_number", "account_id", "id", default=""))
-            agentic = _truthy(_pick(a, "is_agentic", "agentic", "type",
+            # Confirmed against a live response (2026-08): Robinhood's real
+            # field is "agentic_allowed", a plain bool, and it's
+            # caller-relative -- true means *this* agent can act on the
+            # account, not that the account is agentic in general. "type"
+            # here is the trading type (margin/cash), not agentic-ness --
+            # this code used to guess "type" as a fallback, which matched
+            # nothing on either account and is exactly why this raised for
+            # every account. Do not add "nickname" as a candidate either:
+            # Robinhood's own API guidance is explicit that nickname must
+            # not be used to determine agentic-account eligibility.
+            agentic = _truthy(_pick(a, "agentic_allowed", "is_agentic", "agentic",
                                     default=False))
             if self.account_id and aid == self.account_id:
                 chosen = a
@@ -533,22 +614,93 @@ class RobinhoodMCPBroker:
             chosen = accounts[0] if accounts else {}
 
         aid = str(_pick(chosen, "account_number", "account_id", "id", default=""))
+        # Cache the resolved account for order-placement calls later in this
+        # broker's lifetime. Confirmed live (2026-08): get_account() resolves
+        # the right account for reads (positions, portfolio) via this local
+        # `aid`, but review_order/place_order/cancel_order build their
+        # request args from self.account_id -- which nothing populated
+        # before this line existed, so every order call failed with
+        # "still requires ['account_number']" even though the right account
+        # had already been found. Means get_account() must be called at
+        # least once before the first order call, which is already the
+        # natural order everywhere in this codebase.
+        self.account_id = aid
         positions = self._positions(aid)
-        cash = _to_float(_pick(chosen, "cash", "buying_power",
-                               "cash_available_for_withdrawal", default=0.0))
-        equity = _to_float(_pick(chosen, "equity", "total_equity",
-                                 "market_value", default=np.nan))
+        cash, equity, buying_power = self._portfolio_figures(aid, chosen)
         return BrokerAccount(
             account_id=aid,
             cash=cash,
-            equity=equity if np.isfinite(equity) else cash,
-            buying_power=_to_float(_pick(chosen, "buying_power", default=cash)),
+            equity=equity,
+            buying_power=buying_power,
             positions=positions,
             is_agentic=True,
             day_trades_used=_maybe_int(_pick(chosen, "day_trades_used",
                                              "day_trade_count", default=None)),
             raw=chosen,
         )
+
+    def _portfolio_figures(
+        self, account_id: str, account_rec: dict
+    ) -> tuple[float, float, float]:
+        """Cash, equity, buying power -- from the 'portfolio' tool, not 'accounts'.
+
+        Confirmed against a live response (2026-08): the 'accounts' tool
+        (``account_rec`` here) carries no cash/equity/buying_power field at
+        all. 'portfolio' is a separately bound capability whose own
+        description says "market value breakdown by asset type and buying
+        power", so this calls it -- but its exact response field names are
+        still an unverified guess (see the class docstring). If none of the
+        guesses match, this reports 0.0 and warns loudly rather than
+        silently returning a wrong number to something that sizes real
+        trades and feeds the drawdown breaker.
+        """
+        if "portfolio" not in self.bindings:
+            cash = _to_float(_pick(account_rec, "cash", "buying_power",
+                                   "cash_available_for_withdrawal", default=0.0))
+            return cash, cash, cash
+
+        b = self._binding("portfolio")
+        args = {}
+        key = b.resolve_arg("account", ("account_number", "account_id", "account"))
+        if key:
+            args[key] = account_id
+        # 'portfolio' returns one object, not a collection -- _as_records is
+        # for list-shaped responses (accounts, positions, orders) and falls
+        # back to wrapping the whole raw payload as a single opaque "record"
+        # when it can't find a list anywhere, which silently breaks _pick
+        # below. Confirmed live (2026-08): the real shape is a single-level
+        # wrapper, {"data": {"cash": ..., "total_value": ..., ...}}.
+        rec = _unwrap_object(self._call_sync("portfolio", args))
+
+        cash = _to_float(_pick(rec, "cash", "cash_balance",
+                               "cash_available_for_withdrawal", default=np.nan))
+        equity = _to_float(_pick(rec, "equity", "total_equity", "market_value",
+                                 "portfolio_value", "total_value", default=np.nan))
+        # buying_power is itself a nested object on the real response, not a
+        # scalar -- confirmed live (2026-08): {"buying_power":
+        # {"buying_power": "1000.0000", "unleveraged_buying_power": ..., ...}}.
+        # _to_float(<dict>) would raise inside its own try/except and quietly
+        # return 0.0 rather than surface that the shape was wrong.
+        bp_value = _pick(rec, "buying_power", "cash_available_for_withdrawal",
+                         default=None)
+        if isinstance(bp_value, dict):
+            bp_value = _pick(bp_value, "buying_power", "unleveraged_buying_power",
+                             default=None)
+        buying_power = _to_float(bp_value, default=np.nan)
+
+        if not np.isfinite(cash) and not np.isfinite(equity):
+            print(
+                "WARNING: could not find cash/equity in the 'portfolio' "
+                f"response: {rec!r}. Reporting 0.0 -- this is almost "
+                "certainly wrong. Check the raw 'portfolio' response and "
+                "fix _portfolio_figures's candidate field names."
+            )
+            return 0.0, 0.0, 0.0
+
+        cash = cash if np.isfinite(cash) else 0.0
+        equity = equity if np.isfinite(equity) else cash
+        buying_power = buying_power if np.isfinite(buying_power) else cash
+        return cash, equity, buying_power
 
     def _positions(self, account_id: str) -> pd.Series:
         b = self._binding("positions")
@@ -570,8 +722,7 @@ class RobinhoodMCPBroker:
         key = b.resolve_arg("symbols", ("symbols", "symbol", "tickers", "ticker"))
         if key is None:
             raise RuntimeError(f"cannot find symbol argument on {b.tool_name}")
-        prop = b.properties().get(key, {})
-        payload = list(symbols) if prop.get("type") == "array" else ",".join(symbols)
+        payload = b.coerce(key, list(symbols))
         recs = _as_records(self._call_sync("quotes", {key: payload}))
         out: dict[str, float] = {}
         for r in recs:
@@ -621,7 +772,7 @@ class RobinhoodMCPBroker:
         def put(logical, candidates, value):
             key = b.resolve_arg(logical, candidates)
             if key is not None:
-                args[key] = value
+                args[key] = b.coerce(key, value)
             elif logical in b.required():
                 raise RuntimeError(
                     f"{b.tool_name} requires {logical} but no matching "
@@ -630,15 +781,53 @@ class RobinhoodMCPBroker:
 
         put("symbol", ("symbol", "ticker", "instrument"), symbol.upper())
         put("side", ("side", "direction"), side.lower())
-        put("quantity", ("quantity", "shares", "qty", "amount"), abs(quantity))
+        # "amount" is deliberately not a candidate here. On many real
+        # brokerage APIs it denotes dollar notional, not a share count -- if
+        # it were accepted as a stand-in for quantity, a schema exposing
+        # only "amount" would silently turn a 10-share order into a $10
+        # one. Better to leave quantity unresolved and let the required-
+        # field check below fail loudly than guess at an ambiguous unit.
+        put("quantity", ("quantity", "shares", "qty"), abs(quantity))
         put("order_type", ("order_type", "type"), order_type)
-        if self.account_id:
-            put("account", ("account_number", "account_id", "account"),
-                self.account_id)
+        # Not routed through put(): that function's required-field check
+        # only catches a missing *field name* in the schema, not a missing
+        # *value* -- self.account_id being unset is a value problem, not a
+        # schema problem, and deserves its own clearer error rather than
+        # falling through to the generic belt-and-braces message below,
+        # which used to make this look like a candidate-name guessing
+        # problem when it was actually "get_account() was never called."
+        account_key = b.resolve_arg("account", ("account_number", "account_id", "account"))
+        if account_key is not None:
+            if self.account_id:
+                args[account_key] = b.coerce(account_key, self.account_id)
+            elif account_key in b.required():
+                raise RuntimeError(
+                    f"{b.tool_name} requires {account_key!r} but this broker "
+                    "has no account_id set. Call get_account() at least once "
+                    "before reviewing/placing/cancelling an order -- it's "
+                    "what resolves the agentic account."
+                )
         for k, v in extra.items():
             key = b.resolve_arg(k, (k,))
             if key is not None:
-                args[key] = v
+                args[key] = b.coerce(key, v)
+
+        # Belt-and-braces on top of put()'s own per-field check: that check
+        # only catches a required field whose *logical* name happens to
+        # match the server's field name (e.g. both spelled "quantity"). A
+        # server that spells its required quantity-equivalent field
+        # "amount" -- exactly the case the exclusion above is guarding
+        # against -- would otherwise sail through with that field silently
+        # absent from args.
+        missing_required = [r for r in b.required() if r not in args]
+        if missing_required:
+            raise RuntimeError(
+                f"{b.tool_name} still requires {missing_required} after "
+                f"binding symbol/side/quantity/order_type -- schema: "
+                f"{list(b.properties())}. Add the server's actual field "
+                "name to the relevant candidate tuple rather than guessing "
+                "at an ambiguous one."
+            )
         return args
 
     def review_order(self, symbol: str, side: str, quantity: float,
@@ -672,8 +861,27 @@ class RobinhoodMCPBroker:
                                       order_type, kw))
         recs = _as_records(raw)
         rec = recs[0] if recs else {}
+        order_id = _pick(rec, "id", "order_id", default=None)
+        if order_id is None or not str(order_id).strip():
+            # The call went out -- for all we know the order is now live --
+            # but the response can't be parsed into anything we can track or
+            # cancel. Returning a BrokerOrder with a blank id would look
+            # like an ordinary "pending" order to every downstream caller,
+            # including OrderManager, which would then have no way to tell
+            # "definitely never placed" from "placed but unreferenceable."
+            # Raise instead, the same as this module's own stated
+            # philosophy for a missing capability at connect time: fail
+            # loudly rather than fabricate. OrderManager.execute() treats
+            # this exception as an unknown outcome and refuses to retry it
+            # until recover() has checked the broker directly.
+            raise RuntimeError(
+                f"place_order response for {symbol} {side} {quantity} could "
+                f"not be parsed into an order id -- raw response: {rec!r}. "
+                "The order may have gone through; check the broker directly "
+                "before retrying."
+            )
         return BrokerOrder(
-            order_id=str(_pick(rec, "id", "order_id", default="")),
+            order_id=str(order_id),
             symbol=symbol.upper(), side=side.lower(), quantity=abs(quantity),
             state=_normalise_state(_pick(rec, "state", "status",
                                          default="pending")),
@@ -692,11 +900,49 @@ class RobinhoodMCPBroker:
             return False
         b = self._binding("cancel")
         key = b.resolve_arg("order_id", ("order_id", "id"))
-        raw = self._call_sync("cancel", {key or "order_id": order_id})
+        order_id_key = key or "order_id"
+        args = {order_id_key: b.coerce(order_id_key, order_id)}
+        # Same account_number requirement as review/place -- cancel_equity_order's
+        # schema requires it too, confirmed live (2026-08). This call doesn't go
+        # through _order_args(), so it needs its own copy of the same handling.
+        account_key = b.resolve_arg("account", ("account_number", "account_id", "account"))
+        if account_key is not None and self.account_id:
+            args[account_key] = b.coerce(account_key, self.account_id)
+        raw = self._call_sync("cancel", args)
+        # bool(raw) alone treats any non-empty response as success, which
+        # includes an error payload like {"error": "already filled"} --
+        # exactly the case where the cancel did *not* happen. An explicit
+        # error field means failure regardless of anything else in the
+        # response; an explicit success-ish field is authoritative when
+        # present. Absent either, fall back to the old non-empty-response
+        # heuristic -- this adapter's response schema isn't verified
+        # against the live service (see the class docstring), so a
+        # confirmed error is the one thing worth being sure about.
+        recs = _as_records(raw)
+        rec = recs[0] if recs else {}
+        if _pick(rec, "error", "error_message", default=None):
+            return False
+        success = _pick(rec, "success", "ok", "cancelled", "canceled", default=None)
+        if success is not None:
+            return bool(success)
         return bool(raw)
 
     def _call_sync(self, capability: str, arguments: dict) -> Any:
         return self._run(self._call(self._binding(capability).tool_name, arguments))
+
+    def call_raw(self, capability: str, arguments: dict | None = None) -> Any:
+        """Call a bound capability and return the raw, unparsed MCP response.
+
+        For checking this adapter's field-name guesses (account type,
+        agentic flag, position/order field names, ...) against what the
+        real server actually returns -- see the module docstring and
+        ``RobinhoodMCPBroker``'s own admission that none of this has been
+        verified against the live service. Every parsing method above this
+        one (``get_account``, ``_positions``, ``get_quotes``, ``get_orders``)
+        is a guess at field names; this is how you check the guess instead
+        of taking it on faith.
+        """
+        return self._call_sync(capability, arguments or {})
 
 
 # ---------------------------------------------------------------------------
@@ -727,19 +973,66 @@ def _unwrap_tool_result(result: Any) -> Any:
         return {"text": joined}
 
 
+_LIST_WRAPPER_KEYS = ("results", "data", "items", "accounts", "positions",
+                      "orders", "quotes")
+
+
+def _find_wrapped_list(d: dict) -> list | None:
+    for key in _LIST_WRAPPER_KEYS:
+        value = d.get(key)
+        if isinstance(value, list):
+            return value
+    return None
+
+
 def _as_records(payload: Any) -> list[dict]:
-    """Coerce any of the shapes a tool might return into a list of dicts."""
+    """Coerce any of the shapes a tool might return into a list of dicts.
+
+    Handles both a flat wrapper (``{"accounts": [...]}``) and Robinhood's
+    real one-level-deeper nesting, confirmed live (2026-08):
+    ``{"data": {"accounts": [...]}}``. Checks one level of nesting under
+    *any* dict-valued top-level key, not just ``"data"`` specifically,
+    since a different tool could wrap the same way under a different name.
+    """
     if payload is None:
         return []
     if isinstance(payload, dict):
-        for key in ("results", "data", "items", "accounts", "positions",
-                    "orders", "quotes"):
-            if key in payload and isinstance(payload[key], list):
-                return [r for r in payload[key] if isinstance(r, dict)]
+        found = _find_wrapped_list(payload)
+        if found is None:
+            for value in payload.values():
+                if isinstance(value, dict):
+                    found = _find_wrapped_list(value)
+                    if found is not None:
+                        break
+        if found is not None:
+            return [r for r in found if isinstance(r, dict)]
         return [payload]
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
     return []
+
+
+_OBJECT_WRAPPER_KEYS = ("data", "result", "portfolio", "account")
+
+
+def _unwrap_object(payload: Any) -> dict:
+    """Unwrap a single-object response, e.g. ``{"data": {...}} -> {...}``.
+
+    Complementary to :func:`_as_records`/:func:`_find_wrapped_list`, which
+    look for a *list*. Some tools -- Robinhood's ``portfolio`` confirmed
+    live (2026-08) -- return one object, not a collection, still wrapped
+    under a key like ``"data"``. Passing that straight to ``_as_records``
+    finds no list anywhere and falls back to treating the whole wrapper as
+    one opaque record, which silently breaks every ``_pick`` call against
+    it -- the field it's looking for is one level too deep to see.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    for key in _OBJECT_WRAPPER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
 
 
 def _pick(rec: dict, *keys, default=None):

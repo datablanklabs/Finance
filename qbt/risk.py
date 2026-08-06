@@ -124,16 +124,24 @@ class RiskGate:
     Applied in order:
 
     1. **Per-name cap** -- clip any single weight to ``max_weight``.
-    2. **Volatility target** -- scale the whole book so its forecast
-       volatility is ``target_vol``. Forecast comes from the proposed weights
-       and a trailing covariance matrix, not from a single asset's vol, so
-       correlation is accounted for.
+    2. **Volatility target** -- scale the whole book toward ``target_vol``.
+       Forecast comes from the proposed weights and a trailing covariance
+       matrix, not from a single asset's vol, so correlation is accounted
+       for. With the default ``max_vol_scale=1.0`` this can only ever
+       de-risk an over-vol book, never lever up an under-vol one to reach
+       the target -- raise ``max_vol_scale`` above 1.0 if you actually want
+       that (and mean to take on leverage to get it).
     3. **Gross cap** -- hard ceiling on total exposure. Leave at 1.0 for a
        cash account; above 1.0 requires margin and changes your risk profile
        more than the number suggests.
     4. **Drawdown breaker** -- go flat once peak-to-trough loss exceeds
-       ``max_drawdown``, and stay flat until equity recovers past
-       ``resume_at`` of the peak.
+       ``max_drawdown``, and stay flat until a *shadow* book recovers past
+       ``resume_at`` of the peak (see :meth:`apply` for why it has to be a
+       shadow book, not the real one).
+    5. **PDT limit** -- once the rolling day-trade budget is exhausted,
+       block opening any *new* position (a symbol going from flat to held);
+       closing or trimming an existing one is still allowed, the same
+       restriction a real PDT-flagged margin account is placed under.
 
     Set ``target_vol=None`` to disable vol targeting and study the raw signal.
     """
@@ -147,6 +155,10 @@ class RiskGate:
     max_drawdown: float | None = 0.20
     resume_at: float = 0.90
     _halted: bool = field(default=False, init=False, repr=False)
+    _shadow_ratio: float = field(default=1.0, init=False, repr=False)
+    _shadow_weights: pd.Series = field(
+        default_factory=lambda: pd.Series(dtype=float), init=False, repr=False
+    )
 
     # -- helpers ----------------------------------------------------------
 
@@ -206,14 +218,37 @@ class RiskGate:
         if self.max_drawdown is not None:
             dd = ctx.drawdown
             if self._halted:
-                if ctx.equity >= self.resume_at * ctx.peak_equity:
+                # The real book is flat while halted, so its equity -- and
+                # therefore ctx.peak_equity, which only ever ratchets up
+                # from realised equity -- cannot move on its own. Comparing
+                # ctx.equity against resume_at * ctx.peak_equity here would
+                # mean "recover while holding nothing," which is never
+                # possible once dd has already crossed max_drawdown. Instead
+                # track what the pre-halt (risk-adjusted) book *would* have
+                # earned had we stayed invested, using each day's realised
+                # returns applied to the weights frozen at the moment of
+                # tripping. That shadow return is the actual signal for
+                # "has the market recovered" -- independent of the fact
+                # that we're sitting it out.
+                if len(ctx.returns) > 0 and not self._shadow_weights.empty:
+                    shadow = self._shadow_weights.reindex(
+                        ctx.returns.columns
+                    ).fillna(0.0)
+                    today_ret = float((shadow * ctx.returns.iloc[-1].fillna(0.0)).sum())
+                    self._shadow_ratio *= 1.0 + today_ret
+                if self._shadow_ratio >= self.resume_at:
                     self._halted = False
-                    notes.append("drawdown breaker reset")
+                    notes.append(
+                        f"drawdown breaker reset (shadow recovery "
+                        f"{self._shadow_ratio:.1%} of peak)"
+                    )
                 else:
                     halted = True
             elif dd >= self.max_drawdown:
                 self._halted = True
                 halted = True
+                self._shadow_weights = w.copy()
+                self._shadow_ratio = 1.0 - dd
                 notes.append(
                     f"drawdown breaker tripped at {dd:.1%} "
                     f"(limit {self.max_drawdown:.0%})"
@@ -223,8 +258,21 @@ class RiskGate:
                 if "breaker tripped" not in " ".join(notes):
                     notes.append(f"halted, drawdown {dd:.1%}")
 
+        # 5. PDT limit -- block new entries only, closes/trims still allowed
         if ctx.day_trades_remaining <= 0:
-            notes.append("no day trades remaining under PDT rule")
+            current = (
+                ctx.positions.reindex(w.index).fillna(0.0)
+                if ctx.positions is not None
+                else pd.Series(0.0, index=w.index)
+            )
+            currently_flat = current.abs() < 1e-9
+            would_open = currently_flat & (w.abs() > 1e-9)
+            if would_open.any():
+                notes.append(
+                    f"PDT limit reached: blocked {int(would_open.sum())} new "
+                    "entrie(s) (closes/trims of existing positions still allowed)"
+                )
+                w = w.mask(would_open, 0.0)
 
         return RiskDecision(
             weights=w,
@@ -239,3 +287,5 @@ class RiskGate:
     def reset(self) -> None:
         """Clear latched state. Call between independent backtest runs."""
         self._halted = False
+        self._shadow_ratio = 1.0
+        self._shadow_weights = pd.Series(dtype=float)

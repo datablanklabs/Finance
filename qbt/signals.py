@@ -2,13 +2,28 @@
 
 Every strategy implements one method::
 
-    target_weights(view: PricePanel) -> pd.Series
+    target_weights(
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series
 
 ``view`` is already sliced to the decision bar, so the last row of
-``view.close`` is "today". Strategies are pure: no I/O, no broker calls, no
-mutation of the view, no access to the future. The returned Series is indexed
-by symbol and holds *fractions of equity*; it need not sum to one -- anything
-unallocated is cash, and the risk gate is what enforces gross limits.
+``view.close`` is "today". ``fundamentals``, ``macros``, ``corps``, and
+``options``, when the caller has them, have already been through the same
+firewall -- see e.g. :meth:`~qbt.fundamentals.FundamentalsPanel.as_of` -- so
+a strategy is free to call ``.snapshot(view.last_date())`` on any of them
+without re-deriving the cutoff itself. ``fundamentals``, ``corps``, and
+``options`` are per symbol; ``macros`` is economy-wide (no symbol axis --
+every name in the universe sees the same reading). Most strategies here
+don't use any of them and simply ignore the parameters; they exist so the
+ones that do (or that you write) don't need a diverging method signature.
+Strategies are pure: no I/O, no broker calls, no mutation of any input, no
+access to the future. The returned Series is indexed by symbol and holds
+*fractions of equity*; it need not sum to one -- anything unallocated is
+cash, and the risk gate is what enforces gross limits.
 
 That purity is the whole point of the design. The identical strategy object is
 called by :mod:`qbt.engine` during a backtest and by :mod:`qbt.live` when
@@ -23,7 +38,11 @@ from typing import Protocol, Sequence, runtime_checkable
 import numpy as np
 import pandas as pd
 
+from .corporate import DEFAULT_WINDOW_DAYS, CorpsPanel
 from .data import PricePanel
+from .fundamentals import FundamentalsPanel
+from .macro import MacrosPanel
+from .options import OptionsPanel
 
 __all__ = [
     "Strategy",
@@ -32,12 +51,16 @@ __all__ = [
     "TimeSeriesMomentum",
     "ShortHorizonReversal",
     "TrendFilter",
+    "FundamentalsValueFilter",
+    "MacroRegimeFilter",
     "Composite",
     "InverseVolWeighted",
     "PairsTrading",
     "MultiFactorCrossSectional",
     "CalendarSeasonality",
     "RiskParityAllocation",
+    "OptionsMeanReversion",
+    "InsiderEventDrift",
 ]
 
 
@@ -52,7 +75,14 @@ class Strategy(Protocol):
         """Bars of history required before this strategy emits weights."""
         ...
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         """Desired portfolio as fractions of equity, indexed by symbol."""
         ...
 
@@ -85,7 +115,14 @@ class EqualWeightBuyHold:
     def min_history(self) -> int:
         return 2
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
         if names:
@@ -141,7 +178,14 @@ class CrossSectionalMomentum:
             return pd.Series(dtype=float)
         return view.select(names).trailing_return(self.lookback, self.skip).dropna()
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         scores = self.score(view)
         if scores.empty:
@@ -199,7 +243,14 @@ class TimeSeriesMomentum:
             ok &= sub.trailing_return(self.lookback) > 0.0
         return ok.fillna(False)
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         ok = self.qualifies(view)
         held = list(ok.index[ok])
@@ -252,7 +303,14 @@ class ShortHorizonReversal:
         sd = sd.replace(0.0, np.nan)
         return ((roll.iloc[-1] - mu) / sd).dropna()
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         z = self.score(view)
         if z.empty:
@@ -293,14 +351,187 @@ class TrendFilter:
     def min_history(self) -> int:
         return max(self.inner.min_history, self.lookback + 2)
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
-        w = self.inner.target_weights(view)
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
         if w.abs().sum() == 0:
             return w
         ma = view.close.tail(self.lookback).mean()
         last = view.close.iloc[-1]
         blocked = (last <= ma).reindex(w.index).fillna(True)
         return w.mask(blocked, 0.0)
+
+
+@dataclass
+class FundamentalsValueFilter:
+    """Wrap a strategy and zero out names failing a fundamentals screen.
+
+    Same role :class:`TrendFilter` plays for price trend, applied to a
+    fundamentals ratio instead: momentum, reversal, whatever picks the
+    names, this decides which of those picks are allowed to trade. Weight
+    removed by the filter becomes cash rather than being redistributed to
+    the names that pass -- same reasoning as :class:`TrendFilter`: this is
+    meant to reduce exposure to picks that fail the screen, not reshuffle
+    conviction among survivors.
+
+    ``metric`` must be a column :class:`~qbt.fundamentals.
+    FundamentalsRepository` actually produced (e.g. ``"ratios_pe_ratio"``)
+    -- check ``fundamentals.metrics`` if unsure. Set ``max_value`` for a
+    cheap-valuation screen (block names above it, e.g. a P/E ceiling),
+    ``min_value`` for a floor (e.g. a minimum margin), or both for a band.
+
+    Two different "we don't know" cases get two different answers, and the
+    difference matters: a name with no reading for ``metric`` is blocked --
+    the same conservative default :class:`TrendFilter` uses for names with
+    too little price history, since trading a name you can't screen defeats
+    the point of screening. But ``fundamentals`` being entirely absent
+    (``None``, or a caller who never wired up a
+    :class:`~qbt.fundamentals.FundamentalsRepository`) passes the inner
+    strategy's weights through unchanged rather than blocking everything --
+    the alternative would make this filter capable of silently flattening
+    an entire book just because someone forgot the ``fundamentals=``
+    keyword, which is a far more dangerous failure mode than a no-op.
+    """
+
+    inner: Strategy
+    metric: str
+    max_value: float | None = None
+    min_value: float | None = None
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"{self.inner.name}+{self.metric}filter"
+        if self.max_value is None and self.min_value is None:
+            raise ValueError("set at least one of max_value/min_value")
+
+    @property
+    def min_history(self) -> int:
+        return self.inner.min_history
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        if w.abs().sum() == 0:
+            return w
+        if fundamentals is None or len(fundamentals.frame) == 0:
+            return w
+
+        snap = fundamentals.snapshot(view.last_date())
+        if self.metric not in snap.columns:
+            return w
+
+        values = snap[self.metric].reindex(w.index)
+        blocked = values.isna()
+        if self.max_value is not None:
+            blocked = blocked | (values > self.max_value)
+        if self.min_value is not None:
+            blocked = blocked | (values < self.min_value)
+        return w.mask(blocked, 0.0)
+
+
+@dataclass
+class MacroRegimeFilter:
+    """Wrap a strategy and de-risk the whole book in an unfavourable macro regime.
+
+    Different axis from :class:`TrendFilter`/:class:`FundamentalsValueFilter`
+    on purpose: those decide *which names* trade, per symbol. Macro data has
+    no symbol axis -- see :mod:`qbt.macro` -- so this decides *how much of
+    the book* trades, as a single scalar applied to every position, the same
+    role portfolio-level vol targeting plays in :class:`qbt.risk.RiskGate`.
+    Compose them the same way :class:`InverseVolWeighted` composes with the
+    risk gate: this changes total exposure, the picks underneath are
+    untouched.
+
+    Configure any combination of ``max_level``/``min_level`` (block outside
+    an absolute range -- e.g. only trade while ``fed_funds_rate`` is below
+    some level) and ``max_increase`` (block after too sharp a rise over
+    ``lookback`` trading days -- e.g. a rate hiking cycle). ``metric`` must
+    be a column :class:`~qbt.macro.MacrosRepository` actually produced --
+    check ``macros.metrics`` if unsure.
+
+    Same reasoning as :class:`FundamentalsValueFilter` for what happens when
+    the data isn't there, with the same asymmetry and for the same reason:
+    ``macros`` being entirely absent passes the inner strategy's weights
+    through unchanged (a no-op, not a silent full flatten from a missed
+    keyword argument). It's specifically the *regime read as unfavourable*
+    that scales the book down -- absence of information is not itself
+    treated as bad news.
+    """
+
+    inner: Strategy
+    metric: str
+    max_level: float | None = None
+    min_level: float | None = None
+    max_increase: float | None = None
+    lookback: int = 63
+    scale_when_blocked: float = 0.0
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"{self.inner.name}+{self.metric}regime"
+        if self.max_level is None and self.min_level is None and self.max_increase is None:
+            raise ValueError(
+                "set at least one of max_level/min_level/max_increase"
+            )
+        if not 0.0 <= self.scale_when_blocked <= 1.0:
+            raise ValueError("scale_when_blocked must be in [0, 1]")
+
+    @property
+    def min_history(self) -> int:
+        return max(self.inner.min_history, self.lookback + 2)
+
+    def blocked(self, view: PricePanel, macros: MacrosPanel | None) -> bool:
+        """Exposed separately so research code can study the regime read directly."""
+        if macros is None or len(macros.frame) == 0:
+            return False
+
+        today = view.last_date()
+        snap_now = macros.snapshot(today)
+        if self.metric not in snap_now.index:
+            return False
+        level_now = float(snap_now[self.metric])
+
+        if self.max_level is not None and level_now > self.max_level:
+            return True
+        if self.min_level is not None and level_now < self.min_level:
+            return True
+        if self.max_increase is not None and len(view.dates) > self.lookback:
+            prior_date = view.dates[-(self.lookback + 1)]
+            snap_then = macros.snapshot(prior_date)
+            if self.metric in snap_then.index:
+                change = level_now - float(snap_then[self.metric])
+                if change > self.max_increase:
+                    return True
+        return False
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        if w.abs().sum() == 0:
+            return w
+        if self.blocked(view, macros):
+            return w * self.scale_when_blocked
+        return w
 
 
 @dataclass
@@ -328,17 +559,33 @@ class Composite:
     def min_history(self) -> int:
         return max(s.min_history for s, _ in self.members)
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         out = _empty(view)
         for (strat, _), share in zip(self.members, self._shares):
-            out = out.add(strat.target_weights(view).reindex(out.index).fillna(0.0) * share)
+            member_w = strat.target_weights(view, fundamentals, macros, corps, options)
+            out = out.add(member_w.reindex(out.index).fillna(0.0) * share)
         return out
 
-    def contributions(self, view: PricePanel) -> pd.DataFrame:
+    def contributions(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.DataFrame:
         """Per-member weights, for attribution during research."""
         cols = {}
         for (strat, _), share in zip(self.members, self._shares):
-            cols[strat.name] = strat.target_weights(view).reindex(view.symbols).fillna(0.0) * share
+            member_w = strat.target_weights(view, fundamentals, macros, corps, options)
+            cols[strat.name] = member_w.reindex(view.symbols).fillna(0.0) * share
         return pd.DataFrame(cols)
 
 
@@ -363,8 +610,15 @@ class InverseVolWeighted:
     def min_history(self) -> int:
         return max(self.inner.min_history, self.vol_lookback + 2)
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
-        w = self.inner.target_weights(view)
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
         held = w[w.abs() > 0]
         if held.empty:
             return w
@@ -460,7 +714,14 @@ class PairsTrading:
             return float("nan")
         return float((spread.iloc[-1] - mu) / sd)
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         pairs = self.select_pairs(view)
         if not pairs:
@@ -574,7 +835,14 @@ class MultiFactorCrossSectional:
         combined = pd.concat(parts, axis=1).dropna(how="any").sum(axis=1)
         return combined
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         scores = self.score(view)
         if scores.empty:
@@ -642,7 +910,14 @@ class CalendarSeasonality:
         near_month_start = today.day <= self.post_days
         return near_month_end or near_month_start
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
         if not names or not self.in_window(view):
@@ -730,7 +1005,14 @@ class RiskParityAllocation:
     def min_history(self) -> int:
         return self.cov_lookback + 2
 
-    def target_weights(self, view: PricePanel) -> pd.Series:
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
         if not names:
@@ -756,4 +1038,245 @@ class RiskParityAllocation:
 
         rp = _risk_parity_weights(cov.loc[names, names], max_iter=self.max_iter)
         w.loc[rp.index] = self.gross * rp
+        return w
+
+
+# ---------------------------------------------------------------------------
+# Options-derived mean reversion
+# ---------------------------------------------------------------------------
+
+
+def _zscore_last(daily: pd.DataFrame) -> pd.Series:
+    """Per-column time-series z-score of the last row against its own window.
+
+    Distinct from :meth:`MultiFactorCrossSectional._zscore`, which is
+    *cross-sectional* (one snapshot, many symbols). This is the opposite
+    axis: one symbol's own recent history, which is what "elevated relative
+    to normal" has to mean for a signal like implied vol that has wildly
+    different baseline levels across symbols.
+    """
+    mu = daily.mean()
+    sd = daily.std(ddof=0).replace(0.0, np.nan)
+    z = (daily.iloc[-1] - mu) / sd
+    return z.dropna()
+
+
+@dataclass
+class OptionsMeanReversion:
+    """Contrarian: buy names where options-implied fear is most stretched.
+
+    Two options-market gauges function as fear indicators: elevated implied
+    vol (``iv_atm_near``) and unusually heavy put buying relative to calls
+    (``put_call_volume_ratio``). Both are scored *against each symbol's own
+    trailing history* (a time-series z-score, not a cross-sectional one --
+    a 40% IV name and an 80% IV name can both be "stretched" for themselves),
+    blended by ``iv_weight``/``pcr_weight``, and the names with the highest
+    combined score are bought at equal weight. The bet is the same one
+    behind fading a VIX spike or extreme put/call ratio: elevated
+    options-implied stress tends to fade faster than it resolves into an
+    actual price decline, so the mean reversion is in the fear gauge, not
+    necessarily in the price move that produced it.
+
+    This is the one strategy in this module built for options data
+    specifically because it's the one new data source in this package that
+    is genuinely daily -- see :mod:`qbt.options`. It only works with names
+    that have enough archived options history (``iv_window`` trading days);
+    names without it are silently skipped rather than scored on partial
+    data. Note the risk profile, same caveat as :class:`ShortHorizonReversal`:
+    this is short-vol-shaped. Fear is sometimes right. A name that's
+    "stretched" because something is genuinely deteriorating will keep
+    getting more stretched, and this strategy has no way to tell the
+    difference from here.
+    """
+
+    iv_window: int = 20
+    iv_weight: float = 0.5
+    pcr_weight: float = 0.5
+    min_z: float = 1.0
+    top_n: int = 5
+    gross: float = 1.0
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"optrevert_{self.iv_window}_{self.top_n}"
+        if not (self.iv_weight or self.pcr_weight):
+            raise ValueError("at least one of iv_weight/pcr_weight must be nonzero")
+
+    @property
+    def min_history(self) -> int:
+        return self.iv_window + 2
+
+    def score(self, view: PricePanel, options: OptionsPanel | None) -> pd.Series:
+        """Exposed separately so research code can study the raw signal."""
+        if options is None or len(options.frame) == 0:
+            return pd.Series(dtype=float)
+        names = _tradeable(view, self.min_history)
+        names = [n for n in names if n in options.symbols]
+        if not names:
+            return pd.Series(dtype=float)
+
+        need = min(self.iv_window + 1, len(view.dates))
+        dates = view.dates[-need:]
+        if len(dates) < 2:
+            return pd.Series(dtype=float)
+
+        daily = options.to_daily(
+            dates, symbols=names, metrics=["iv_atm_near", "put_call_volume_ratio"]
+        )
+
+        parts = []
+        iv = daily.get("iv_atm_near")
+        if iv is not None and self.iv_weight:
+            parts.append(self.iv_weight * _zscore_last(iv))
+        pcr = daily.get("put_call_volume_ratio")
+        if pcr is not None and self.pcr_weight:
+            parts.append(self.pcr_weight * _zscore_last(pcr))
+        if not parts:
+            return pd.Series(dtype=float)
+
+        return pd.concat(parts, axis=1).dropna(how="any").sum(axis=1)
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = _empty(view)
+        z = self.score(view, options)
+        if z.empty:
+            return w
+        candidates = z[z >= abs(self.min_z)]
+        if candidates.empty:
+            return w
+        picks = candidates.nlargest(min(self.top_n, len(candidates)))
+        w.loc[picks.index] = self.gross / len(picks)
+        return w
+
+
+# ---------------------------------------------------------------------------
+# Insider-buying / 8-K event drift
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InsiderEventDrift:
+    """Long fresh insider buying that follows an 8-K, held for a short drift window.
+
+    An 8-K alone is a coin flip -- it just means something happened, not
+    whether it's good news. Insiders buying in the open market shortly
+    after one is a much more specific signal: they've seen the same event
+    the market has and are putting their own money on it being overreacted
+    to (or simply fine). That combination -- a recent 8-K *and* fresh net
+    insider buying -- is the entry condition here, which is a real, if
+    modest, empirical effect (see Lakonishok & Lee 2001 on insider-trading
+    drift, and the broader post-8-K/PEAD literature this rhymes with).
+
+    The "held for a short drift window" part is deliberately *not*
+    implemented with position-entry bookkeeping. Every other strategy in
+    this module is a pure function of today's data that "unwinds on its
+    own" as the underlying signal fades (see :class:`PairsTrading`'s
+    docstring) rather than remembering when it opened a position, and this
+    one follows the same discipline: it compares today's
+    :meth:`~qbt.corporate.CorpsPanel.snapshot` against the snapshot from
+    ``drift_days`` trading days ago, and only holds a name while its
+    trailing insider-buy/8-K counts have *increased* since then -- i.e.
+    while a qualifying event is still inside the window. Once the event
+    ages out, the comparison stops firing and the position exits on the
+    next rebalance, with no state carried between calls.
+
+    ``window_days`` must match whatever
+    :class:`~qbt.corporate.CorpsRepository` produced ``corps`` (it's baked
+    into the metric names, e.g. ``filed_8k_count_90d``) -- a mismatch isn't
+    an error, it just means every name silently fails to qualify, since a
+    missing column reads as "no activity" rather than "unknown." Cheap to
+    get wrong, easy to check: compare ``corps.metrics`` against
+    ``qbt.corporate.DEFAULT_WINDOW_DAYS`` or whatever you configured.
+    """
+
+    drift_days: int = 10
+    window_days: int = DEFAULT_WINDOW_DAYS
+    require_8k: bool = True
+    top_n: int | None = 10
+    weighting: str = "equal"
+    gross: float = 1.0
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"insiderdrift_{self.drift_days}_{self.top_n}"
+        if self.weighting not in ("equal", "rank"):
+            raise ValueError("weighting must be 'equal' or 'rank'")
+        if self.drift_days < 1:
+            raise ValueError("drift_days must be >= 1")
+
+    @property
+    def min_history(self) -> int:
+        return self.drift_days + 2
+
+    def _metric_col(self, snap: pd.DataFrame, base: str, names: list[str]) -> pd.Series:
+        metric = f"{base}_{self.window_days}d"
+        if metric not in snap.columns:
+            return pd.Series(0.0, index=names)
+        return snap[metric].reindex(names).fillna(0.0)
+
+    def score(self, view: PricePanel, corps: CorpsPanel | None) -> pd.Series:
+        """Net insider shares for names with a fresh qualifying event.
+
+        Exposed separately so research code can study the raw signal.
+        Positive-valued only -- a name mid-drift with net insider *selling*
+        doesn't qualify no matter how recent the 8-K was.
+        """
+        if corps is None or len(corps.frame) == 0:
+            return pd.Series(dtype=float)
+        names = _tradeable(view, self.min_history)
+        if not names:
+            return pd.Series(dtype=float)
+        if len(view.dates) <= self.drift_days:
+            return pd.Series(dtype=float)
+
+        today = view.last_date()
+        prior_date = view.dates[-(self.drift_days + 1)]
+        now = corps.snapshot(today)
+        then = corps.snapshot(prior_date)
+        if now.empty:
+            return pd.Series(dtype=float)
+
+        buy_now = self._metric_col(now, "insider_buy_count", names)
+        buy_then = self._metric_col(then, "insider_buy_count", names)
+        fresh_buy = buy_now > buy_then
+
+        if self.require_8k:
+            eightk_now = self._metric_col(now, "filed_8k_count", names)
+            eightk_then = self._metric_col(then, "filed_8k_count", names)
+            fresh_buy &= eightk_now > eightk_then
+
+        net_now = self._metric_col(now, "insider_net_shares", names)
+        qualifies = fresh_buy & (net_now > 0)
+        return net_now[qualifies]
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = _empty(view)
+        candidates = self.score(view, corps)
+        if candidates.empty:
+            return w
+
+        k = len(candidates) if self.top_n is None else min(self.top_n, len(candidates))
+        picks = candidates.nlargest(k)
+
+        if self.weighting == "equal":
+            w.loc[picks.index] = self.gross / len(picks)
+        else:
+            ranks = picks.rank()
+            w.loc[picks.index] = self.gross * ranks / ranks.sum()
         return w

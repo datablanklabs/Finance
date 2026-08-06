@@ -29,6 +29,7 @@ from .broker import (
     RobinhoodMCPBroker,
     ToolBinding,
 )
+from .corporate import CorpsPanel, CorpsRepository
 from .data import (
     OpenBBRepository,
     PricePanel,
@@ -46,7 +47,10 @@ from .engine import (
     rebalance_dates,
     summary_stats,
 )
+from .fundamentals import FundamentalsPanel, FundamentalsRepository
 from .live import LivePlan, LiveSignalRunner, OrderIntent, PortfolioState
+from .macro import MacrosPanel, MacrosRepository
+from .options import OptionsPanel, OptionsRepository, derive_indicators as derive_options_indicators
 from .orders import AuditLog, ExecutionPolicy, ExecutionReport, OrderManager
 from .research import (
     ParameterSweep,
@@ -66,8 +70,12 @@ from .signals import (
     Composite,
     CrossSectionalMomentum,
     EqualWeightBuyHold,
+    FundamentalsValueFilter,
+    InsiderEventDrift,
     InverseVolWeighted,
+    MacroRegimeFilter,
     MultiFactorCrossSectional,
+    OptionsMeanReversion,
     PairsTrading,
     RiskParityAllocation,
     ShortHorizonReversal,
@@ -81,10 +89,16 @@ __version__ = "0.1.0"
 __all__ = [
     "PricePanel", "PriceRepository", "OpenBBRepository", "SyntheticRepository",
     "align_panels",
+    "FundamentalsPanel", "FundamentalsRepository",
+    "MacrosPanel", "MacrosRepository",
+    "CorpsPanel", "CorpsRepository",
+    "OptionsPanel", "OptionsRepository", "derive_options_indicators",
     "Strategy", "EqualWeightBuyHold", "CrossSectionalMomentum",
     "TimeSeriesMomentum", "ShortHorizonReversal", "TrendFilter", "Composite",
+    "FundamentalsValueFilter", "MacroRegimeFilter",
     "InverseVolWeighted", "PairsTrading", "MultiFactorCrossSectional",
-    "CalendarSeasonality", "RiskParityAllocation",
+    "CalendarSeasonality", "RiskParityAllocation", "OptionsMeanReversion",
+    "InsiderEventDrift",
     "RiskGate", "RiskContext", "RiskDecision", "DayTradeLedger",
     "Backtester", "BacktestResult", "CostModel", "ExecutionConfig",
     "rebalance_dates", "summary_stats", "drawdown_series", "compare",

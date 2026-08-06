@@ -28,7 +28,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .corporate import CorpsPanel
 from .data import PricePanel
+from .fundamentals import FundamentalsPanel
+from .macro import MacrosPanel
+from .options import OptionsPanel
 from .risk import DayTradeLedger, RiskContext, RiskGate
 from .signals import Strategy
 
@@ -113,24 +117,32 @@ class ExecutionConfig:
 
 
 def rebalance_dates(index: pd.DatetimeIndex, freq: str | int) -> pd.DatetimeIndex:
-    """Decision bars. ``freq`` is 'D', 'W', 'M', 'Q', or every-n-bars as int.
+    """Decision bars. ``freq`` is 'D', 'W', 'M', 'Q', 'A'/'Y', or every-n-bars as int.
 
     Implemented by period grouping rather than ``resample`` so it behaves the
     same across pandas versions, and so the returned dates are always real
-    trading days present in ``index``.
+    trading days present in ``index``. Matches on the first letter, so
+    ``"Monthly"``/``"monthly"``/``"M"`` are all fine -- but an unrecognized
+    string (a typo, or a pandas-style offset like ``"3M"`` that this
+    function does not support) raises rather than silently rebalancing
+    every single day, which is what a bad string used to fall back to.
     """
     if isinstance(freq, int):
         if freq < 1:
             raise ValueError("integer freq must be >= 1")
         return index[::freq]
 
-    key = {"D": None, "W": "W", "M": "M", "Q": "Q", "A": "Y", "Y": "Y"}.get(
-        freq.upper()[0] if freq else "M"
-    )
-    if freq.upper().startswith("D"):
+    if not freq:
+        freq = "M"
+    first = freq.upper()[0]
+    if first == "D":
         return index
+    key = {"W": "W", "M": "M", "Q": "Q", "A": "Y", "Y": "Y"}.get(first)
     if key is None:
-        return index
+        raise ValueError(
+            f"unrecognized rebalance freq {freq!r}; use 'D', 'W', 'M', 'Q', "
+            "'A'/'Y', or an integer bar count"
+        )
     periods = index.to_period(key)
     s = pd.Series(np.arange(len(index)), index=periods)
     last = s.groupby(level=0).last().to_numpy()
@@ -203,6 +215,25 @@ class Backtester:
         to the current decision bar.
     strategy:
         Any object satisfying :class:`qbt.signals.Strategy`.
+    fundamentals:
+        Optional. Full filing history; the engine truncates it to
+        ``fundamentals.as_of(date)`` before every decision, the same way it
+        truncates ``panel``, so a strategy that reads it can't see a filing
+        before its own filing date. Strategies that ignore the argument are
+        unaffected either way -- pass ``None`` (or leave it out) and nothing
+        about their behaviour changes.
+    macros:
+        Optional. Full macro-indicator history, truncated to
+        ``macros.as_of(date)`` the same way. Economy-wide rather than
+        per-symbol -- see :mod:`qbt.macro`.
+    corps:
+        Optional. Full corporate-filings-indicator history (filing cadence,
+        insider activity), truncated the same way -- see
+        :mod:`qbt.corporate`.
+    options:
+        Optional. Full options-indicator history, truncated the same way --
+        see :mod:`qbt.options` for why this one is realistically only
+        populated for backtests over a window you've personally archived.
     risk_gate:
         Optional. Omit to study raw strategy behaviour with no risk overlay.
     rebalance:
@@ -213,6 +244,10 @@ class Backtester:
         self,
         panel: PricePanel,
         strategy: Strategy,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
         risk_gate: RiskGate | None = None,
         cost_model: CostModel | None = None,
         execution: ExecutionConfig | None = None,
@@ -223,6 +258,10 @@ class Backtester:
     ) -> None:
         self.panel = panel
         self.strategy = strategy
+        self.fundamentals = fundamentals
+        self.macros = macros
+        self.corps = corps
+        self.options = options
         self.gate = risk_gate
         self.costs = cost_model or CostModel()
         self.exec = execution or ExecutionConfig()
@@ -373,7 +412,23 @@ class Backtester:
                 )
                 peak_at_decision = max(peak, equity_at_decision)
                 view = self.panel.as_of(date)
-                proposed = self.strategy.target_weights(view)
+                fview = (
+                    self.fundamentals.as_of(date)
+                    if self.fundamentals is not None
+                    else None
+                )
+                mview = (
+                    self.macros.as_of(date) if self.macros is not None else None
+                )
+                cview = (
+                    self.corps.as_of(date) if self.corps is not None else None
+                )
+                oview = (
+                    self.options.as_of(date) if self.options is not None else None
+                )
+                proposed = self.strategy.target_weights(
+                    view, fview, mview, cview, oview
+                )
 
                 if self.gate is not None:
                     ctx = RiskContext(

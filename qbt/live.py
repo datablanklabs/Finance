@@ -25,7 +25,11 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .corporate import CorpsPanel
 from .data import PricePanel
+from .fundamentals import FundamentalsPanel
+from .macro import MacrosPanel
+from .options import OptionsPanel
 from .risk import DayTradeLedger, RiskContext, RiskDecision, RiskGate
 from .signals import Strategy
 
@@ -139,7 +143,8 @@ class LiveSignalRunner:
         risk_gate: RiskGate | None = None,
         min_trade_notional: float = 10.0,
         allow_fractional: bool = True,
-        max_turnover: float | None = 0.60,
+        max_turnover: float | None = 0.67,
+        allow_full_turnover_from_flat: bool = True,
         day_trade_ledger: DayTradeLedger | None = None,
     ) -> None:
         self.strategy = strategy
@@ -147,6 +152,7 @@ class LiveSignalRunner:
         self.min_trade_notional = min_trade_notional
         self.allow_fractional = allow_fractional
         self.max_turnover = max_turnover
+        self.allow_full_turnover_from_flat = allow_full_turnover_from_flat
         self.ledger = day_trade_ledger or DayTradeLedger()
 
     def plan(
@@ -155,10 +161,24 @@ class LiveSignalRunner:
         state: PortfolioState,
         asof: pd.Timestamp | None = None,
         tradeable: Sequence[str] | None = None,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
     ) -> LivePlan:
+        """Produce today's plan.
+
+        ``fundamentals``, ``macros``, ``corps``, and ``options``, if given,
+        are each truncated here to ``as_of(asof_ts)`` before ever reaching
+        the strategy, the same firewall the backtester applies.
+        """
         warnings: list[str] = []
         view = panel.as_of(asof) if asof is not None else panel
         asof_ts = view.last_date()
+        fview = fundamentals.as_of(asof_ts) if fundamentals is not None else None
+        mview = macros.as_of(asof_ts) if macros is not None else None
+        cview = corps.as_of(asof_ts) if corps is not None else None
+        oview = options.as_of(asof_ts) if options is not None else None
 
         staleness = (pd.Timestamp.today().normalize() - asof_ts).days
         if staleness > 4:
@@ -182,7 +202,7 @@ class LiveSignalRunner:
         peak = state.peak_equity if state.peak_equity is not None else equity
         current_w = state.weights(prices)
 
-        proposed = self.strategy.target_weights(view)
+        proposed = self.strategy.target_weights(view, fview, mview, cview, oview)
         if tradeable is not None:
             blocked = [s for s in proposed.index if s not in set(tradeable)]
             if any(abs(proposed.get(s, 0.0)) > 1e-9 for s in blocked):
@@ -211,11 +231,27 @@ class LiveSignalRunner:
         if self.max_turnover is not None and equity > 0:
             turnover = sum(abs(i.notional) for i in intents) / equity
             if turnover > self.max_turnover:
-                warnings.append(
-                    f"turnover {turnover:.1%} exceeds cap {self.max_turnover:.0%}, "
-                    "plan withheld for review"
-                )
-                intents = []
+                # A flat account's first-ever buildout is structurally ~100%
+                # turnover -- current weights are all zero, so turnover and
+                # gross exposure are the same number. Same mechanical
+                # exemption as ExecutionPolicy.allow_full_turnover_from_flat
+                # in qbt/orders.py: the account currently holds zero
+                # positions, full stop, not a judgment call about whether
+                # the trade looks reasonable.
+                flat = state.shares.empty or bool((state.shares.abs() < 1e-9).all())
+                if self.allow_full_turnover_from_flat and flat:
+                    warnings.append(
+                        f"turnover {turnover:.1%} exceeds cap "
+                        f"{self.max_turnover:.0%} but the account holds no "
+                        "positions -- the first buildout from cash is exempt "
+                        "(allow_full_turnover_from_flat)"
+                    )
+                else:
+                    warnings.append(
+                        f"turnover {turnover:.1%} exceeds cap {self.max_turnover:.0%}, "
+                        "plan withheld for review"
+                    )
+                    intents = []
 
         return LivePlan(
             asof=asof_ts,

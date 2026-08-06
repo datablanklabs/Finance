@@ -197,6 +197,8 @@ def return_autocorrelation(
     effect; positive at longer lags hints at trend.
     """
     rets = panel.returns()
+    n_dates, n_symbols = rets.shape
+    date_idx = np.repeat(np.arange(n_dates), n_symbols)
     rows = {}
     for lag in lags:
         if pooled:
@@ -209,8 +211,18 @@ def return_autocorrelation(
                 continue
             rho = float(np.corrcoef(x[ok], y[ok])[0, 1])
             n = int(ok.sum())
-            se = 1.0 / np.sqrt(n)
-            rows[lag] = {"autocorr": rho, "t_stat": rho / se, "n": n}
+            # n itself overstates independence: returns are strongly
+            # cross-sectionally correlated (market-wide moves), so pooling
+            # symbols x dates and treating every pair as an i.i.d. draw
+            # inflates the effective sample size by roughly the symbol
+            # count. The effective number of independent observations is
+            # much closer to the number of distinct dates than to n.
+            n_effective = int(np.unique(date_idx[ok]).size)
+            se = 1.0 / np.sqrt(n_effective)
+            rows[lag] = {
+                "autocorr": rho, "t_stat": rho / se, "n": n,
+                "n_effective": n_effective,
+            }
         else:
             per = rets.apply(lambda s: s.autocorr(lag=lag))
             rows[lag] = {"autocorr": float(per.mean()), "n": int(per.notna().sum())}

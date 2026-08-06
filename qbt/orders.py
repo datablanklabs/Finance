@@ -36,15 +36,21 @@ import os
 import socket
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as dtime, timezone
-from typing import Sequence
+from datetime import datetime, time as dtime, timedelta, timezone
+from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .broker import BrokerAccount, BrokerAdapter, BrokerOrder
 from .live import LivePlan, OrderIntent
+
+try:
+    import fcntl  # POSIX advisory file locking; unavailable on Windows.
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 __all__ = ["ExecutionPolicy", "OrderManager", "ExecutionReport", "AuditLog"]
 
@@ -118,7 +124,15 @@ class ExecutionPolicy:
 
     max_order_notional: float = 2_500.0
     max_plan_notional: float = 10_000.0
-    max_plan_turnover: float = 0.50
+    max_plan_turnover: float = 0.67
+    # A flat account's first-ever buildout is structurally ~100% turnover --
+    # current weights are all zero, so turnover and gross exposure are the
+    # same number. A cap meant to catch excess *rebalancing* churn would
+    # otherwise make it impossible to ever place the first trade. This is a
+    # second dumb, mechanical rule (account currently holds zero positions,
+    # full stop), not a judgment call about whether the trade "looks"
+    # reasonable -- consistent with this class's own design.
+    allow_full_turnover_from_flat: bool = True
     max_orders_per_cycle: int = 12
     max_position_weight: float = 0.35
     symbol_allowlist: tuple[str, ...] = ()
@@ -198,6 +212,34 @@ class OrderManager:
         self.journal_path = journal_path
         os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
 
+    # -- concurrency --------------------------------------------------------
+
+    @contextmanager
+    def _dedup_lock(self) -> Iterator[None]:
+        """Advisory exclusive lock scoped to ``journal_path``.
+
+        Guards the read-then-write dedup sequence in :meth:`execute` --
+        read what's already been submitted, decide what's left, submit it --
+        against a second :class:`OrderManager` racing the same journal, e.g.
+        an accidentally double-scheduled run. A per-instance lock (like
+        ``threading.Lock``) can't help here: the risk is two separate
+        instances, often in two separate processes, not two threads sharing
+        one object. Best-effort: POSIX only (``fcntl``); on platforms
+        without it this is a silent no-op, same as running without the lock
+        at all.
+        """
+        if fcntl is None:  # pragma: no cover
+            yield
+            return
+        lock_path = self.journal_path + ".lock"
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        with open(lock_path, "a") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
     # -- journal ----------------------------------------------------------
 
     def _journal(self, **fields) -> None:
@@ -259,16 +301,45 @@ class OrderManager:
             self.audit.emit("recover_clean", unresolved=0)
             return pd.DataFrame()
 
-        since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
-                                                   microsecond=0)
-        broker_orders = self.broker.get_orders(since=since)
+        submitting = {
+            key: next(e for e in es if e.get("stage") == "submitting")
+            for key, es in unresolved
+        }
+
+        # Anchor the broker query to when the earliest unresolved attempt
+        # actually happened, not to "today". recover() running on a later
+        # calendar day than the crash -- the process was down over a
+        # weekend, say, and comes back up Monday after a Friday-close
+        # crash -- would otherwise never even ask the broker about an
+        # order from before today's midnight, and a genuinely-placed order
+        # gets wrongly resolved as not_at_broker.
+        sub_times = []
+        for sub in submitting.values():
+            try:
+                sub_times.append(datetime.fromisoformat(sub["ts"]))
+            except (KeyError, ValueError, TypeError):
+                continue
+        since = (
+            min(sub_times) - timedelta(minutes=5)
+            if sub_times
+            else datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                     microsecond=0)
+        )
+        broker_orders = list(self.broker.get_orders(since=since))
+
         rows = []
-        for key, es in unresolved:
-            sub = next(e for e in es if e.get("stage") == "submitting")
+        for key, sub in submitting.items():
             fp = (str(sub.get("symbol", "")).upper(),
                   str(sub.get("side", "")).lower(),
                   round(float(sub.get("quantity", 0.0)) / 0.02))
-            match = next((o for o in broker_orders if o.fingerprint() == fp), None)
+            # Consume the match so a second unresolved entry with the same
+            # (symbol, side, quantity-bucket) -- two ghost entries from one
+            # crash, say -- can't also claim the same one broker order.
+            match_idx = next(
+                (i for i, o in enumerate(broker_orders) if o.fingerprint() == fp),
+                None,
+            )
+            match = broker_orders.pop(match_idx) if match_idx is not None else None
             outcome = "found_at_broker" if match else "not_at_broker"
             self._journal(stage="resolved", plan_id=sub.get("plan_id"),
                           intent_key=sub.get("intent_key"), outcome=outcome,
@@ -341,8 +412,19 @@ class OrderManager:
             turnover = gross / account.equity
             notes.append(f"turnover {turnover:.1%}")
             if turnover > self.policy.max_plan_turnover:
-                fatal.append(f"turnover {turnover:.1%} exceeds "
-                             f"{self.policy.max_plan_turnover:.0%}")
+                flat = account.positions.empty or bool(
+                    (account.positions.abs() < 1e-9).all()
+                )
+                if self.policy.allow_full_turnover_from_flat and flat:
+                    notes.append(
+                        f"turnover {turnover:.1%} exceeds "
+                        f"{self.policy.max_plan_turnover:.0%} but the account "
+                        "holds no positions -- the first buildout from cash is "
+                        "exempt (allow_full_turnover_from_flat)"
+                    )
+                else:
+                    fatal.append(f"turnover {turnover:.1%} exceeds "
+                                 f"{self.policy.max_plan_turnover:.0%}")
 
         if len(plan.intents) > self.policy.max_orders_per_cycle:
             fatal.append(f"{len(plan.intents)} orders exceeds "
@@ -402,84 +484,123 @@ class OrderManager:
             return report
         self.audit.emit("preflight_passed", plan_id=pid, notes="; ".join(notes))
 
-        # Everything already submitted for this plan, so a re-run is a no-op.
-        done = {
-            e.get("intent_key") for e in self._journal_entries()
-            if e.get("plan_id") == pid
-            and e.get("stage") in ("submitted", "rejected", "resolved")
-        }
+        # The read-then-write dedup sequence below (read what's already
+        # submitted, decide what's left, submit it) has to be one atomic
+        # section w.r.t. any other OrderManager -- another thread, or another
+        # process from an accidentally double-scheduled run -- racing the
+        # same journal_path, or both can read the same "nothing submitted
+        # yet" state and both place the same order.
+        with self._dedup_lock():
+            plan_entries = [
+                e for e in self._journal_entries() if e.get("plan_id") == pid
+            ]
+            # Everything already submitted for this plan, so a re-run is a no-op.
+            done = {
+                e.get("intent_key") for e in plan_entries
+                if e.get("stage") in ("submitted", "rejected", "resolved")
+            }
+            # An intent left dangling at "submitting" with no terminal stage
+            # means the *previous* attempt's outcome is unknown -- the
+            # broker call may have gone through, may not have (this is
+            # exactly the case the except-block below produces). Silently
+            # resubmitting here is how you get a real double-fill; recover()
+            # has to check the broker directly and close the loop (into
+            # "resolved") before this intent is safe to touch again.
+            pending_recovery = {
+                e.get("intent_key") for e in plan_entries
+                if e.get("stage") == "submitting"
+            } - done
 
-        allow = {s.upper() for s in self.policy.symbol_allowlist}
-        self._journal(stage="planned", plan_id=pid, n_intents=len(plan.intents))
+            allow = {s.upper() for s in self.policy.symbol_allowlist}
+            self._journal(stage="planned", plan_id=pid, n_intents=len(plan.intents))
 
-        for intent in plan.intents:
-            # Deliberately excludes quantity: within one plan there should be
-            # at most one order per symbol per side, and keying on a float
-            # would let a 1% equity drift defeat deduplication.
-            key = f"{intent.symbol}:{intent.side}"
+            for intent in plan.intents:
+                # Deliberately excludes quantity: within one plan there should be
+                # at most one order per symbol per side, and keying on a float
+                # would let a 1% equity drift defeat deduplication.
+                key = f"{intent.symbol}:{intent.side}"
 
-            if key in done:
-                report.skipped.append((intent, "already submitted for this plan"))
-                self.audit.emit("intent_deduplicated", plan_id=pid, intent=key)
-                continue
-            if allow and intent.symbol.upper() not in allow:
-                report.skipped.append((intent, "not on allowlist"))
-                self.audit.emit("intent_blocked", plan_id=pid, intent=key,
-                                reason="allowlist")
-                continue
-            if abs(intent.notional) > self.policy.max_order_notional:
-                report.skipped.append((intent, "exceeds per-order notional cap"))
-                self.audit.emit("intent_blocked", plan_id=pid, intent=key,
-                                reason="order_notional",
-                                notional=round(abs(intent.notional), 2))
-                continue
-
-            if self.policy.require_review:
-                review = self.broker.review_order(
-                    intent.symbol, intent.side, abs(intent.shares))
-                warns = review.get("warnings") or []
-                self.audit.emit("order_reviewed", plan_id=pid, intent=key,
-                                ok=review.get("ok"),
-                                est_price=review.get("estimated_price"),
-                                warnings="; ".join(map(str, warns)))
-                if warns and not self.policy.allow_review_warnings:
-                    report.skipped.append((intent, f"review: {'; '.join(map(str, warns))}"))
+                if key in done:
+                    report.skipped.append((intent, "already submitted for this plan"))
+                    self.audit.emit("intent_deduplicated", plan_id=pid, intent=key)
+                    continue
+                if key in pending_recovery:
+                    report.skipped.append(
+                        (intent, "unresolved outcome from a prior attempt -- "
+                                 "run recover() first")
+                    )
+                    self.audit.emit("intent_blocked", plan_id=pid, intent=key,
+                                    reason="pending_recovery")
+                    continue
+                if allow and intent.symbol.upper() not in allow:
+                    report.skipped.append((intent, "not on allowlist"))
+                    self.audit.emit("intent_blocked", plan_id=pid, intent=key,
+                                    reason="allowlist")
+                    continue
+                if abs(intent.notional) > self.policy.max_order_notional:
+                    report.skipped.append((intent, "exceeds per-order notional cap"))
+                    self.audit.emit("intent_blocked", plan_id=pid, intent=key,
+                                    reason="order_notional",
+                                    notional=round(abs(intent.notional), 2))
                     continue
 
-            if dry:
-                report.skipped.append((intent, "dry run"))
-                self.audit.emit("order_not_sent_dry_run", plan_id=pid, intent=key,
+                if self.policy.require_review:
+                    review = self.broker.review_order(
+                        intent.symbol, intent.side, abs(intent.shares))
+                    warns = review.get("warnings") or []
+                    # review.get("ok") is authoritative on its own -- both
+                    # broker adapters define ok = not warnings today, but an
+                    # explicit ok=False shouldn't be overridable by
+                    # allow_review_warnings, which is only meant to tolerate
+                    # non-fatal warnings.
+                    not_ok = review.get("ok", True) is False
+                    self.audit.emit("order_reviewed", plan_id=pid, intent=key,
+                                    ok=review.get("ok"),
+                                    est_price=review.get("estimated_price"),
+                                    warnings="; ".join(map(str, warns)))
+                    if not_ok:
+                        reason = ("; ".join(map(str, warns))
+                                  or "broker marked the order not ok")
+                        report.skipped.append((intent, f"review: {reason}"))
+                        continue
+                    if warns and not self.policy.allow_review_warnings:
+                        report.skipped.append((intent, f"review: {'; '.join(map(str, warns))}"))
+                        continue
+
+                if dry:
+                    report.skipped.append((intent, "dry run"))
+                    self.audit.emit("order_not_sent_dry_run", plan_id=pid, intent=key,
+                                    symbol=intent.symbol, side=intent.side,
+                                    quantity=round(abs(intent.shares), 6),
+                                    notional=round(abs(intent.notional), 2))
+                    continue
+
+                # Write-ahead: the intent to submit is durable before the call.
+                self._journal(stage="submitting", plan_id=pid, intent_key=key,
+                              symbol=intent.symbol, side=intent.side,
+                              quantity=abs(intent.shares))
+                self.audit.emit("order_submitting", plan_id=pid, intent=key,
                                 symbol=intent.symbol, side=intent.side,
-                                quantity=round(abs(intent.shares), 6),
-                                notional=round(abs(intent.notional), 2))
-                continue
+                                quantity=round(abs(intent.shares), 6))
+                try:
+                    order = self.broker.place_order(
+                        intent.symbol, intent.side, abs(intent.shares))
+                except Exception as exc:
+                    # Unknown outcome. Do not retry; leave it for recover().
+                    self.audit.emit("order_unknown_outcome", plan_id=pid, intent=key,
+                                    error=repr(exc))
+                    report.skipped.append((intent, f"unknown outcome: {exc!r}"))
+                    break
 
-            # Write-ahead: the intent to submit is durable before the call.
-            self._journal(stage="submitting", plan_id=pid, intent_key=key,
-                          symbol=intent.symbol, side=intent.side,
-                          quantity=abs(intent.shares))
-            self.audit.emit("order_submitting", plan_id=pid, intent=key,
-                            symbol=intent.symbol, side=intent.side,
-                            quantity=round(abs(intent.shares), 6))
-            try:
-                order = self.broker.place_order(
-                    intent.symbol, intent.side, abs(intent.shares))
-            except Exception as exc:
-                # Unknown outcome. Do not retry; leave it for recover().
-                self.audit.emit("order_unknown_outcome", plan_id=pid, intent=key,
-                                error=repr(exc))
-                report.skipped.append((intent, f"unknown outcome: {exc!r}"))
-                break
-
-            stage = "rejected" if order.state == "rejected" else "submitted"
-            self._journal(stage=stage, plan_id=pid, intent_key=key,
-                          order_id=order.order_id, state=order.state)
-            self.audit.emit("order_" + stage, plan_id=pid, intent=key,
-                            order_id=order.order_id, state=order.state,
-                            filled=round(order.filled_quantity, 6),
-                            avg_price=order.average_price,
-                            reason=order.reject_reason)
-            report.submitted.append(order)
+                stage = "rejected" if order.state == "rejected" else "submitted"
+                self._journal(stage=stage, plan_id=pid, intent_key=key,
+                              order_id=order.order_id, state=order.state)
+                self.audit.emit("order_" + stage, plan_id=pid, intent=key,
+                                order_id=order.order_id, state=order.state,
+                                filled=round(order.filled_quantity, 6),
+                                avg_price=order.average_price,
+                                reason=order.reject_reason)
+                report.submitted.append(order)
 
         report.reconciliation = self.reconcile(plan, pid)
         return report
