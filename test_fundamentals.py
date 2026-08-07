@@ -56,6 +56,20 @@ try:
 except TypeError:
     check("rejects non-datetime as_of_date", True)
 
+# describe() used to call .min()/.max() on as_of_date unconditionally, the
+# one panel of the four missing the empty-frame guard MacrosPanel/
+# CorpsPanel/OptionsPanel all have -- inconsistent, and fragile beyond the
+# specific pandas version where pd.NaT.date() happens not to raise.
+empty = FundamentalsPanel(frame=frame.iloc[0:0])
+empty_desc = empty.describe()
+check("describe handles an empty panel", empty_desc.startswith("FundamentalsPanel(0"))
+# The weaker startswith check above passes either way on this pandas
+# version (pd.NaT.date() doesn't raise here) -- confirm the explicit
+# empty-frame guard actually fired, not the min()/max() fallback path
+# quietly degrading to "NaT to NaT".
+check("the empty-frame guard produces a clean message, not a NaT fallback",
+      "NaT" not in empty_desc, empty_desc)
+
 print()
 print("=" * 72)
 print("2. as_of -- the look-ahead firewall (truncates to a FundamentalsPanel)")
@@ -150,6 +164,21 @@ check(
     "no look-ahead: forward-filled value never exceeds what as_of would show",
     (rev.loc["2023-08-01":"2023-08-03", "AAA"] == 100.0).all(),
 )
+
+# wide.reindex(columns=[s for s in names if s in wide.columns]) used to
+# filter the column list down to what already existed *before*
+# reindexing, so reindex could only reorder/subset -- never add -- a
+# requested symbol with zero rows for this metric. A brand-new IPO or a
+# symbol added mid-backtest got silently dropped from the output entirely
+# instead of coming back as an all-NaN column, and a caller indexing by
+# symbol (wide[symbol]) got a KeyError instead of NaN.
+daily_missing = panel.to_daily(dates, symbols=["AAA", "NEWIPO"],
+                               metrics=["income_revenue"])
+rev_missing = daily_missing["income_revenue"]
+check("a requested symbol with zero rows is still a column, not silently dropped",
+      "NEWIPO" in rev_missing.columns, rev_missing.columns.tolist())
+check("that column is all-NaN, not fabricated data",
+      rev_missing["NEWIPO"].isna().all())
 
 print()
 print("=" * 72)

@@ -112,6 +112,20 @@ check(
     eightk.loc["2023-02-14", "AAA"] == 1.0 and eightk.loc["2023-02-15", "AAA"] == 2.0,
 )
 
+# wide.reindex(columns=[s for s in names if s in wide.columns]) used to
+# filter the column list down to what already existed *before*
+# reindexing, so reindex could only reorder/subset -- never add -- a
+# requested symbol with zero rows for this metric. A brand-new IPO or a
+# symbol added mid-backtest got silently dropped from the output entirely
+# instead of coming back as an all-NaN column.
+daily_missing = panel.to_daily(dates, symbols=["AAA", "NEWIPO"],
+                               metrics=["filed_8k_count_90d"])
+eightk_missing = daily_missing["filed_8k_count_90d"]
+check("a requested symbol with zero rows is still a column, not silently dropped",
+      "NEWIPO" in eightk_missing.columns, eightk_missing.columns.tolist())
+check("that column is all-NaN, not fabricated data",
+      eightk_missing["NEWIPO"].isna().all())
+
 print()
 print("=" * 72)
 print("5. Trailing-window derivation logic (offline, no network)")
@@ -142,6 +156,17 @@ values = pd.Series([100.0, -50.0, 200.0, -10.0])
 sums = _trailing_sum(pd.Series(events), values, window_days=90)
 check("trailing sum accumulates within the window", sums[2] == 250.0)  # 100-50+200
 check("trailing sum drops out-of-window events", sums[3] == -10.0)
+
+# pandas' own default for an offset-based rolling window is closed="right"
+# -- the half-open interval (t - window_days, t], which excludes an event
+# landing *exactly* window_days before another one. "Trailing N days"
+# reads as inclusive of both ends in the ordinary sense, so an
+# exact-boundary hit shouldn't be the one case silently dropped.
+boundary_events = pd.to_datetime(["2024-01-01", "2024-03-31"])  # exactly 90 days apart
+boundary_counts = _trailing_count(pd.Series(boundary_events), window_days=90)
+check("an event exactly window_days before another is included, not "
+      "excluded by a half-open boundary",
+      list(boundary_counts) == [1.0, 2.0], list(boundary_counts))
 
 repo = CorpsRepository(window_days=90)
 

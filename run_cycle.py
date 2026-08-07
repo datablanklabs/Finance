@@ -28,14 +28,15 @@ copy the resulting state file over.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
 import pandas as pd
 
 from qbt import (
-    CrossSectionalMomentum, LiveSignalRunner, OpenBBRepository, PortfolioState,
-    RiskGate, SyntheticRepository,
+    CrossSectionalMomentum, DayTradeLedger, LiveSignalRunner, OpenBBRepository,
+    PortfolioState, RiskGate, SyntheticRepository,
 )
 from qbt.broker import MockBroker, RobinhoodMCPBroker
 from qbt.oauth import build_robinhood_oauth
@@ -87,6 +88,39 @@ def save_peak(path: str, value: float) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as fh:
         fh.write(f"{value:.4f}")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def load_day_trade_ledger(path: str) -> DayTradeLedger:
+    """Persisted rolling day-trade log -- survives restarts, the same
+    reason peak_equity does (see :func:`load_peak`).
+
+    Confirmed live (2026-08): without this, every process invocation
+    constructs a fresh, empty ``DayTradeLedger``, so ``RiskGate``'s PDT
+    check can never actually trigger in live trading -- nothing remembers
+    a day trade past the process that recorded it. See :func:`mode_path`
+    for why ``path`` must never be shared between synthetic and real runs.
+    """
+    ledger = DayTradeLedger()
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        ledger.events = [pd.Timestamp(d) for d in data.get("events", [])]
+    except (OSError, ValueError, TypeError):
+        pass
+    return ledger
+
+
+def save_day_trade_ledger(path: str, ledger: DayTradeLedger) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Trim to what the rolling window could still matter for, so this file
+    # doesn't grow forever -- a generous 10 business days; the precise
+    # 5-business-day cutoff is DayTradeLedger.count()'s own job.
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.tseries.offsets.BDay(10)
+    events = [d for d in ledger.events if pd.Timestamp(d) > cutoff]
+    with open(path, "w") as fh:
+        json.dump({"events": [pd.Timestamp(d).isoformat() for d in events]}, fh)
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -191,6 +225,7 @@ def main() -> int:
         return 3
 
     # ---- broker ---------------------------------------------------------
+    broker = None
     try:
         if args.synthetic:
             broker = MockBroker(prices=panel.last_close(), cash=25_000.0, seed=0)
@@ -214,6 +249,13 @@ def main() -> int:
         account = broker.get_account()
     except Exception as exc:
         audit.emit("broker_connect_failed", error=repr(exc))
+        # broker may or may not exist yet -- oauth/RobinhoodMCPBroker
+        # construction itself can raise before broker is ever assigned,
+        # and `broker = None` above is exactly what makes this safe to
+        # check rather than risking a NameError on top of the original
+        # failure.
+        if broker is not None:
+            broker.close()
         return 3
 
     policy = ExecutionPolicy(
@@ -225,9 +267,12 @@ def main() -> int:
         require_market_open=not args.ignore_market_hours,
         dry_run=not args.live,
     )
+    day_trades_path = mode_path("state/day_trades.json", args.synthetic)
+    ledger = load_day_trade_ledger(day_trades_path)
     manager = OrderManager(
         broker=broker, policy=policy, audit=audit,
         journal_path=mode_path("audit/journal.jsonl", args.synthetic),
+        day_trade_ledger=ledger,
     )
 
     # ---- recovery before anything else ----------------------------------
@@ -235,6 +280,7 @@ def main() -> int:
         unresolved = manager.recover()
     except Exception as exc:
         audit.emit("recover_failed", error=repr(exc))
+        broker.close()
         return 2
     if not unresolved.empty:
         lost = unresolved[unresolved["outcome"] == "not_at_broker"]
@@ -243,6 +289,7 @@ def main() -> int:
                        symbols=", ".join(lost["symbol"]))
             print("HALT: in-flight orders could not be accounted for.")
             print(unresolved.to_string(index=False))
+            broker.close()
             return 2
 
     # ---- plan -----------------------------------------------------------
@@ -264,7 +311,8 @@ def main() -> int:
         # rarely-firing safety net for equity drift between planning and
         # submission, not the real enforcement point.
         plan = LiveSignalRunner(strategy=STRATEGY, risk_gate=RiskGate(**GATE),
-                                max_turnover=args.max_turnover).plan(
+                                max_turnover=args.max_turnover,
+                                day_trade_ledger=ledger).plan(
             panel, state)
 
         # Surface *why* the plan looks the way it does -- these were
@@ -288,6 +336,7 @@ def main() -> int:
         return 3
 
     save_peak(peak_file, max(peak, account.equity))
+    save_day_trade_ledger(day_trades_path, ledger)
     print(report)
     if not report.to_frame().empty:
         print(report.to_frame().to_string(index=False))

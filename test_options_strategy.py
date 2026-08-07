@@ -35,6 +35,12 @@ except ValueError:
 OptionsMeanReversion(iv_weight=1.0, pcr_weight=0.0)  # should not raise
 check("allows a single-factor configuration", True)
 
+try:
+    OptionsMeanReversion(top_n=0)
+    check("rejects top_n=0", False)
+except ValueError:
+    check("rejects top_n=0", True)
+
 print()
 print("=" * 72)
 print("2. score() -- z-scored options stress, per symbol against its own history")

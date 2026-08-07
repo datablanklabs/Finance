@@ -112,6 +112,20 @@ check(
     (iv.loc["2023-01-10":"2023-01-20", "BBB"] == 0.40).all(),
 )
 
+# wide.reindex(columns=[s for s in names if s in wide.columns]) used to
+# filter the column list down to what already existed *before*
+# reindexing, so reindex could only reorder/subset -- never add -- a
+# requested symbol with zero rows for this metric. A brand-new IPO or a
+# symbol added mid-backtest got silently dropped from the output entirely
+# instead of coming back as an all-NaN column.
+daily_missing = panel.to_daily(dates, symbols=["AAA", "NEWIPO"],
+                               metrics=["iv_atm_near"])
+iv_missing = daily_missing["iv_atm_near"]
+check("a requested symbol with zero rows is still a column, not silently dropped",
+      "NEWIPO" in iv_missing.columns, iv_missing.columns.tolist())
+check("that column is all-NaN, not fabricated data",
+      iv_missing["NEWIPO"].isna().all())
+
 print()
 print("=" * 72)
 print("5. derive_indicators -- pure derivation from a hand-built chain (offline)")

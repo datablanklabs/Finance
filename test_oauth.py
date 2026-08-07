@@ -10,6 +10,7 @@ import stat
 import shutil
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -63,6 +64,35 @@ async def _storage_checks():
 
     mode = stat.S_IMODE(os.stat(storage.path).st_mode)
     check("token file is owner-only (0600)", mode == 0o600, oct(mode))
+
+    # The check above only proves the *final* mode is right -- true even
+    # under the old write-then-chmod code, since chmod eventually ran.
+    # That code created the file via Path.write_text() first (the OS
+    # default creation mode, typically 0o644-0o666 depending on umask --
+    # world/group readable) and only *then* chmod'd it to 0600, leaving a
+    # real transient exposure window for a live refresh token. Confirmed
+    # live (2026-08) under a permissive umask (0o000): write_text() alone
+    # produces 0o666. Prove the fix is atomic at creation, not
+    # write-then-fix, two ways: chmod is never called at all, and the
+    # file is 0600 even under a umask that would unmask everything else.
+    chmod_calls = []
+    _real_chmod = os.chmod
+    os.chmod = lambda *a, **kw: chmod_calls.append((a, kw)) or _real_chmod(*a, **kw)
+    old_umask = os.umask(0o000)
+    try:
+        perm_storage = FileTokenStorage(os.path.join(WORK, "perm_check.json"))
+        await perm_storage.set_tokens(
+            OAuthToken(access_token="perm-at", refresh_token="perm-rt"))
+    finally:
+        os.umask(old_umask)
+        os.chmod = _real_chmod
+    perm_mode = stat.S_IMODE(os.stat(perm_storage.path).st_mode)
+    check("token file is created at 0600 atomically, even under a "
+          "permissive umask that would unmask everything else",
+          perm_mode == 0o600, oct(perm_mode))
+    check("permissions are set at creation, not via a separate chmod call "
+          "after the file already exists",
+          len(chmod_calls) == 0, chmod_calls)
 
     tokens2 = OAuthToken(access_token="at-2", refresh_token="rt-2")
     await storage.set_tokens(tokens2)
@@ -140,6 +170,53 @@ async def _callback_missing_code():
 
 
 asyncio.run(_callback_missing_code())
+
+print()
+print("=" * 72)
+print("4. Loopback callback server -- a stray wrong-path request doesn't "
+      "eat the real callback's turn")
+print("=" * 72)
+
+PORT3 = 8767
+
+
+async def _callback_stray_request():
+    redirect_handler, callback_handler = _make_handlers(PORT3)
+
+    result_holder = {}
+
+    async def run_callback():
+        result_holder["result"] = await callback_handler()
+
+    task = asyncio.create_task(run_callback())
+    await asyncio.sleep(0.2)
+
+    def fire_stray_then_real():
+        # A request to some other path -- e.g. a browser or stray local
+        # process probing the port -- used to consume the server's
+        # one-shot handle_request() call before the real redirect ever
+        # arrived, since the original handler accepted any GET
+        # regardless of path. The fixed handler responds 404 to it, which
+        # urlopen raises as HTTPError -- expected, not a test failure.
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{PORT3}/favicon.ico", timeout=5)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, f"expected 404 for the stray path, got {exc.code}"
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT3}/callback?code=AUTHCODE789&state=STATE000",
+            timeout=5,
+        )
+
+    await asyncio.get_event_loop().run_in_executor(None, fire_stray_then_real)
+    await asyncio.wait_for(task, timeout=5)
+
+    code, state = result_holder["result"]
+    check("a stray request to the wrong path is ignored, not captured as "
+          "the OAuth result",
+          code == "AUTHCODE789" and state == "STATE000", (code, state))
+
+
+asyncio.run(_callback_stray_request())
 
 shutil.rmtree(WORK, ignore_errors=True)
 

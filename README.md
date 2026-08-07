@@ -15,7 +15,7 @@ and production to drift apart.
 | `qbt/corporate.py` | `CorpsPanel`: point-in-time SEC filing cadence (10-K/10-Q/8-K) and Form 4 insider-transaction indicators |
 | `qbt/options.py` | `OptionsPanel`: daily-archived options-chain indicators (ATM IV, put/call volume ratio) |
 | `qbt/signals.py` | `Strategy` protocol, 10 strategies, 5 composer/filter wrappers |
-| `qbt/risk.py` | `RiskGate` (vol target, caps, drawdown breaker), `DayTradeLedger` |
+| `qbt/risk.py` | `RiskGate` (vol target, caps, drawdown breaker), `DayTradeLedger` (PDT budget, persisted across cycles by `run_cycle.py`) |
 | `qbt/engine.py` | `Backtester` (T+1 fills, costs), performance metrics |
 | `qbt/research.py` | IC grid, autocorrelation, walk-forward, multiple-testing haircut |
 | `qbt/live.py` | `LiveSignalRunner` → order intents (no execution) |
@@ -24,17 +24,17 @@ and production to drift apart.
 | `qbt/orders.py` | `OrderManager`: journal, preflight, reconciliation, audit |
 | `research.ipynb` | 49-cell research notebook, 30 code cells |
 | `run_cycle.py` | One trading cycle. Run on a schedule, never from the notebook |
-| `test_qbt.py` | 74 engine validation checks (strategies, engine, risk gate, research) |
-| `test_orders.py` | 73 order-path checks, offline against `MockBroker` |
-| `test_fundamentals.py` | 29 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
+| `test_qbt.py` | 95 engine validation checks (strategies, engine, risk gate, research) |
+| `test_orders.py` | 88 order-path checks, offline against `MockBroker` |
+| `test_fundamentals.py` | 33 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
 | `test_macro.py` | 31 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter` |
-| `test_corporate.py` | 35 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
-| `test_options.py` | 37 checks: `OptionsPanel`, daily-archive semantics |
-| `test_options_strategy.py` | 18 checks: `OptionsMeanReversion` |
-| `test_insider_drift_strategy.py` | 19 checks: `InsiderEventDrift` |
+| `test_corporate.py` | 38 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
+| `test_options.py` | 39 checks: `OptionsPanel`, daily-archive semantics |
+| `test_options_strategy.py` | 19 checks: `OptionsMeanReversion` |
+| `test_insider_drift_strategy.py` | 21 checks: `InsiderEventDrift` |
 | `test_regime_filters.py` | 25 checks: `MacroRegimeFilter`/`FundamentalsValueFilter` end-to-end |
-| `test_robinhood_broker.py` | 30 checks: response shapes confirmed against the live Robinhood MCP server |
-| `test_oauth.py` | 11 checks: PKCE flow, loopback callback server |
+| `test_robinhood_broker.py` | 43 checks: response shapes confirmed against the live Robinhood MCP server |
+| `test_oauth.py` | 14 checks: PKCE flow, loopback callback server, token-file permissions |
 | `build_notebook.py` | Regenerates `research.ipynb` |
 | `smoke_test.py` | Executes every notebook cell in one namespace |
 
@@ -76,18 +76,18 @@ pip install openbb-fmp                            # optional, for FundamentalsPa
 pip install openbb-fred                           # optional, for MacrosPanel (needs a free FRED key)
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
-python test_qbt.py                     # 74 engine checks, ~90s
-python test_orders.py                  # 73 order-path checks, ~10s
-python test_fundamentals.py            # 29 checks
+python test_qbt.py                     # 95 engine checks, ~90s
+python test_orders.py                  # 88 order-path checks, ~10s
+python test_fundamentals.py            # 33 checks
 python test_macro.py                   # 31 checks
-python test_corporate.py               # 35 checks
-python test_options.py                 # 37 checks
-python test_options_strategy.py        # 18 checks
-python test_insider_drift_strategy.py  # 19 checks
+python test_corporate.py               # 38 checks
+python test_options.py                 # 39 checks
+python test_options_strategy.py        # 19 checks
+python test_insider_drift_strategy.py  # 21 checks
 python test_regime_filters.py          # 25 checks
-python test_robinhood_broker.py        # 30 checks, offline against confirmed live response shapes
-python test_oauth.py                   # 11 checks
-python smoke_test.py                   # all 30 notebook cells, ~120s
+python test_robinhood_broker.py        # 43 checks, offline against confirmed live response shapes
+python test_oauth.py                   # 14 checks
+python smoke_test.py                   # all 30 notebook cells
 jupyter lab research.ipynb
 ```
 
@@ -193,10 +193,10 @@ The notebook never places orders. Notebooks have hidden state and out-of-order
 execution — re-running a cell re-submits, and a kernel restart loses the record
 of what was already sent. `run_cycle.py` does the placing, as a separate
 process with a write-ahead journal and crash recovery. What the notebook *is*
-good for is the read side and the dry run — section 11 replaces the
-hypothetical `PortfolioState` with real broker positions and runs
-`OrderManager` with `dry_run=True`, so you see exactly what would be sent
-without sending it.
+good for is the read side and the dry run — section 12 (below, and in the
+notebook itself) replaces the hypothetical `PortfolioState` with real broker
+positions and runs `OrderManager` with `dry_run=True`, so you see exactly
+what would be sent without sending it.
 
 ```bash
 python run_cycle.py --synthetic --ignore-market-hours   # offline, mock broker
@@ -294,6 +294,15 @@ follow all come from actual live calls, not the original design-time guesses.
   these collapses to `"unhandled errors in a TaskGroup (1 sub-exception)"` —
   the actual message only survives `repr()`. Anything matching on error text
   needs to search the `repr()`, not the `str()`.
+- **`get_equity_quotes`'s real response is `{"data": {"results": [{"quote":
+  {...}, "close": {...}}, ...]}}`** — each result bundles a *live* quote and a
+  *stale* end-of-day close as sibling objects, with `symbol`/price fields
+  inside `"quote"`, not at the top level of the result. A naive top-level
+  field lookup found neither and `get_quotes()` silently returned an empty
+  series for every real request — no exception, just no prices, which meant
+  a portfolio summary showed shares held with no value or weight for any
+  position. Falls back to `"close"` only if the live quote has no usable
+  price field.
 
 The full, dated list — including fixtures that reproduce each exact response
 shape — lives in `test_robinhood_broker.py`'s header docstring; that file is
@@ -333,6 +342,23 @@ correctly sized moments earlier for no reason a human would find
 convincing. Re-fitting at both ends means overage gets corrected wherever it
 turns up, not just detected once and given up on (see "Idempotency" above
 for the same instinct applied to order retries instead of trade sizing).
+
+### PDT accounting
+
+`RiskGate`'s PDT check (step 5 of `apply()`) reads `day_trades_remaining` and
+blocks opening a *new* position once the rolling budget is exhausted — closes
+and trims of positions already held are still allowed, same as a real
+PDT-flagged margin account. This is only as good as what feeds it: a
+`DayTradeLedger` that gets thrown away every cycle can never actually
+accumulate a day trade, so the check would never fire no matter how many day
+trades really happened. `run_cycle.py` persists the ledger to
+`state/day_trades.json` (mode-suffixed like `peak_equity.txt` — synthetic and
+live runs never share it) and passes the *same* instance to both
+`LiveSignalRunner` and `OrderManager`, so a round trip `OrderManager.execute()`
+detects — bought from flat, then sold back to flat, in the same market-tz
+session, mirroring exactly the `opened_on`/`ledger.record()` bookkeeping
+`Backtester.run()` already does — is immediately visible to the next cycle's
+`day_trades_remaining`, not just the next backtest.
 
 ### Going live, in order
 

@@ -37,6 +37,15 @@ try:
 except ValueError:
     check("rejects drift_days < 1", True)
 
+try:
+    InsiderEventDrift(top_n=0)
+    check("rejects top_n=0", False)
+except ValueError:
+    check("rejects top_n=0", True)
+
+InsiderEventDrift(top_n=None)  # a documented fallback, must not raise
+check("top_n=None still constructs fine", True)
+
 print()
 print("=" * 72)
 print("2. score()/target_weights() -- entry, hold-through-drift, and clean exit")

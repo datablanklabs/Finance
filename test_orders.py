@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    CrossSectionalMomentum, LiveSignalRunner, LivePlan, OrderIntent,
-    PortfolioState, RiskGate, SyntheticRepository,
+    CrossSectionalMomentum, DayTradeLedger, LiveSignalRunner, LivePlan,
+    OrderIntent, PortfolioState, RiskGate, SyntheticRepository,
 )
 from qbt.broker import BrokerOrder, MockBroker
 from qbt.orders import AuditLog, ExecutionPolicy, OrderManager
@@ -694,7 +694,158 @@ check("recover() finds the order that actually landed, not_at_broker",
 
 print()
 print("=" * 72)
-print("6. Reconciliation and audit stream")
+print("6. recover() and execute() share the same dedup lock")
+print("=" * 72)
+
+# _dedup_lock() used to guard only execute()'s own read-then-write dedup
+# sequence -- recover() reads and writes the exact same journal, but
+# without the lock a genuinely concurrent second process (the same
+# double-scheduled-run risk _dedup_lock's own docstring exists for) could
+# have execute() mid-flight while recover() reads a partial view. Two
+# threads, two separate OrderManager instances sharing one journal_path
+# (mirroring two separate processes, since flock() locks are scoped to
+# the open file description, not the thread/process that created it):
+# thread 1 holds the lock via a slow execute()-shaped critical section,
+# thread 2's recover() must not observe or act until thread 1 releases it.
+import threading
+import time as _time
+
+lock_path = fresh("dedup_lock_shared")
+lock_broker = MockBroker(prices=pd.Series({"AAA": 100.0}), cash=100_000.0)
+lock_broker.connect()
+lock_om1 = OrderManager(
+    lock_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(lock_path, "KILL")),
+    AuditLog(os.path.join(lock_path, "a1.jsonl"), stdout=False),
+    os.path.join(lock_path, "j.jsonl"),
+)
+lock_om2 = OrderManager(
+    lock_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(lock_path, "KILL")),
+    AuditLog(os.path.join(lock_path, "a2.jsonl"), stdout=False),
+    os.path.join(lock_path, "j.jsonl"),
+)
+
+events = []
+
+def _hold_lock():
+    with lock_om1._dedup_lock():
+        events.append(("thread1_acquired", _time.perf_counter()))
+        _time.sleep(0.3)
+        events.append(("thread1_released", _time.perf_counter()))
+
+def _try_recover():
+    _time.sleep(0.05)  # ensure thread 1 has acquired the lock first
+    events.append(("thread2_recover_start", _time.perf_counter()))
+    lock_om2.recover()
+    events.append(("thread2_recover_done", _time.perf_counter()))
+
+t1 = threading.Thread(target=_hold_lock)
+t2 = threading.Thread(target=_try_recover)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+by_name = dict(events)
+check("thread 2's recover() only actually runs after thread 1 releases "
+      "the lock, not while it's held",
+      by_name["thread2_recover_done"] > by_name["thread1_released"]
+      and by_name["thread2_recover_start"] < by_name["thread1_released"],
+      events)
+
+print()
+print("=" * 72)
+print("7. PDT accounting -- a real day trade actually gets recorded now")
+print("=" * 72)
+
+# Confirmed live (2026-08): RiskGate's PDT check (step 5 of apply()) reads
+# day_trades_remaining, but nothing in the live path ever called
+# ledger.record() -- only Backtester.run() did. Every OrderManager/
+# LiveSignalRunner pair got a fresh, empty DayTradeLedger every cycle, so
+# the PDT limit could never actually trigger in live trading. These checks
+# exercise the fix directly through OrderManager.execute(), not by poking
+# the ledger by hand.
+
+dt_path = fresh("day_trade_roundtrip")
+dt_ledger = DayTradeLedger()
+dt_broker = MockBroker(prices=pd.Series({"AAA": 100.0}), cash=100_000.0)
+dt_broker.connect()
+dt_policy = ExecutionPolicy(dry_run=False, require_review=False,
+                            require_market_open=False,
+                            kill_switch_path=os.path.join(dt_path, "KILL"))
+dt_om = OrderManager(dt_broker, dt_policy,
+                     AuditLog(os.path.join(dt_path, "a.jsonl"), stdout=False),
+                     os.path.join(dt_path, "j.jsonl"),
+                     day_trade_ledger=dt_ledger)
+
+buy_intent = OrderIntent(symbol="AAA", side="buy", shares=10.0, reference_price=100.0,
+                         notional=1000.0, current_weight=0.0, target_weight=0.10)
+buy_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[buy_intent],
+                    target_weights=pd.Series({"AAA": 0.10}),
+                    current_weights=pd.Series({"AAA": 0.0}), decision=None)
+dt_om.execute(buy_plan, strategy_name="dt-test")
+check("opening a new position from flat does not itself record a day trade",
+      len(dt_ledger.events) == 0, dt_ledger.events)
+
+sell_intent = OrderIntent(symbol="AAA", side="sell", shares=10.0, reference_price=100.0,
+                          notional=1000.0, current_weight=0.10, target_weight=0.0)
+sell_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[sell_intent],
+                     target_weights=pd.Series({"AAA": 0.0}),
+                     current_weights=pd.Series({"AAA": 0.10}), decision=None)
+dt_om.execute(sell_plan, strategy_name="dt-test")
+check("closing that same position to flat in the same session records exactly one day trade",
+      len(dt_ledger.events) == 1, dt_ledger.events)
+
+# A trim that does NOT close to flat, and a close of a position that was
+# NOT opened today, must not be mistaken for a day trade.
+notrade_path = fresh("day_trade_no_trade")
+notrade_ledger = DayTradeLedger()
+notrade_broker = MockBroker(prices=pd.Series({"BBB": 50.0}), cash=100_000.0,
+                            positions=pd.Series({"BBB": 20.0}))
+notrade_broker.connect()
+notrade_om = OrderManager(
+    notrade_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(notrade_path, "KILL")),
+    AuditLog(os.path.join(notrade_path, "a.jsonl"), stdout=False),
+    os.path.join(notrade_path, "j.jsonl"),
+    day_trade_ledger=notrade_ledger,
+)
+trim_intent = OrderIntent(symbol="BBB", side="sell", shares=5.0, reference_price=50.0,
+                          notional=250.0, current_weight=0.10, target_weight=0.05)
+trim_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[trim_intent],
+                     target_weights=pd.Series({"BBB": 0.05}),
+                     current_weights=pd.Series({"BBB": 0.10}), decision=None)
+notrade_om.execute(trim_plan, strategy_name="dt-test2")
+check("trimming a pre-existing position (not opened today, not closed to "
+      "flat) does not record a day trade",
+      len(notrade_ledger.events) == 0, notrade_ledger.events)
+
+close_intent = OrderIntent(symbol="BBB", side="sell", shares=20.0, reference_price=50.0,
+                           notional=1000.0, current_weight=0.10, target_weight=0.0)
+close_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[close_intent],
+                      target_weights=pd.Series({"BBB": 0.0}),
+                      current_weights=pd.Series({"BBB": 0.10}), decision=None)
+notrade_om.execute(close_plan, strategy_name="dt-test3")
+check("closing a position that was already held before today (not opened "
+      "this session) does not record a day trade",
+      len(notrade_ledger.events) == 0, notrade_ledger.events)
+
+# A LiveSignalRunner sharing the same ledger instance sees the recorded
+# trade reflected in day_trades_remaining on its next plan() -- this is
+# the actual point of the fix: the risk gate's PDT check can now trigger.
+shared_ledger = DayTradeLedger(limit=1)
+today = pd.Timestamp.now(tz="America/New_York").normalize()
+shared_ledger.record(today)
+check("a shared ledger correctly reports zero remaining after one recorded trade",
+      shared_ledger.remaining(today, equity=1_000.0) == 0)
+
+print()
+print("=" * 72)
+print("8. Reconciliation and audit stream")
 print("=" * 72)
 
 om, broker, path = make("recon", dry_run=False)
@@ -730,7 +881,7 @@ print(f"\n  {len(rules)} SIEM detection rules, "
 
 print()
 print("=" * 72)
-print("7. Tool discovery binds by schema, not by assumption")
+print("9. Tool discovery binds by schema, not by assumption")
 print("=" * 72)
 
 from qbt.broker import CAPABILITY_CANDIDATES, REQUIRED_CAPABILITIES, ToolBinding

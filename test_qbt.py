@@ -6,11 +6,12 @@ import pandas as pd
 from qbt import (
     Backtester, Composite, CostModel, CrossSectionalMomentum, DayTradeLedger,
     EqualWeightBuyHold, ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
-    PortfolioState, PricePanel, RiskGate, ShortHorizonReversal,
-    SyntheticRepository, TimeSeriesMomentum, TrendFilter, compare, ic_grid,
-    ic_summary, information_coefficient, expected_max_sharpe, forward_returns,
-    rebalance_dates, return_autocorrelation, trailing_signal,
-    walk_forward_splits, ParameterSweep, sharpe_haircut,
+    MultiFactorCrossSectional, OpenBBRepository, PortfolioState, PricePanel,
+    RiskGate, ShortHorizonReversal, SyntheticRepository, TimeSeriesMomentum,
+    TrendFilter, compare, ic_grid, ic_summary, information_coefficient,
+    expected_max_sharpe, forward_returns, rebalance_dates,
+    return_autocorrelation, trailing_signal, walk_forward_splits,
+    ParameterSweep, sharpe_haircut,
 )
 from qbt.risk import RiskContext
 
@@ -65,6 +66,86 @@ last_decision = res.targets.index.max()
 check("strategy never sees beyond its decision bar",
       peeker.max_seen == last_decision,
       f"max_seen={peeker.max_seen.date()} last_decision={last_decision.date()}")
+
+# OpenBBRepository used to infer "this is a single-symbol response" solely
+# from the *absence* of a column named "symbol" -- if a multi-symbol
+# request came back with no symbol-identifying column at all (a provider
+# naming it differently, or omitting it unexpectedly), every row across
+# every requested symbol got silently mislabeled with symbols[0], merging
+# unrelated price series into one column with no error. Deferred openbb
+# import means the real dependency is mocked here via sys.modules, not a
+# live network call.
+import sys
+from unittest.mock import MagicMock
+
+
+def _fake_openbb(df):
+    # _fetch_remote() does `from openbb import obb`, which reads the
+    # `obb` *attribute* of the openbb module, not the module object
+    # itself -- the mock has to live at .obb, not at the module's own
+    # top level, or the real code path never touches it.
+    fake_module = MagicMock()
+    fake_module.obb.equity.price.historical.return_value.to_dataframe.return_value = df
+    sys.modules["openbb"] = fake_module
+
+
+_real_openbb_module = sys.modules.get("openbb")
+try:
+    obb_repo = OpenBBRepository(provider="fake", cache_dir=None)
+
+    # 1. Multi-symbol response with an explicit "symbol" column -- normal
+    #    case, must still work.
+    multi_df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+        "symbol": ["AAA", "BBB"],
+        "close": [10.0, 20.0],
+    })
+    _fake_openbb(multi_df)
+    out = obb_repo._fetch_remote(["AAA", "BBB"], "2024-01-01", "2024-01-02")
+    check("a genuine multi-symbol response with a 'symbol' column still works",
+          set(out["symbol"]) == {"AAA", "BBB"})
+
+    # 2. Single-symbol response, no symbol column at all -- still safe,
+    #    since there's exactly one symbol to attribute every row to.
+    single_df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01"]), "close": [10.0],
+    })
+    _fake_openbb(single_df)
+    out = obb_repo._fetch_remote(["AAA"], "2024-01-01", "2024-01-02")
+    check("a single-symbol response with no symbol column is still labeled correctly",
+          list(out["symbol"]) == ["AAA"])
+
+    # 3. The dangerous case: MULTIPLE symbols requested, but the response
+    #    has no symbol/ticker column to attribute rows to. Must raise, not
+    #    silently mislabel every row with symbols[0].
+    ambiguous_df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-01-01"]), "close": [10.0, 20.0],
+    })
+    _fake_openbb(ambiguous_df)
+    try:
+        obb_repo._fetch_remote(["AAA", "BBB"], "2024-01-01", "2024-01-02")
+        check("a multi-symbol request with no symbol column raises, doesn't "
+              "silently mislabel every row", False)
+    except ValueError as exc:
+        check("a multi-symbol request with no symbol column raises, doesn't "
+              "silently mislabel every row", "symbol" in str(exc).lower(), str(exc))
+
+    # 4. A "ticker" column (not "symbol") must also be recognized, not
+    #    treated as absent.
+    ticker_df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+        "ticker": ["AAA", "BBB"],
+        "close": [10.0, 20.0],
+    })
+    _fake_openbb(ticker_df)
+    out = obb_repo._fetch_remote(["AAA", "BBB"], "2024-01-01", "2024-01-02")
+    check("a 'ticker' column is recognized the same as 'symbol'",
+          set(out["symbol"]) == {"AAA", "BBB"})
+finally:
+    if _real_openbb_module is None:
+        sys.modules.pop("openbb", None)
+    else:
+        sys.modules["openbb"] = _real_openbb_module
 
 print()
 print("=" * 72)
@@ -147,6 +228,62 @@ for d in (0, 1):
 print(f"  reversal sharpe: delay=0 -> {delayed[0]:.2f}, delay=1 -> {delayed[1]:.2f}")
 check("delay=0 inflates a same-close signal", delayed[0] > delayed[1],
       "this is exactly the look-ahead bug the default guards against")
+
+# `pending` used to be a single tuple|None slot, not a queue -- a new
+# decision arriving before the previous one's fill executed silently
+# overwrote it, with no error and no trace, dropping the entire rebalance.
+# Only shows up when the rebalance cadence outpaces delay_bars (not the
+# library defaults, rebalance='M'/delay_bars=1, which is why it went
+# unnoticed). This strategy alternates fully between two disjoint sleeves
+# every single decision, so a genuine trade should exist for nearly every
+# decision -- anything otherwise is dropped, not a legitimate no-op.
+class _AlternatingStrategy:
+    name = "alternating"
+    min_history = 1
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        syms = view.symbols
+        half = pd.Series({syms[0]: 0.5, syms[1]: 0.5}).reindex(syms).fillna(0.0)
+        other_half = pd.Series({syms[2]: 0.5, syms[3]: 0.5}).reindex(syms).fillna(0.0)
+        return half if len(view.dates) % 2 == 0 else other_half
+
+
+alt_panel = SyntheticRepository(n_symbols=4, seed=2).fetch(
+    start="2020-01-01", end="2020-04-01")
+alt_result = Backtester(
+    panel=alt_panel, strategy=_AlternatingStrategy(), risk_gate=None,
+    rebalance="D", execution=ExecutionConfig(delay_bars=2, price="close"),
+    initial_equity=100_000,
+).run()
+alt_n_decisions = len(alt_result.targets)
+alt_n_fill_dates = (alt_result.trades["date"].nunique()
+                    if not alt_result.trades.empty else 0)
+check("a rebalance cadence faster than delay_bars does not silently drop "
+      "decisions (a single-slot pending overwrite used to drop ~all of them)",
+      alt_n_decisions - alt_n_fill_dates <= 3,
+      f"{alt_n_decisions} decisions, only {alt_n_fill_dates} distinct fill dates")
+
+# The last delay_bars decisions of any run have nowhere to schedule a fill
+# (i + delay_bars would run past the panel's last bar) -- an unavoidable
+# edge effect, not a bug. But target_rows/audit used to record those
+# decisions with no marker distinguishing them from ones that actually
+# executed, so a reader of the tail of those frames could mistake
+# "decided" for "filled." audit["scheduled"] now flags exactly this.
+tail_panel = SyntheticRepository(n_symbols=5, seed=1).fetch(
+    start="2020-01-01", end="2020-03-01")
+tail_result = Backtester(
+    panel=tail_panel, strategy=EqualWeightBuyHold(), risk_gate=None,
+    rebalance="D", execution=ExecutionConfig(delay_bars=3, price="close"),
+    initial_equity=100_000,
+).run()
+tail_unscheduled = tail_result.audit[~tail_result.audit["scheduled"]]
+check("exactly the last delay_bars decisions are flagged unscheduled",
+      len(tail_unscheduled) == 3, len(tail_unscheduled))
+check("every decision before the tail is flagged scheduled",
+      tail_result.audit["scheduled"].iloc[:-3].all())
+check("the unscheduled decisions are exactly the panel's final dates",
+      list(tail_unscheduled.index) == list(tail_result.audit.index[-3:]))
 
 print()
 print("=" * 72)
@@ -306,6 +443,55 @@ print(tbl[["cagr", "ann_vol", "sharpe", "max_drawdown", "turnover_ann",
 check("trend filter reduces exposure vs unfiltered",
       results["xsmom_126_5_10+trend200"].summary()["avg_exposure"]
       < results["xsmom_126_5_10"].summary()["avg_exposure"])
+
+# top_n=0 used to reach all the way into target_weights() before failing
+# (a ZeroDivisionError on equal weighting, or silent NaN weights on rank
+# weighting) instead of being rejected at construction, where a bad config
+# value belongs.
+for _name, _ctor in [
+    ("CrossSectionalMomentum", lambda: CrossSectionalMomentum(top_n=0)),
+    ("ShortHorizonReversal", lambda: ShortHorizonReversal(top_n=0)),
+    ("MultiFactorCrossSectional", lambda: MultiFactorCrossSectional(top_n=0)),
+]:
+    try:
+        _ctor()
+        check(f"{_name} rejects top_n=0 at construction", False)
+    except ValueError:
+        check(f"{_name} rejects top_n=0 at construction", True)
+check("top_n=None (a documented fallback to half the candidates) still "
+      "constructs fine", CrossSectionalMomentum(top_n=None).top_n is None)
+
+# TrendFilter's blocked = (last <= ma).reindex(...).fillna(True) used to get
+# the fail-safe direction backwards for a NaN moving average: `last <= ma`
+# evaluates to False, not NaN, when ma is NaN (a symbol with zero valid
+# observations anywhere in its trailing lookback window -- confirmed via
+# `np.nan <= np.nan` -> False), so an unscreenable name passed straight
+# through with zero trend confirmation instead of being blocked -- exactly
+# backwards for a filter whose whole job is requiring that confirmation.
+class _TrendStubInner:
+    """Doesn't itself gate on live/tradeable data -- the point is testing
+    TrendFilter's own robustness, not relying on the inner strategy to
+    have already excluded an unscoreable symbol."""
+    name = "stub"
+    min_history = 5
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        return pd.Series({"OLD": 0.5, "NEW": 0.5}).reindex(view.symbols).fillna(0.0)
+
+
+_trend_dates = pd.date_range("2024-01-01", periods=250, freq="D")
+_trend_close = pd.DataFrame({
+    "OLD": np.linspace(100, 200, 250),  # clean long uptrend -- always passes
+    "NEW": [np.nan] * 250,              # zero valid data -- unscoreable
+}, index=_trend_dates)
+_trend_panel = PricePanel(close=_trend_close)
+_trend_w = TrendFilter(inner=_TrendStubInner(), lookback=200).target_weights(_trend_panel)
+check("a symbol with zero valid data in its trailing window is blocked, "
+      "not passed through with zero trend confirmation",
+      _trend_w["NEW"] == 0.0, _trend_w.to_dict())
+check("a symbol with a genuine, fully-scoreable uptrend still passes",
+      _trend_w["OLD"] == 0.5, _trend_w.to_dict())
 
 print()
 print("=" * 72)
