@@ -19,7 +19,7 @@ server's to change and a stale hard-coded name fails at the worst moment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 import numpy as np
@@ -230,7 +230,16 @@ class LiveSignalRunner:
 
         if self.max_turnover is not None and equity > 0:
             turnover = sum(abs(i.notional) for i in intents) / equity
-            if turnover > self.max_turnover:
+            # A plan whose turnover lands exactly on the cap must be
+            # allowed through unscaled -- "at the limit" is compliant, not
+            # a breach. The tolerance exists because "exactly at the cap"
+            # is a mathematical statement, not a floating-point one: this
+            # is a sum of per-symbol notionals divided by equity, and
+            # floating-point rounding can land that a hair above a cap
+            # that was conceptually hit precisely (e.g. 0.6700000000000001
+            # for a true 0.67), which would otherwise scale or reject a
+            # plan for no real reason.
+            if turnover > self.max_turnover + 1e-9:
                 # A flat account's first-ever buildout is structurally ~100%
                 # turnover -- current weights are all zero, so turnover and
                 # gross exposure are the same number. Same mechanical
@@ -247,11 +256,37 @@ class LiveSignalRunner:
                         "(allow_full_turnover_from_flat)"
                     )
                 else:
+                    # Rather than discard the whole plan, shrink every
+                    # intent by the same factor so gross turnover lands
+                    # exactly at the cap -- the largest plan, still moving
+                    # in the direction the strategy actually wants, that
+                    # respects the limit. Turnover scales linearly with a
+                    # uniform size reduction (same equity denominator, same
+                    # trade directions), so the exact factor is closed-form,
+                    # not something to search for. current_weight/
+                    # target_weight on each intent are left as the
+                    # strategy's real read of the book -- only the size of
+                    # the trade actually sent this cycle shrinks; the
+                    # rest of the move happens on a later cycle once the
+                    # book has caught up.
+                    scale = self.max_turnover / turnover
+                    n_before = len(intents)
+                    scaled = []
+                    for i in intents:
+                        shares = i.shares * scale
+                        notional = i.notional * scale
+                        if (abs(notional) < self.min_trade_notional
+                                or abs(shares) < 1e-9):
+                            continue
+                        scaled.append(replace(i, shares=shares, notional=notional))
+                    intents = scaled
                     warnings.append(
-                        f"turnover {turnover:.1%} exceeds cap {self.max_turnover:.0%}, "
-                        "plan withheld for review"
+                        f"turnover {turnover:.1%} exceeds cap "
+                        f"{self.max_turnover:.0%}, every order scaled to "
+                        f"{scale:.0%} of its target size to fit "
+                        f"({len(scaled)} of {n_before} orders survive the "
+                        "min-notional filter after scaling)"
                     )
-                    intents = []
 
         return LivePlan(
             asof=asof_ts,

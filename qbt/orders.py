@@ -32,12 +32,13 @@ so the log is directly ingestible by a SIEM. See
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Iterator, Sequence
 
@@ -301,8 +302,23 @@ class OrderManager:
             self.audit.emit("recover_clean", unresolved=0)
             return pd.DataFrame()
 
-        submitting = {
+        # The *first* "submitting" entry per key anchors the broker-query
+        # window (the earliest moment something might have been sent); the
+        # *last* one is what was actually most recently sent and is what
+        # fingerprinting must match against. These differ whenever execute()
+        # retried at a corrected quantity -- e.g. a fractional-share
+        # rejection followed by a whole-share retry (see execute()) writes
+        # a second "submitting" entry at the corrected size. Confirmed live
+        # (2026-08): fingerprinting against the first entry's now-stale
+        # original quantity searched for an order that was never actually
+        # requested, and never found the one that was -- a real fill got
+        # misresolved as not_at_broker.
+        first_submitting = {
             key: next(e for e in es if e.get("stage") == "submitting")
+            for key, es in unresolved
+        }
+        latest_submitting = {
+            key: [e for e in es if e.get("stage") == "submitting"][-1]
             for key, es in unresolved
         }
 
@@ -314,7 +330,7 @@ class OrderManager:
         # order from before today's midnight, and a genuinely-placed order
         # gets wrongly resolved as not_at_broker.
         sub_times = []
-        for sub in submitting.values():
+        for sub in first_submitting.values():
             try:
                 sub_times.append(datetime.fromisoformat(sub["ts"]))
             except (KeyError, ValueError, TypeError):
@@ -328,10 +344,11 @@ class OrderManager:
         broker_orders = list(self.broker.get_orders(since=since))
 
         rows = []
-        for key, sub in submitting.items():
-            fp = (str(sub.get("symbol", "")).upper(),
-                  str(sub.get("side", "")).lower(),
-                  round(float(sub.get("quantity", 0.0)) / 0.02))
+        for key, sub in first_submitting.items():
+            latest = latest_submitting[key]
+            fp = (str(latest.get("symbol", "")).upper(),
+                  str(latest.get("side", "")).lower(),
+                  round(float(latest.get("quantity", 0.0)) / 0.02))
             # Consume the match so a second unresolved entry with the same
             # (symbol, side, quantity-bucket) -- two ghost entries from one
             # crash, say -- can't also claim the same one broker order.
@@ -369,6 +386,53 @@ class OrderManager:
         # NOTE: this does not know about market holidays or half days. Wire in
         # exchange_calendars before trusting it unattended.
         return True, f"open ({local.strftime('%a %H:%M %Z')})"
+
+    def _refit_turnover(self, plan: LivePlan, account: BrokerAccount) -> LivePlan:
+        """Re-scale the plan against *this* account read, right before
+        preflight sees it -- not the equity LiveSignalRunner used to build
+        it minutes or seconds ago.
+
+        LiveSignalRunner.plan() already scales an over-cap plan down to
+        exactly the turnover cap using the equity it had at planning time.
+        "Exactly" is the problem: ordinary price movement between planning
+        and this read -- confirmed live (2026-08), a $0.12 move on a
+        ~$1,000 account was enough -- recomputes gross/account.equity a
+        hair above the cap and used to hard-abort here, in
+        preflight()'s own turnover check, even though the plan was
+        correctly sized against reality as of a few seconds earlier. Same
+        closed-form scale as LiveSignalRunner, just re-applied against
+        fresher equity, so a plan that already fit only needs a
+        vanishingly small correction, not a fresh rejection.
+        """
+        if account.equity <= 0 or not plan.intents:
+            return plan
+        gross = sum(abs(i.notional) for i in plan.intents)
+        turnover = gross / account.equity
+        if turnover <= self.policy.max_plan_turnover + 1e-9:
+            return plan
+        flat = account.positions.empty or bool(
+            (account.positions.abs() < 1e-9).all()
+        )
+        if self.policy.allow_full_turnover_from_flat and flat:
+            return plan
+        scale = self.policy.max_plan_turnover / turnover
+        scaled = [
+            replace(i, shares=i.shares * scale, notional=i.notional * scale)
+            for i in plan.intents
+        ]
+        scaled = [i for i in scaled if abs(i.notional) > 1e-9]
+        return replace(
+            plan,
+            intents=scaled,
+            warnings=[
+                *plan.warnings,
+                f"turnover {turnover:.1%} exceeds cap "
+                f"{self.policy.max_plan_turnover:.0%} against the account's "
+                f"current equity -- every order rescaled to {scale:.0%} of "
+                "its already-planned size to fit (re-fit at submission "
+                "time, not the equity the plan was originally sized against)",
+            ],
+        )
 
     def preflight(
         self, plan: LivePlan, account: BrokerAccount, now: datetime | None = None
@@ -411,7 +475,14 @@ class OrderManager:
         if account.equity > 0:
             turnover = gross / account.equity
             notes.append(f"turnover {turnover:.1%}")
-            if turnover > self.policy.max_plan_turnover:
+            # Same tolerance as LiveSignalRunner.plan()'s turnover check --
+            # a plan at exactly the cap must clear this, not get hard-
+            # aborted because gross/account.equity landed a floating-point
+            # hair above it. Genuinely matters here specifically: this
+            # check runs against a freshly-read account.equity that can
+            # differ in its last few bits from what LiveSignalRunner used
+            # to size the plan, even when nothing meaningful drifted.
+            if turnover > self.policy.max_plan_turnover + 1e-9:
                 flat = account.positions.empty or bool(
                     (account.positions.abs() < 1e-9).all()
                 )
@@ -474,6 +545,20 @@ class OrderManager:
                         cash=round(account.cash, 2),
                         n_positions=int(len(account.positions)),
                         is_agentic=account.is_agentic)
+
+        # Re-fit against this fresh equity read before preflight ever sees
+        # the plan -- see _refit_turnover's docstring. A no-op (returns the
+        # same object) whenever the plan already fits, which is the normal
+        # case; identity comparison is how we know whether it did anything.
+        refit_plan = self._refit_turnover(plan, account)
+        if refit_plan is not plan:
+            self.audit.emit(
+                "turnover_refit", plan_id=pid,
+                n_intents_before=len(plan.intents),
+                n_intents_after=len(refit_plan.intents),
+                account_equity=round(account.equity, 2),
+            )
+            plan = refit_plan
 
         ok, notes = self.preflight(plan, account, now=now)
         report.preflight_notes = notes
@@ -582,25 +667,118 @@ class OrderManager:
                 self.audit.emit("order_submitting", plan_id=pid, intent=key,
                                 symbol=intent.symbol, side=intent.side,
                                 quantity=round(abs(intent.shares), 6))
+                def _finalize(order):
+                    stage = "rejected" if order.state == "rejected" else "submitted"
+                    self._journal(stage=stage, plan_id=pid, intent_key=key,
+                                  order_id=order.order_id, state=order.state)
+                    self.audit.emit("order_" + stage, plan_id=pid, intent=key,
+                                    order_id=order.order_id, state=order.state,
+                                    filled=round(order.filled_quantity, 6),
+                                    avg_price=order.average_price,
+                                    reason=order.reject_reason)
+                    report.submitted.append(order)
+
                 try:
                     order = self.broker.place_order(
                         intent.symbol, intent.side, abs(intent.shares))
                 except Exception as exc:
-                    # Unknown outcome. Do not retry; leave it for recover().
-                    self.audit.emit("order_unknown_outcome", plan_id=pid, intent=key,
-                                    error=repr(exc))
-                    report.skipped.append((intent, f"unknown outcome: {exc!r}"))
-                    break
+                    # repr(), not str(): the real broker raises through
+                    # anyio task groups, so exc is often a nested
+                    # ExceptionGroup whose str() collapses to "unhandled
+                    # errors in a TaskGroup (1 sub-exception)" -- the actual
+                    # "fractional shares" message only survives in the
+                    # recursive repr() of the whole tree. Confirmed live
+                    # (2026-08): str()-only matching silently missed this
+                    # exact rejection on a second symbol (XLK caught it,
+                    # XLV fell through to the generic unknown-outcome path
+                    # right below with the identical underlying error).
+                    text = repr(exc)
+                    if "fractional shares" not in text.lower():
+                        # Genuinely unknown outcome. Do not retry; leave it
+                        # for recover().
+                        self.audit.emit("order_unknown_outcome", plan_id=pid,
+                                        intent=key, error=repr(exc))
+                        report.skipped.append((intent, f"unknown outcome: {exc!r}"))
+                        break
 
-                stage = "rejected" if order.state == "rejected" else "submitted"
-                self._journal(stage=stage, plan_id=pid, intent_key=key,
-                              order_id=order.order_id, state=order.state)
-                self.audit.emit("order_" + stage, plan_id=pid, intent=key,
-                                order_id=order.order_id, state=order.state,
-                                filled=round(order.filled_quantity, 6),
-                                avg_price=order.average_price,
-                                reason=order.reject_reason)
-                report.submitted.append(order)
+                    # Confirmed live (2026-08): some instruments reject a
+                    # fractional order size with a synchronous 400 ("Order
+                    # quantity cannot include fractional shares"). Unlike a
+                    # timeout or 5xx, this means the order was definitely
+                    # never created -- not the ambiguous case recover()
+                    # exists for. A single corrected retry at a whole-share
+                    # size is a deliberate, bounded correction (not a blind
+                    # retry of the identical request). Routing this through
+                    # the unknown-outcome path instead used to leave a
+                    # dangling "submitting" journal entry that the *next*
+                    # cycle's recover() would resolve as not_at_broker and
+                    # HALT on, even though the outcome was already fully
+                    # known right here.
+                    whole_qty = math.floor(abs(intent.shares))
+                    if whole_qty < 1:
+                        # A target under one share can't be filled at all on
+                        # an instrument that requires whole shares -- except
+                        # when this is establishing a brand-new position
+                        # (current_weight ~ 0, nothing held yet). "Buy
+                        # nothing" there isn't a substitute for "buy a
+                        # little," it's just never holding this name, ever,
+                        # on any account small enough that a single share
+                        # already costs more than the target dollar
+                        # allocation -- confirmed live (2026-08): a $1,000
+                        # account targeting 5 equal-weight ETF sleeves at
+                        # ~$160 each hit this on every single sleeve whose
+                        # share price exceeds that. One whole share is the
+                        # smallest unit that gets any exposure at all;
+                        # downstream limits (max_order_notional,
+                        # max_position_weight) still catch it if that one
+                        # share is unreasonably large for the account. A
+                        # marginal top-up or trim on a position already
+                        # held, or a sell, gets no such exception --
+                        # rounding a small rebalance nudge up to a full
+                        # share would be a much bigger trade than intended,
+                        # not a substitute for a small one.
+                        if intent.side == "buy" and abs(intent.current_weight) < 1e-6:
+                            whole_qty = 1
+                        else:
+                            self._journal(stage="rejected", plan_id=pid,
+                                          intent_key=key, order_id=None,
+                                          state="rejected")
+                            self.audit.emit("order_rejected", plan_id=pid, intent=key,
+                                            order_id=None, state="rejected",
+                                            filled=0.0, avg_price=None, reason=text)
+                            report.skipped.append(
+                                (intent, f"rejected: {intent.symbol} requires whole "
+                                         f"shares and the target size "
+                                         f"({abs(intent.shares):.4f}) rounds down "
+                                         "to 0"))
+                            continue
+
+                    # A second write-ahead entry, at the corrected quantity
+                    # -- recover() reads the *last* "submitting" entry per
+                    # intent for fingerprint matching precisely so this
+                    # retried size (not the original fractional one) is
+                    # what gets searched for if this attempt itself throws
+                    # below.
+                    self._journal(stage="submitting", plan_id=pid, intent_key=key,
+                                  symbol=intent.symbol, side=intent.side,
+                                  quantity=float(whole_qty))
+                    try:
+                        order = self.broker.place_order(
+                            intent.symbol, intent.side, float(whole_qty))
+                    except Exception as exc2:
+                        self.audit.emit("order_unknown_outcome", plan_id=pid,
+                                        intent=key, error=repr(exc2))
+                        report.skipped.append((intent, f"unknown outcome: {exc2!r}"))
+                        break
+
+                    self.audit.emit("order_fractional_rejected_retried_whole",
+                                    plan_id=pid, intent=key,
+                                    original_quantity=round(abs(intent.shares), 6),
+                                    retried_quantity=whole_qty)
+                    _finalize(order)
+                    continue
+
+                _finalize(order)
 
         report.reconciliation = self.reconcile(plan, pid)
         return report

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,6 +52,27 @@ __all__ = [
     "RobinhoodMCPBroker",
     "ToolBinding",
 ]
+
+
+class _SuppressSessionTerminationNoise(logging.Filter):
+    """Confirmed live (2026-08): Robinhood's MCP server 400s on the client's
+    session-termination DELETE at disconnect, every time, regardless of
+    whether anything actually went wrong -- the `mcp` SDK logs it as a bare
+    ``logger.warning(...)`` from :mod:`mcp.client.streamable_http` with no
+    caller-facing option to disable it. It is unrelated to trading logic and
+    shows up on every connect/disconnect cycle, drowning out real output.
+    Filtering the one specific message, rather than raising this logger's
+    level wholesale, leaves any other (currently hypothetical, but real)
+    warning from that module visible.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Session termination failed" not in record.getMessage()
+
+
+logging.getLogger("mcp.client.streamable_http").addFilter(
+    _SuppressSessionTerminationNoise()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -736,11 +758,29 @@ class RobinhoodMCPBroker:
     def get_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
         b = self._binding("orders")
         args = {}
+        # Same requirement as positions/portfolio -- confirmed live (2026-08)
+        # via the recover() path: the 'orders' tool's schema requires
+        # account_number too, and this call built its args without one
+        # because, unlike _positions/_portfolio_figures, it was never given
+        # the account-resolving block. get_account() must have already run
+        # to populate self.account_id (true everywhere recover() is called
+        # from run_cycle.py), so silently omitting the key when unset would
+        # only trade a clear error now for a confusing one from the server.
+        key = b.resolve_arg("account", ("account_number", "account_id", "account"))
+        if key is not None:
+            if self.account_id:
+                args[key] = b.coerce(key, self.account_id)
+            elif key in b.required():
+                raise RuntimeError(
+                    f"{b.tool_name} requires {key!r} but this broker has no "
+                    "account_id set. Call get_account() at least once before "
+                    "get_orders() -- it's what resolves the agentic account."
+                )
         if since is not None:
-            key = b.resolve_arg("since", ("start_date", "since", "after",
-                                          "created_after", "start"))
-            if key:
-                args[key] = since.date().isoformat()
+            since_key = b.resolve_arg("since", ("start_date", "since", "after",
+                                                 "created_after", "start"))
+            if since_key:
+                args[since_key] = since.date().isoformat()
         recs = _as_records(self._call_sync("orders", args))
         orders = []
         for r in recs:
@@ -787,7 +827,17 @@ class RobinhoodMCPBroker:
         # only "amount" would silently turn a 10-share order into a $10
         # one. Better to leave quantity unresolved and let the required-
         # field check below fail loudly than guess at an ambiguous unit.
-        put("quantity", ("quantity", "shares", "qty"), abs(quantity))
+        # Confirmed live (2026-08): the API itself (not the MCP schema --
+        # this passes schema validation and is rejected downstream)
+        # enforces "no more than 8 decimal places" on quantity. Computed
+        # share counts (weight * equity / price) are ordinary floats with
+        # full binary precision, e.g. 2.7255578430183576 -- sent as-is,
+        # every fractional-share order fails with a 400 after already
+        # passing review. Round once, here, so both review_order and
+        # place_order (both go through this method) get a value that can
+        # actually be accepted -- the sub-satoshi difference this rounding
+        # introduces is immaterial at any real order size.
+        put("quantity", ("quantity", "shares", "qty"), round(abs(quantity), 8))
         put("order_type", ("order_type", "type"), order_type)
         # Not routed through put(): that function's required-field check
         # only catches a missing *field name* in the schema, not a missing
@@ -838,8 +888,18 @@ class RobinhoodMCPBroker:
         raw = self._call_sync(
             "review", self._order_args("review", symbol, side, quantity,
                                        order_type, kw))
-        recs = _as_records(raw)
-        rec = recs[0] if recs else {}
+        # A review response is one result, not a collection -- the same
+        # shape as 'portfolio' (single object under "data"), not the same
+        # shape as 'accounts' (list under "data"). _as_records is built for
+        # the list case; handed a single object, it can't find one and
+        # falls back to treating the whole {"data": {...}} wrapper as one
+        # opaque record, which silently breaks every _pick call below (a
+        # response *with* real warnings would read as none, defeating the
+        # one thing this method exists to catch). Inferred from the
+        # confirmed accounts/portfolio pattern, not independently verified
+        # against a live review response -- call_raw("review", ...) to
+        # check directly if this ever looks wrong.
+        rec = _unwrap_object(raw)
         warnings = _pick(rec, "warnings", "alerts", "messages", default=[]) or []
         if isinstance(warnings, str):
             warnings = [warnings]
@@ -859,8 +919,12 @@ class RobinhoodMCPBroker:
         raw = self._call_sync(
             "place", self._order_args("place", symbol, side, quantity,
                                       order_type, kw))
-        recs = _as_records(raw)
-        rec = recs[0] if recs else {}
+        # Same reasoning as review_order(): a place response is one order,
+        # not a collection, so this needs _unwrap_object (single object
+        # under "data"), not _as_records (list under "data") -- inferred
+        # from the confirmed accounts/portfolio pattern, not independently
+        # verified against a live place response.
+        rec = _unwrap_object(raw)
         order_id = _pick(rec, "id", "order_id", default=None)
         if order_id is None or not str(order_id).strip():
             # The call went out -- for all we know the order is now live --
@@ -918,8 +982,9 @@ class RobinhoodMCPBroker:
         # heuristic -- this adapter's response schema isn't verified
         # against the live service (see the class docstring), so a
         # confirmed error is the one thing worth being sure about.
-        recs = _as_records(raw)
-        rec = recs[0] if recs else {}
+        # Same single-object-under-"data" shape as review/place, inferred
+        # from the confirmed accounts/portfolio pattern -- see review_order().
+        rec = _unwrap_object(raw)
         if _pick(rec, "error", "error_message", default=None):
             return False
         success = _pick(rec, "success", "ok", "cancelled", "canceled", default=None)
@@ -1012,7 +1077,21 @@ def _as_records(payload: Any) -> list[dict]:
     return []
 
 
-_OBJECT_WRAPPER_KEYS = ("data", "result", "portfolio", "account")
+# "order" confirmed live (2026-08): place_equity_order's real response is
+# {"order": {"id": ..., "state": "unconfirmed", ...}}, not {"data": {...}}
+# like portfolio -- each tool wraps its single-object response under a key
+# named for what it returns, not a single generic envelope. Discovered when
+# an EFA order that actually filled couldn't be parsed into an order id
+# (the "order" key wasn't a candidate here, so _unwrap_object fell through
+# to returning the whole {"order": {...}} wrapper as the "record", and
+# _pick found no top-level "id" on it) -- place_order() correctly refused
+# to fabricate an order id rather than silently return a wrong one, but
+# that meant OrderManager treated a real, filled order as an unknown
+# outcome. review_equity_order/cancel_equity_order are not yet confirmed
+# to use "order" too (still inferred from the accounts/portfolio pattern,
+# same caveat as before) -- call_raw(...) to check directly if one of
+# those ever looks wrong.
+_OBJECT_WRAPPER_KEYS = ("data", "result", "portfolio", "account", "order")
 
 
 def _unwrap_object(payload: Any) -> dict:
@@ -1025,13 +1104,31 @@ def _unwrap_object(payload: Any) -> dict:
     finds no list anywhere and falls back to treating the whole wrapper as
     one opaque record, which silently breaks every ``_pick`` call against
     it -- the field it's looking for is one level too deep to see.
+
+    Peels through *every* consecutive layer of single-key wrapping, not
+    just one. Confirmed live (2026-08): place_equity_order's real response
+    is two levels deep, {"data": {"order": {...}}} -- the same "data"
+    envelope every other endpoint uses, plus a resource-name key, the same
+    shape "accounts" uses for its list ({"data": {"accounts": [...]}}).
+    An earlier version of this function stopped after unwrapping "data"
+    once and never got to "order", which is exactly how a real, filled
+    order (state="filled", not a rejection) came back unparseable and got
+    treated as an unknown outcome a second time -- the first fix confirmed
+    a one-level {"order": {...}} shape by reading an error message that
+    had, itself, already been through one round of incomplete unwrapping.
     """
     if not isinstance(payload, dict):
         return {}
-    for key in _OBJECT_WRAPPER_KEYS:
-        value = payload.get(key)
-        if isinstance(value, dict):
-            return value
+    depth = 0
+    while depth < 5:
+        key = next(
+            (k for k in _OBJECT_WRAPPER_KEYS if isinstance(payload.get(k), dict)),
+            None,
+        )
+        if key is None:
+            break
+        payload = payload[key]
+        depth += 1
     return payload
 
 
