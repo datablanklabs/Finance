@@ -254,10 +254,17 @@ follow all come from actual live calls, not the original design-time guesses.
 - **`portfolio` returns one object, not a list**, `{"data": {...}}` one level
   deep, with `buying_power` itself nested one level further,
   `{"buying_power": {"buying_power": "1000.0000", ...}}`.
-- **`place_equity_order`'s response wraps under `"order"`**, not `"data"` like
-  `portfolio` — each tool's response wrapper key matches what it returns, not
-  one shared envelope. Missing this meant a real, filled order was briefly
-  unparseable (see "Idempotency" above for how that's now closed out safely).
+- **`place_equity_order`'s response is wrapped two levels deep**,
+  `{"data": {"order": {...}}}` — the same `"data"` envelope every other
+  endpoint uses, plus a resource-name key, the same shape `"accounts"` uses
+  for its list (`{"data": {"accounts": [...]}}`). `_unwrap_object()` used to
+  stop after peeling one layer, which happened to be enough for `portfolio`
+  (flat fields directly under `"data"`, no resource-name key) but not for
+  `place`/`order` — it now peels every consecutive layer, not just one.
+  Missing this meant two separate real, filled orders came back unparseable
+  before being caught (see "Idempotency" above for how that's now closed out
+  safely each time it happens, rather than by getting the shape right once
+  and hoping).
 - **`review_equity_order`/`place_equity_order`/`cancel_equity_order`/
   `get_equity_orders` all require `account_number`** in their schema, resolved
   from `get_account()` and cached for the rest of the broker's lifetime.
@@ -267,11 +274,15 @@ follow all come from actual live calls, not the original design-time guesses.
 - **Orders must not exceed 8 decimal places**, a business rule enforced by the
   API itself, beyond and separate from anything the schema says.
 - **Fractional-share orders are rejected outright on at least several ETFs**
-  (observed on XLF, XLK, XLV, and IWM) — "Order quantity cannot include
+  (observed on XLF, XLK, XLV, IWM, and EFA) — "Order quantity cannot include
   fractional shares." This looks like a broad account/instrument-class
-  limitation, not a one-off quirk; budget for whole-share sizing on a small
-  account, since a target position under 1 share just won't fill. See the
-  idempotency note above for how a rejection here is now handled automatically.
+  limitation, not a one-off quirk. On a small account this means most
+  multi-name targets round to under a share; `execute()` rounds a sub-share
+  target *up* to one whole share specifically when establishing a brand-new
+  position (nothing held yet), since a floor to zero there means never
+  holding that name at all, on any account this size. A marginal top-up or
+  trim on a position already held still rounds down and skips — see the
+  idempotency note above for the full retry logic either way.
 - **Real errors arrive as nested `anyio` `ExceptionGroup`s.** `str()` on one of
   these collapses to `"unhandled errors in a TaskGroup (1 sub-exception)"` —
   the actual message only survives `repr()`. Anything matching on error text
@@ -281,22 +292,40 @@ The full, dated list — including fixtures that reproduce each exact response
 shape — lives in `test_robinhood_broker.py`'s header docstring; that file is
 the thing to extend the next time a new quirk turns up. Two things remain
 genuinely unconfirmed: **rate limits** (not yet hit), and whether
-**`review_equity_order`/`cancel_equity_order` follow the same `"order"`-key
-wrapper `place_equity_order` does** (inferred from the pattern, not
-independently observed — `broker.call_raw("review", ...)` is the safe way to
-check directly).
+**`review_equity_order`/`cancel_equity_order` wrap the same way `place`
+does** (inferred from the pattern, not independently observed —
+`broker.call_raw("review", ...)` is the safe way to check directly). Trust
+the *pattern* here (a "data" envelope plus a resource-name key) more than
+any single confirmed depth, though — that's the second time a real order
+response turned out to be wrapped one layer deeper than the last confirmed
+sample suggested.
 
 The entire order path is additionally tested against `MockBroker`, which
 models partial fills, rejections, and untradeable symbols — so the logic is
 verified offline too, not only against the one live account it's been run
 against so far.
 
-### Four independent kill switches
+### Three stops, and a two-stage throttle
 
-Fastest to slowest: the `KILL` file preflight checks every cycle; the drawdown
-breaker in the risk gate; the turnover cap in `LiveSignalRunner`; and
-Robinhood's one-tap disconnect in the app — the only one that does not depend on
-your code being correct.
+The `KILL` file (checked every cycle), the drawdown breaker in the risk gate,
+and Robinhood's one-tap disconnect in the app are the genuine stops — each
+one zeroes out the plan (or, for the disconnect, everything). Turnover isn't
+among them: both places that check it scale the plan down to fit rather than
+reject it outright, and neither is the "real" one alone — they're two
+applications of the same idea, not a soft check backed by a hard one.
+
+`LiveSignalRunner.plan()` scales first, against the equity it has at
+planning time. `OrderManager._refit_turnover()` re-fits the same plan again
+right before submission, against a freshly-read account — because scaling to
+*exactly* the cap at planning time leaves no margin for ordinary price
+movement between then and submission. Confirmed live (2026-08): a $0.12 move
+on a ~$1,000 account was enough to push a plan already scaled to exactly 67%
+back over it by the time `OrderManager` read the account fresh, and the
+first version of this hard-aborted on that — rejecting a plan that had been
+correctly sized moments earlier for no reason a human would find
+convincing. Re-fitting at both ends means overage gets corrected wherever it
+turns up, not just detected once and given up on (see "Idempotency" above
+for the same instinct applied to order retries instead of trade sizing).
 
 ### Going live, in order
 

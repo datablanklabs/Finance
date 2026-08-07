@@ -159,8 +159,10 @@ check("closed market aborts the plan",
 
 om, broker, path = make("turnover", dry_run=False, max_plan_turnover=0.01)
 rep = om.execute(plan, now=MARKET_HOURS)
-check("turnover cap aborts the plan",
-      rep.aborted and "turnover" in rep.aborted_reason, rep.aborted_reason)
+check("turnover cap scales the plan down to fit instead of aborting it",
+      not rep.aborted, rep.aborted_reason)
+check("the re-fit that made this possible is in the audit trail",
+      "turnover_refit" in om.audit.read()["event"].tolist())
 
 # A flat account's first-ever buildout is structurally ~100% turnover --
 # current weights are all zero, so turnover and gross exposure are the same
@@ -211,6 +213,93 @@ _strict_om = OrderManager(broker=_flat_broker, policy=_strict_policy,
 _strict_ok, _strict_notes = _strict_om.preflight(_flat_plan, _flat_broker.get_account(), now=MARKET_HOURS)
 check("the exemption can be disabled via allow_full_turnover_from_flat=False",
       not _strict_ok, "; ".join(_strict_notes))
+
+# A plan whose turnover lands exactly on the cap must clear preflight, not
+# get hard-aborted -- but "exactly 0.67" is a mathematical statement, and
+# gross/account.equity is a float computation. This specific equity and
+# per-order notional (found by search) genuinely rounds to
+# 0.6700000000000002 in IEEE double precision -- 1.1e-16 above the nominal
+# cap, not a real overage. A non-flat account, deliberately: the
+# allow_full_turnover_from_flat exemption would otherwise mask a broken
+# comparison by passing for an unrelated reason.
+_boundary_broker = MockBroker(prices=pd.Series({"S0": 100.0}), cash=3060.19,
+                              positions=pd.Series({"S0": 1.0}))  # equity = 3160.19, not flat
+_boundary_broker.connect()
+_boundary_intents = [
+    OrderIntent(symbol=f"B{i}", side="buy", shares=1.0, reference_price=705.7757666666668,
+               notional=705.7757666666668, current_weight=0.0, target_weight=0.0)
+    for i in range(3)
+]
+_boundary_plan = LivePlan(
+    asof=pd.Timestamp("2026-08-06"), equity=3160.19, intents=_boundary_intents,
+    target_weights=pd.Series(dtype=float), current_weights=pd.Series(dtype=float),
+    decision=None, warnings=[],
+)
+_raw_turnover = sum(i.notional for i in _boundary_intents) / 3160.19
+check("the boundary case actually reproduces a float artifact just above 0.67",
+      0.67 < _raw_turnover < 0.67 + 1e-9, repr(_raw_turnover))
+
+_boundary_policy = ExecutionPolicy(max_plan_turnover=0.67, require_market_open=False,
+                                   kill_switch_path=os.path.join(fresh("boundary"), "KILL"))
+_boundary_om = OrderManager(broker=_boundary_broker, policy=_boundary_policy,
+                            journal_path=os.path.join(WORK, "boundary", "journal.jsonl"))
+_boundary_ok, _boundary_notes = _boundary_om.preflight(
+    _boundary_plan, _boundary_broker.get_account(), now=MARKET_HOURS
+)
+check("a plan landing a float hair above the cap clears preflight, not aborted",
+      _boundary_ok, "; ".join(_boundary_notes))
+
+# The real bug this session hit: LiveSignalRunner.plan() scales a plan down
+# to *exactly* the turnover cap using the equity it had at planning time.
+# By the time OrderManager.execute() reads the account fresh, ordinary
+# price movement -- confirmed live, a $0.12 move on a ~$1,000 account --
+# recomputes gross/account.equity a hair over the cap, and used to abort
+# execute() outright even though the plan was correctly sized moments
+# earlier. execute() must re-fit against the fresh read instead.
+_drift_gross = 0.67 * 1001.28  # exactly what planning scaled to, equity=1001.28
+_drift_intents = [
+    OrderIntent(symbol="XLF", side="buy", shares=_drift_gross / 100.0,
+               reference_price=100.0, notional=_drift_gross,
+               current_weight=0.0, target_weight=0.1),
+]
+_drift_plan = LivePlan(
+    asof=pd.Timestamp("2026-08-07"), equity=1001.28, intents=_drift_intents,
+    target_weights=pd.Series({"XLF": 0.1}), current_weights=pd.Series({"XLF": 0.0}),
+    decision=None, warnings=[],
+)
+# Not flat, fresh equity 1001.16 -- the exact reported drift, $0.12 lower.
+_drift_broker = MockBroker(prices=pd.Series({"XLF": 100.0}), cash=901.16,
+                           positions=pd.Series({"XLF": 1.0}))
+_drift_broker.connect()
+_drift_policy = ExecutionPolicy(max_plan_turnover=0.67, require_market_open=False,
+                                dry_run=True,
+                                kill_switch_path=os.path.join(fresh("drift_refit"), "KILL"))
+_drift_path = fresh("drift_refit_om")
+_drift_om = OrderManager(broker=_drift_broker, policy=_drift_policy,
+                         audit=AuditLog(os.path.join(_drift_path, "a.jsonl"), stdout=False),
+                         journal_path=os.path.join(_drift_path, "journal.jsonl"))
+_drift_report = _drift_om.execute(_drift_plan, strategy_name="drift-refit")
+check("a plan re-scaled to exactly the cap survives normal equity drift by "
+      "execution time, instead of getting hard-aborted",
+      _drift_report.aborted_reason is None, _drift_report.aborted_reason)
+check("the re-fit is recorded in the audit trail",
+      "turnover_refit" in _drift_om.audit.read()["event"].tolist())
+
+# A plan comfortably under the cap must not be touched at all -- confirm
+# _refit_turnover() is a true no-op (same object back) in the normal case,
+# not just "close enough" scaling every single time.
+_norefit_intents = [
+    OrderIntent(symbol="XLF", side="buy", shares=1.0, reference_price=10.0,
+               notional=10.0, current_weight=0.0, target_weight=0.01),
+]
+_norefit_plan = LivePlan(
+    asof=pd.Timestamp("2026-08-07"), equity=1000.0, intents=_norefit_intents,
+    target_weights=pd.Series({"XLF": 0.01}), current_weights=pd.Series({"XLF": 0.0}),
+    decision=None, warnings=[],
+)
+_norefit_account = _drift_broker.get_account()
+check("a plan already well under the cap is not rewritten at all",
+      _drift_om._refit_turnover(_norefit_plan, _norefit_account) is _norefit_plan)
 
 om, broker, path = make("notional", dry_run=False, max_plan_notional=100.0)
 rep = om.execute(plan, now=MARKET_HOURS)
@@ -476,13 +565,22 @@ frac_recover = frac_om.recover()
 check("recover() finds nothing dangling after a fractional-rejection retry succeeded",
       frac_recover.empty)
 
-# A target size that rounds down to zero whole shares can't be corrected --
-# must skip cleanly (terminal "rejected" in the journal), not retry at 0.
+# A target under one share for a brand-new position (current_weight ~ 0)
+# rounds UP to one whole share instead of being skipped -- confirmed live
+# (2026-08): a $1,000 account targeting 5 equal-weight ETF sleeves at
+# ~$160 each hit this on every sleeve whose share price exceeds that;
+# skipping every one of them means never holding any of those names, on
+# any account this size, rather than holding a *little* of each.
 tiny_path = fresh("fractional_tiny")
 tiny_broker = MockBroker(prices=pd.Series({"CCC": 300.0}), cash=100_000.0)
 tiny_broker.connect()
+_real_tiny_place = tiny_broker.place_order
+tiny_calls = []
 def _tiny_place(symbol, side, quantity, *a, **kw):
-    raise _fractional_shares_error()
+    tiny_calls.append(quantity)
+    if quantity != 1.0:
+        raise _fractional_shares_error()
+    return _real_tiny_place(symbol, side, quantity, *a, **kw)
 tiny_broker.place_order = _tiny_place
 
 tiny_om = OrderManager(
@@ -498,13 +596,48 @@ tiny_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[tiny_in
                      target_weights=pd.Series({"CCC": 0.01}),
                      current_weights=pd.Series({"CCC": 0.0}), decision=None)
 tiny_report = tiny_om.execute(tiny_plan, strategy_name="frac-tiny", now=now)
-check("a sub-one-share fractional rejection is skipped cleanly, not retried at 0 shares",
-      any("rounds down to 0" in s[1] for s in tiny_report.skipped))
+check("a sub-one-share target for a brand-new position rounds up to 1 share",
+      tiny_calls == [0.848263, 1.0], tiny_calls)
+check("the rounded-up order actually lands",
+      any(o.symbol == "CCC" for o in tiny_report.submitted))
 
 tiny_recover = tiny_om.recover()
-check("a definitively-rejected sub-share order leaves nothing dangling -- recover() "
-      "can't misresolve it as not_at_broker and HALT the next cycle",
+check("recover() finds nothing dangling after a round-up-to-1 retry succeeded",
       tiny_recover.empty)
+
+# The same sub-one-share target, but as a marginal top-up on a position
+# already held (current_weight != 0) -- must still skip cleanly, not round
+# up. Forcing a full extra share for a small rebalance nudge would be a
+# much bigger trade than intended, unlike establishing a position from
+# nothing, where the target was already going to be small.
+topup_path = fresh("fractional_topup")
+topup_broker = MockBroker(prices=pd.Series({"DDD": 300.0}), cash=100_000.0)
+topup_broker.connect()
+def _topup_place(symbol, side, quantity, *a, **kw):
+    raise _fractional_shares_error()
+topup_broker.place_order = _topup_place
+
+topup_om = OrderManager(
+    topup_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(topup_path, "KILL")),
+    AuditLog(os.path.join(topup_path, "a.jsonl"), stdout=False),
+    os.path.join(topup_path, "j.jsonl"),
+)
+topup_intent = OrderIntent(symbol="DDD", side="buy", shares=0.848263, reference_price=300.0,
+                           notional=254.48, current_weight=0.08, target_weight=0.09)
+topup_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[topup_intent],
+                      target_weights=pd.Series({"DDD": 0.09}),
+                      current_weights=pd.Series({"DDD": 0.08}), decision=None)
+topup_report = topup_om.execute(topup_plan, strategy_name="frac-topup", now=now)
+check("a sub-one-share top-up on an existing position is still skipped, not "
+      "rounded up",
+      any("rounds down to 0" in s[1] for s in topup_report.skipped))
+
+topup_recover = topup_om.recover()
+check("a definitively-rejected top-up leaves nothing dangling -- recover() "
+      "can't misresolve it as not_at_broker and HALT the next cycle",
+      topup_recover.empty)
 
 # The exact real-money scenario this session hit: a fractional-share
 # rejection triggers a retry at a whole-share size, the retry *itself* then

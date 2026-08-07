@@ -40,15 +40,25 @@ silently regress any of the bugs this session found:
   place_order() (correctly) raised rather than fabricate an id -- which
   meant a genuinely successful live order got treated as an unknown
   outcome.
+* Confirmed live (2026-08): the server 400s on the client's own
+  session-termination DELETE at disconnect, every time, regardless of
+  whether anything actually went wrong. The `mcp` SDK logs this as a bare
+  warning from mcp.client.streamable_http with no caller-facing switch to
+  turn it off, so importing qbt.broker installs a logging.Filter on that
+  one logger that drops only this specific message -- not the whole
+  logger, so a real warning from that module would still surface.
 
 
 Account numbers and dollar values below are fabricated, not the real ones
 from that session -- only the field names/nesting are verbatim.
 """
 
+import io
+import logging
+
 import numpy as np
 
-from qbt.broker import RobinhoodMCPBroker, ToolBinding, _schema_types
+from qbt.broker import RobinhoodMCPBroker, ToolBinding, _schema_types, _unwrap_object
 
 FAILS = []
 
@@ -411,7 +421,7 @@ except RuntimeError as exc:
 
 print()
 print("=" * 72)
-print("7. place_order() parses the real {\"order\": {...}} response shape")
+print("7. place_order() parses the real, doubly-wrapped {\"data\": {\"order\": {...}}} shape")
 print("=" * 72)
 
 PLACE_SCHEMA = {
@@ -422,23 +432,38 @@ PLACE_SCHEMA = {
     },
     "required": ["account_number", "symbol", "side", "type", "quantity"],
 }
-# The exact shape confirmed live (2026-08): a single order object wrapped
-# under "order", not "data" -- field names verbatim, id/timestamps fabricated.
+# The exact shape confirmed live (2026-08): TWO levels deep,
+# {"data": {"order": {...}}} -- the same "data" envelope every other
+# endpoint uses, plus a resource-name key, the same pattern "accounts"
+# uses for its list ({"data": {"accounts": [...]}}). Field names verbatim,
+# id/timestamps fabricated. An earlier fix confirmed only a one-level
+# {"order": {...}} shape (REAL_PLACE_RESPONSE_LEGACY_SHAPE below) by
+# reading a RuntimeError's already-partly-unwrapped `rec!r` text rather
+# than the true raw payload -- a second real, filled order (XLF) came back
+# unparseable a second time because _unwrap_object stopped after peeling
+# "data" and never got to "order".
 REAL_PLACE_RESPONSE = {
-    "order": {
-        "id": "6a74e504-ec28-4ec9-9df3-8b31afe4f305",
-        "instrument_id": "c787074b-0abb-4940-846b-dbee221dd10f",
-        "symbol": "",
-        "side": "buy",
-        "type": "market",
-        "state": "filled",
-        "quantity": "1.000000",
-        "cumulative_quantity": "1.000000",
-        "price": "107.260000",
-        "average_price": "107.255000",
-        "created_at": "2026-08-06T19:48:20.555945Z",
+    "data": {
+        "order": {
+            "id": "6a75fb46-4005-4062-b3d5-3a66c7b0058a",
+            "instrument_id": "f25b2d63-0372-4827-9907-e7e9e37a10f1",
+            "symbol": "",
+            "side": "buy",
+            "type": "market",
+            "state": "filled",
+            "quantity": "2.000000",
+            "cumulative_quantity": "2.000000",
+            "price": "57.520000",
+            "average_price": "57.519900",
+            "created_at": "2026-08-07T15:35:34.713562Z",
+        }
     }
 }
+# The one-level shape the first fix (incorrectly) assumed was the whole
+# story -- still a real possibility (maybe some other tool really does
+# only wrap once), so _unwrap_object must keep handling it too.
+REAL_PLACE_RESPONSE_LEGACY_SHAPE = {"order": dict(REAL_PLACE_RESPONSE["data"]["order"],
+                                                   id="legacy-shape-id")}
 
 place_broker = RobinhoodMCPBroker(token="fake")
 place_broker.bindings = {
@@ -457,13 +482,76 @@ def _fake_place_call(capability, arguments):
 place_broker._call_sync = _fake_place_call
 place_broker.get_account()
 
-placed = place_broker.place_order("EFA", "buy", 1.0)
-check("place_order parses the id out of the {\"order\": {...}} wrapper, doesn't raise",
-      placed.order_id == "6a74e504-ec28-4ec9-9df3-8b31afe4f305")
-check("state is read from inside the unwrapped 'order' object",
+placed = place_broker.place_order("XLF", "buy", 2.0)
+check("place_order parses the id out of the {\"data\": {\"order\": {...}}} "
+      "double wrapper, doesn't raise",
+      placed.order_id == "6a75fb46-4005-4062-b3d5-3a66c7b0058a")
+check("state is read from inside the fully-unwrapped 'order' object",
       placed.state == "filled")
-check("average_price is read from inside the unwrapped 'order' object",
-      placed.average_price == 107.255)
+check("average_price is read from inside the fully-unwrapped 'order' object",
+      placed.average_price == 57.5199)
+
+legacy_broker = RobinhoodMCPBroker(token="fake")
+legacy_broker.bindings = dict(place_broker.bindings)
+def _fake_legacy_call(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    if capability == "place":
+        return REAL_PLACE_RESPONSE_LEGACY_SHAPE
+    raise AssertionError(f"unexpected capability {capability!r}")
+legacy_broker._call_sync = _fake_legacy_call
+legacy_broker.get_account()
+legacy_placed = legacy_broker.place_order("XLF", "buy", 2.0)
+check("a one-level {\"order\": {...}} response (no \"data\" wrapper) still parses too",
+      legacy_placed.order_id == "legacy-shape-id")
+
+print()
+print("=" * 72)
+print("8. Session-termination noise is filtered, not the whole logger")
+print("=" * 72)
+
+_mcp_logger = logging.getLogger("mcp.client.streamable_http")
+_capture = io.StringIO()
+_handler = logging.StreamHandler(_capture)
+_mcp_logger.addHandler(_handler)
+try:
+    _mcp_logger.warning("Session termination failed: 400")
+    _mcp_logger.warning("Session termination failed: some other exception text")
+    _mcp_logger.warning("a genuinely different warning that should still surface")
+finally:
+    _mcp_logger.removeHandler(_handler)
+
+_captured_text = _capture.getvalue()
+check("the status-code variant of the noise is filtered",
+      "Session termination failed: 400" not in _captured_text)
+check("the exception-text variant of the noise is filtered too",
+      "some other exception text" not in _captured_text)
+check("an unrelated warning from the same logger still surfaces",
+      "genuinely different warning" in _captured_text, repr(_captured_text))
+
+print()
+print("=" * 72)
+print("9. _unwrap_object() peels every layer of wrapping, not just one")
+print("=" * 72)
+
+check("a two-level {\"data\": {\"order\": {...}}} response is fully unwrapped",
+      _unwrap_object({"data": {"order": {"id": "x"}}}) == {"id": "x"})
+check("a one-level {\"order\": {...}} response still works",
+      _unwrap_object({"order": {"id": "x"}}) == {"id": "x"})
+check("an already-flat response is returned unchanged",
+      _unwrap_object({"id": "x"}) == {"id": "x"})
+check("a non-dict payload returns an empty dict, doesn't crash",
+      _unwrap_object([1, 2, 3]) == {})
+# The critical non-regression: portfolio's real shape has a legitimate
+# nested field named "buying_power" that must NOT be mistaken for another
+# layer of wrapping just because unwrapping is now multi-level.
+_portfolio_like = {"data": {"cash": "500", "buying_power": {"buying_power": "500"}}}
+check("multi-level unwrapping does not over-unwrap into unrelated nested "
+      "fields (portfolio's real shape)",
+      _unwrap_object(_portfolio_like) == {"cash": "500",
+                                          "buying_power": {"buying_power": "500"}})
 
 print()
 print("=" * 72)

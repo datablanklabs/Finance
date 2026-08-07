@@ -425,17 +425,99 @@ check("live runner weights match a direct gate call",
 
 print("\n  audit record:", plan.audit_record())
 
-# Turnover guard should withhold an oversized plan -- except `state` here is
-# a flat book (all-zero shares), and allow_full_turnover_from_flat defaults
-# to True, so the raw withholding mechanism needs the exemption off to
-# actually exercise it.
+# Turnover guard should scale an oversized plan down to fit the cap, not
+# discard it -- except `state` here is a flat book (all-zero shares), and
+# allow_full_turnover_from_flat defaults to True, so the exemption needs to
+# be off to actually exercise the scaling path.
+uncapped = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                            max_turnover=None)
+uplan = uncapped.plan(panel, state)
+
 guarded = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
                            max_turnover=0.05,
                            allow_full_turnover_from_flat=False)
 gplan = guarded.plan(panel, state)
-check("turnover guard withholds oversized plans",
-      len(gplan.intents) == 0 and any("turnover" in w for w in gplan.warnings),
+check("turnover guard scales an oversized plan down instead of discarding it",
+      len(gplan.intents) > 0 and any("scaled" in w for w in gplan.warnings),
       gplan.warnings[0] if gplan.warnings else "")
+check("the scaled plan's turnover respects the cap",
+      gplan.turnover <= guarded.max_turnover + 1e-9,
+      f"turnover={gplan.turnover:.4f} cap={guarded.max_turnover}")
+
+# Scaling must be uniform (every surviving order shrunk by the same factor,
+# not a hand-picked subset kept at full size) and must land at the cap, not
+# arbitrarily below it -- the largest plan that still respects the limit.
+expected_scale = guarded.max_turnover / uplan.turnover
+uplan_by_symbol = {i.symbol: i for i in uplan.intents}
+ratios = [gi.notional / uplan_by_symbol[gi.symbol].notional for gi in gplan.intents]
+check("every surviving order is scaled by the same factor",
+      all(abs(r - expected_scale) < 1e-9 for r in ratios), ratios)
+check("that factor is exactly cap / uncapped turnover",
+      abs(gplan.turnover - guarded.max_turnover) < 1e-9,
+      f"turnover={gplan.turnover:.6f} cap={guarded.max_turnover}")
+
+# A scaled-down order can itself fall below min_trade_notional -- the same
+# filter _to_intents() already applies pre-scaling has to run again after,
+# not just once up front, or a $9 leftover order would still go out.
+class _FixedWeights:
+    name = "fixed"
+    min_history = 1
+
+    def __init__(self, weights):
+        self._weights = weights
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        return pd.Series(self._weights).reindex(view.symbols).fillna(0.0)
+
+
+tiny_dates = pd.date_range("2024-01-01", periods=5, freq="D")
+tiny_panel = PricePanel(close=pd.DataFrame(
+    {"A": [100.0] * 5, "B": [100.0] * 5}, index=tiny_dates))
+tiny_state = PortfolioState(cash=1_000.0, shares=pd.Series({"A": 0.0, "B": 0.0}))
+# Uncapped: A=70%, B=30% of $1,000 -> $700/$300, turnover 100%.
+# Capped at 10% with allow_full_turnover_from_flat off -> scale=0.1 ->
+# A=$70, B=$30. min_trade_notional=35 keeps A, drops B.
+tiny_runner = LiveSignalRunner(
+    strategy=_FixedWeights({"A": 0.7, "B": 0.3}), risk_gate=None,
+    min_trade_notional=35.0, max_turnover=0.10,
+    allow_full_turnover_from_flat=False,
+)
+tiny_plan = tiny_runner.plan(tiny_panel, tiny_state)
+check("a scaled order that drops below min_trade_notional is filtered out",
+      [i.symbol for i in tiny_plan.intents] == ["A"],
+      [(i.symbol, i.notional) for i in tiny_plan.intents])
+
+# A plan whose turnover lands exactly on the cap must clear it, not get
+# scaled/withheld -- but "exactly 0.67" is a mathematical statement, and
+# sum(notional) / equity is a float computation. This specific combination
+# of 7 equal-weighted symbols (0.67 / 7 each) and prices was found by
+# search to genuinely round to 0.6700000000000002 in IEEE double precision
+# -- 1.1e-16 above the nominal cap, not a real overage -- reproducing
+# exactly the class of bug a bare `turnover > max_turnover` comparison
+# would hit on real data, not a contrived exact-equality case that would
+# have passed even without the fix.
+boundary_prices = {"S0": 117.2, "S1": 410.39, "S2": 320.76, "S3": 468.89,
+                   "S4": 305.06, "S5": 46.26, "S6": 70.98}
+boundary_panel = PricePanel(close=pd.DataFrame(
+    {s: [p] * 5 for s, p in boundary_prices.items()}, index=tiny_dates))
+boundary_state = PortfolioState(
+    cash=1_000.0, shares=pd.Series({s: 0.0 for s in boundary_prices}))
+boundary_runner = LiveSignalRunner(
+    strategy=_FixedWeights({s: 0.67 / 7 for s in boundary_prices}), risk_gate=None,
+    min_trade_notional=0.001, max_turnover=0.67,
+)
+boundary_plan = boundary_runner.plan(boundary_panel, boundary_state)
+raw_turnover = sum(i.notional for i in boundary_plan.intents) / 1_000.0
+check("the boundary case actually reproduces a float artifact just above 0.67",
+      0.67 < raw_turnover < 0.67 + 1e-9, repr(raw_turnover))
+check("a plan landing a float hair above the cap is not scaled or withheld",
+      len(boundary_plan.intents) == 7
+      and not any("exceeds" in w for w in boundary_plan.warnings),
+      boundary_plan.warnings)
+check("the surviving order still respects the turnover cap",
+      tiny_plan.turnover <= tiny_runner.max_turnover + 1e-9,
+      f"turnover={tiny_plan.turnover}")
 
 # Same cap, same flat state, default settings this time: the first buildout
 # from cash is exempt rather than withheld.

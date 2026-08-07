@@ -183,8 +183,17 @@ def main() -> int:
             shares=account.positions.reindex(panel.symbols).fillna(0.0),
             peak_equity=peak,
         )
+        # Same cap ExecutionPolicy enforces below, not a looser multiple of
+        # it -- the two used to disagree (this one 1.5x looser), so a plan
+        # that cleared this check unscaled would still turn around and get
+        # hard-aborted by ExecutionPolicy's own turnover check in
+        # OrderManager.preflight(), the exact thing the scale-down logic in
+        # LiveSignalRunner.plan() exists to avoid. Keeping both aligned
+        # means that check now does what it was actually meant to do: a
+        # rarely-firing safety net for equity drift between planning and
+        # submission, not the real enforcement point.
         plan = LiveSignalRunner(strategy=STRATEGY, risk_gate=RiskGate(**GATE),
-                                max_turnover=args.max_turnover * 1.5).plan(
+                                max_turnover=args.max_turnover).plan(
             panel, state)
 
         # Surface *why* the plan looks the way it does -- these were
