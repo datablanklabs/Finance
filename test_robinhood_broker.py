@@ -33,13 +33,17 @@ silently regress any of the bugs this session found:
   ever resolving/including an account key at all (unlike _positions() and
   _portfolio_figures(), which both do), so OrderManager.recover()'s call to
   it failed MCP-side with 'missing properties: ["account_number"]'.
-* place_equity_order's real response is {"order": {"id": ..., "state":
-  "unconfirmed", ...}} -- a single object wrapped under "order", not under
-  "data" like portfolio. "order" wasn't a candidate key in
-  _unwrap_object(), so a real, filled order came back unparseable and
-  place_order() (correctly) raised rather than fabricate an id -- which
-  meant a genuinely successful live order got treated as an unknown
-  outcome.
+* place_equity_order's real response is wrapped TWO levels deep,
+  {"data": {"order": {"id": ..., "state": "unconfirmed", ...}}} -- the same
+  "data" envelope every other endpoint uses, plus a resource-name key, the
+  same pattern "accounts" uses for its list. An earlier fix confirmed only
+  a one-level {"order": {...}} shape (inferred from a RuntimeError's
+  already-partly-unwrapped `rec!r` text, not the true raw payload), so
+  _unwrap_object() stopped after peeling "data" once and never got to
+  "order" -- meaning a real, filled order came back unparseable and
+  place_order() (correctly) raised rather than fabricate an id, a second
+  time, for a second real order. _unwrap_object() now peels every
+  consecutive layer of wrapping, not just one.
 * Confirmed live (2026-08): the server 400s on the client's own
   session-termination DELETE at disconnect, every time, regardless of
   whether anything actually went wrong. The `mcp` SDK logs this as a bare
@@ -47,6 +51,22 @@ silently regress any of the bugs this session found:
   turn it off, so importing qbt.broker installs a logging.Filter on that
   one logger that drops only this specific message -- not the whole
   logger, so a real warning from that module would still surface.
+* get_equity_quotes's real response is {"data": {"results": [{"quote":
+  {"symbol": ..., "last_trade_price": ..., ...}, "close": {...}}, ...]}} --
+  each result bundles a live "quote" sub-object and a stale end-of-day
+  "close" sub-object as siblings. symbol/price live inside "quote", not at
+  the top level of the record, so a naive top-level _pick found neither
+  and get_quotes() silently returned an empty series for every real
+  request -- no exception, just no prices, which meant a portfolio summary
+  showed shares held with no value or weight for any position.
+* A fractional-share rejection now rounds a sub-share target UP to one
+  whole share when establishing a brand-new position (current_weight ~ 0)
+  -- see qbt/orders.py's execute(). Confirmed live (2026-08): a $1,000
+  account targeting 5 equal-weight ETF sleeves at ~$160 each hit the
+  fractional-share rejection on every sleeve whose share price exceeds
+  that, and rounding down to 0 there means never holding that name at all,
+  on any account this size. A marginal top-up or trim on a position
+  already held still rounds down and skips.
 
 
 Account numbers and dollar values below are fabricated, not the real ones
@@ -345,11 +365,62 @@ def _fake_quotes_call(capability, arguments):
     quotes_captured["args"] = arguments
     return {"data": {"quotes": [{"symbol": "XLF", "last_trade_price": "57.83"}]}}
 quotes_broker._call_sync = _fake_quotes_call
-quotes_broker.get_quotes(UNIVERSE)
+quotes_result = quotes_broker.get_quotes(UNIVERSE)
 check("symbols is sent as a real list, not a comma-joined string",
       isinstance(quotes_captured["args"]["symbols"], list))
 check("the full symbol list survives, all 18 names",
       quotes_captured["args"]["symbols"] == UNIVERSE)
+check("a flat {symbol, last_trade_price} record still parses to a price",
+      quotes_result.get("XLF") == 57.83)
+
+# The exact confirmed live shape: each record bundles a live "quote"
+# sub-object and a stale "close" sub-object as siblings -- symbol/price
+# live inside "quote", not at the top of the record. A naive top-level
+# _pick found neither and silently returned an empty series for every
+# real quotes call, so every position's value/weight in a portfolio
+# summary came back blank.
+REAL_QUOTES_PAYLOAD = {
+    "data": {
+        "results": [
+            {
+                "quote": {"symbol": "EFA", "last_trade_price": "108.320000",
+                          "bid_price": "108.320000", "ask_price": "108.330000"},
+                "close": {"symbol": "EFA", "price": "107.36"},
+            },
+            {
+                "quote": {"symbol": "XLF", "last_trade_price": "57.560000",
+                          "bid_price": "57.550000", "ask_price": "57.560000"},
+                "close": {"symbol": "XLF", "price": "57.81"},
+            },
+        ]
+    }
+}
+nested_quotes_broker = RobinhoodMCPBroker(token="fake")
+nested_quotes_broker.bindings = {
+    "quotes": ToolBinding("quotes", "get_equity_quotes", {
+        "properties": {"symbols": {"type": ["null", "array"], "items": {"type": "string"}}},
+    }),
+}
+nested_quotes_broker._call_sync = lambda capability, arguments: REAL_QUOTES_PAYLOAD
+nested_result = nested_quotes_broker.get_quotes(["EFA", "XLF"])
+check("the real nested {\"quote\": {...}, \"close\": {...}} shape parses both symbols",
+      set(nested_result.index) == {"EFA", "XLF"}, dict(nested_result))
+check("the live quote price is used, not the stale close price",
+      nested_result["EFA"] == 108.32 and nested_result["XLF"] == 57.56)
+
+# When the live "quote" sub-object has no usable price field, "close" is a
+# reasonable fallback -- still better than dropping the symbol entirely.
+close_fallback_payload = {
+    "data": {"results": [
+        {"quote": {"symbol": "EFA"}, "close": {"symbol": "EFA", "price": "107.36"}},
+    ]}
+}
+fallback_broker = RobinhoodMCPBroker(token="fake")
+fallback_broker.bindings = dict(nested_quotes_broker.bindings)
+fallback_broker._call_sync = lambda capability, arguments: close_fallback_payload
+fallback_result = fallback_broker.get_quotes(["EFA"])
+check("falls back to the stale close price when the live quote has none",
+      fallback_result.get("EFA") == 107.36)
 
 # A server that genuinely only accepts a comma-joined string must still get one.
 string_quotes_broker = RobinhoodMCPBroker(token="fake")

@@ -3,6 +3,7 @@
 
     python run_cycle.py --dry-run            # default, sends nothing
     python run_cycle.py --live --max-order 50
+    python run_cycle.py --check-portfolio    # read-only: print holdings, exit
 
 Exit codes: 0 completed, 1 aborted at preflight, 2 unresolved in-flight order
 (halt and investigate before the next cycle), 3 setup or connection failure.
@@ -90,6 +91,70 @@ def save_peak(path: str, value: float) -> None:
         os.fsync(fh.fileno())
 
 
+def check_portfolio(args: argparse.Namespace) -> int:
+    """Read-only: connect, fetch the agentic account's current holdings,
+    print them, exit. No price panel, no strategy, no risk gate, no
+    journal or audit writes -- just the same broker connection and
+    get_account() call every real cycle already makes, surfaced on its own
+    so you can see what's actually held without running (or dry-running)
+    a full cycle.
+    """
+    try:
+        if args.synthetic:
+            broker = MockBroker(prices=pd.Series({"XLB": 100.0}), cash=25_000.0, seed=0)
+        else:
+            oauth = build_robinhood_oauth(
+                storage_path=os.environ.get(
+                    "ROBINHOOD_OAUTH_STATE", "state/robinhood_oauth.json"
+                ),
+                port=int(os.environ.get("ROBINHOOD_OAUTH_CALLBACK_PORT", "8765")),
+            )
+            broker = RobinhoodMCPBroker(auth=oauth, require_agentic=True)
+        broker.connect()
+        account = broker.get_account()
+    except Exception as exc:
+        print(f"FAILED to connect or read the account: {exc!r}")
+        return 3
+
+    print(f"account:         {account.account_id} "
+          f"({'agentic' if account.is_agentic else 'NOT agentic'})")
+    print(f"equity:          ${account.equity:,.2f}")
+    print(f"cash:            ${account.cash:,.2f}")
+    print(f"buying power:    ${account.buying_power:,.2f}")
+    if account.day_trades_used is not None:
+        print(f"day trades used: {account.day_trades_used}")
+
+    held = account.positions[account.positions.abs() > 1e-9]
+    print()
+    if held.empty:
+        print("No open positions -- fully in cash.")
+        broker.close()
+        return 0
+
+    try:
+        prices = broker.get_quotes(list(held.index))
+    except Exception as exc:
+        print(f"(could not fetch quotes for position values: {exc!r})")
+        prices = pd.Series(dtype=float)
+
+    weights = account.weights(prices) if not prices.empty else pd.Series(dtype=float)
+    rows = []
+    for sym, shares in held.sort_values(ascending=False).items():
+        price = prices.get(sym, float("nan"))
+        rows.append({
+            "symbol": sym,
+            "shares": round(float(shares), 6),
+            "price": f"${price:,.2f}" if pd.notna(price) else "n/a",
+            "value": f"${shares * price:,.2f}" if pd.notna(price) else "n/a",
+            "weight": f"{weights.get(sym, float('nan')):.1%}"
+                     if sym in weights.index and pd.notna(weights.get(sym))
+                     else "n/a",
+        })
+    print(pd.DataFrame(rows).set_index("symbol").to_string())
+    broker.close()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -100,7 +165,13 @@ def main() -> int:
     ap.add_argument("--synthetic", action="store_true",
                     help="use generated data and a mock broker")
     ap.add_argument("--ignore-market-hours", action="store_true")
+    ap.add_argument("--check-portfolio", action="store_true",
+                    help="fetch and print the agentic account's current "
+                         "holdings, then exit -- no planning or trading")
     args = ap.parse_args()
+
+    if args.check_portfolio:
+        return check_portfolio(args)
 
     audit = AuditLog(mode_path("audit/orders.jsonl", args.synthetic))
     audit.emit("cycle_start", live=args.live, argv=" ".join(sys.argv[1:]))

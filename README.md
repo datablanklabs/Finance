@@ -202,10 +202,17 @@ without sending it.
 python run_cycle.py --synthetic --ignore-market-hours   # offline, mock broker
 python run_cycle.py                                     # dry run, real data
 python run_cycle.py --live --max-order 50               # live, minimum size
+python run_cycle.py --check-portfolio                   # read-only: print holdings, exit
 ```
 
 Exit codes: `0` completed, `1` aborted at preflight, `2` unresolved in-flight
 order (halt before the next cycle), `3` setup failure.
+
+`--check-portfolio` skips everything else — no price panel, no strategy, no
+risk gate, no journal or audit writes. It connects, calls the same
+`get_account()` every real cycle already calls, and prints holdings with
+current value and weight (via `get_quotes()`) so you can see what's actually
+in the account without running or dry-running a full cycle.
 
 ### Idempotency without a broker-side key
 
