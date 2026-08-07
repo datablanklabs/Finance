@@ -166,6 +166,8 @@ class CrossSectionalMomentum:
             self.name = f"xsmom_{self.lookback}_{self.skip}_{self.top_n}"
         if self.weighting not in ("equal", "rank"):
             raise ValueError("weighting must be 'equal' or 'rank'")
+        if self.top_n is not None and self.top_n < 1:
+            raise ValueError("top_n must be >= 1 (or None)")
 
     @property
     def min_history(self) -> int:
@@ -286,6 +288,8 @@ class ShortHorizonReversal:
     def __post_init__(self) -> None:
         if not self.name:
             self.name = f"revert_{self.lookback}_{self.top_n}"
+        if self.top_n < 1:
+            raise ValueError("top_n must be >= 1")
 
     @property
     def min_history(self) -> int:
@@ -364,7 +368,18 @@ class TrendFilter:
             return w
         ma = view.close.tail(self.lookback).mean()
         last = view.close.iloc[-1]
-        blocked = (last <= ma).reindex(w.index).fillna(True)
+        # A NaN moving average -- a symbol whose trailing `lookback` window
+        # isn't fully populated, e.g. a recently-added or short-history
+        # name that still cleared the *inner* strategy's shorter
+        # min_history -- must block, not pass through. `last <= ma`
+        # evaluates to False, not NaN, when `ma` is NaN, so a plain
+        # comparison silently granted a position zero trend confirmation:
+        # exactly backwards for a filter whose entire job is requiring
+        # that confirmation. Same fail-safe direction as
+        # TimeSeriesMomentum.qualifies and FundamentalsValueFilter
+        # elsewhere in this module -- unknown means blocked, not unblocked.
+        insufficient_history = ma.isna() | last.isna()
+        blocked = ((last <= ma) | insufficient_history).reindex(w.index).fillna(True)
         return w.mask(blocked, 0.0)
 
 
@@ -790,6 +805,8 @@ class MultiFactorCrossSectional:
             raise ValueError(f"unknown factor(s) in factor_weights: {unknown}")
         if not any(self.factor_weights.values()):
             raise ValueError("factor_weights must have at least one nonzero entry")
+        if self.top_n is not None and self.top_n < 1:
+            raise ValueError("top_n must be >= 1 (or None)")
 
     @property
     def min_history(self) -> int:
@@ -1102,6 +1119,8 @@ class OptionsMeanReversion:
             self.name = f"optrevert_{self.iv_window}_{self.top_n}"
         if not (self.iv_weight or self.pcr_weight):
             raise ValueError("at least one of iv_weight/pcr_weight must be nonzero")
+        if self.top_n < 1:
+            raise ValueError("top_n must be >= 1")
 
     @property
     def min_history(self) -> int:
@@ -1212,6 +1231,8 @@ class InsiderEventDrift:
             raise ValueError("weighting must be 'equal' or 'rank'")
         if self.drift_days < 1:
             raise ValueError("drift_days must be >= 1")
+        if self.top_n is not None and self.top_n < 1:
+            raise ValueError("top_n must be >= 1 (or None)")
 
     @property
     def min_history(self) -> int:

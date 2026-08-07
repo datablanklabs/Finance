@@ -180,7 +180,15 @@ class CorpsPanel:
                 )
                 columns[sym] = merged["value"].to_numpy()
             wide = pd.DataFrame(columns, index=pd.DatetimeIndex(dates))
-            wide = wide.reindex(columns=[s for s in names if s in wide.columns])
+            # Reindex against the full requested list, not a subset already
+            # filtered down to what's present -- filtering first meant
+            # reindex could only reorder/subset existing columns, never add
+            # a missing one, so a requested symbol with zero rows for this
+            # metric (a brand-new IPO, or one added mid-backtest) was
+            # silently dropped from the output entirely instead of coming
+            # back as an all-NaN column. A caller indexing by symbol
+            # (wide[symbol]) got a KeyError instead of NaN.
+            wide = wide.reindex(columns=names)
             out[metric] = wide
         return out
 
@@ -205,14 +213,22 @@ def _trailing_count(as_of: pd.Series, window_days: int) -> pd.Series:
 
     Requires ``as_of`` sorted ascending. Uses a time-based rolling window,
     so it's correct even when events aren't evenly spaced.
+
+    ``closed="both"``, not pandas' own default of ``"right"``: an
+    offset-based rolling window is otherwise the half-open interval
+    ``(t - window_days, t]``, which excludes an event landing *exactly*
+    ``window_days`` before another one from that later event's own count.
+    "Trailing N days" reads as inclusive of both ends in the ordinary
+    sense, and there's no reason a same-instant boundary hit should be the
+    one case silently dropped.
     """
     s = pd.Series(1.0, index=pd.DatetimeIndex(as_of))
-    return s.rolling(f"{window_days}D").sum().to_numpy()
+    return s.rolling(f"{window_days}D", closed="both").sum().to_numpy()
 
 
 def _trailing_sum(as_of: pd.Series, values: pd.Series, window_days: int) -> pd.Series:
     s = pd.Series(values.to_numpy(dtype=float), index=pd.DatetimeIndex(as_of))
-    return s.rolling(f"{window_days}D").sum().to_numpy()
+    return s.rolling(f"{window_days}D", closed="both").sum().to_numpy()
 
 
 class CorpsRepository:

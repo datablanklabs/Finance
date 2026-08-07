@@ -89,8 +89,18 @@ class FileTokenStorage(TokenStorage):
     def _write(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data))
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        # Confirmed live (2026-08): write-then-chmod leaves the file at
+        # whatever the OS default creation mode is (typically 0o644 under
+        # a standard umask -- world- and group-readable) for the entire
+        # duration of the write, directly contradicting this class's own
+        # docstring claim of "never world- or group-readable even
+        # transiently." os.open() with an explicit mode applies owner-only
+        # permissions atomically at creation, before the live refresh
+        # token (as sensitive as a password) is ever written to disk.
+        mode = stat.S_IRUSR | stat.S_IWUSR
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(data))
         tmp.replace(self.path)
 
     async def get_tokens(self) -> OAuthToken | None:
@@ -118,9 +128,25 @@ class FileTokenStorage(TokenStorage):
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Captures exactly one OAuth redirect GET, then the server stops."""
+    """Captures exactly one OAuth redirect GET to the registered callback
+    path, then the server stops.
+
+    Any other request -- a stray local probe, a browser doing something
+    unrelated while the loopback port happens to be listening -- gets a
+    404 and does not consume the one-shot slot. The original version
+    accepted the *first* GET regardless of path: a wrong request arriving
+    before the real redirect would eat that one `handle_request()` call,
+    and the genuine callback would then hit a closed port. Not a
+    CSRF/token-injection risk either way -- the `state` parameter is
+    validated by the MCP SDK itself, independent of this handler -- this
+    is a reliability gap in the happy path, not a security one.
+    """
 
     def do_GET(self) -> None:  # noqa: N802 -- fixed name from BaseHTTPRequestHandler
+        if urlparse(self.path).path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
         query = parse_qs(urlparse(self.path).query)
         self.server.oauth_result = (  # type: ignore[attr-defined]
             query.get("code", [None])[0],
@@ -157,7 +183,15 @@ def _make_handlers(
         server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
         server.timeout = 300  # abandon the login attempt after 5 minutes idle
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, server.handle_request)
+        # A stray request to the wrong path no longer consumes the
+        # one-shot handle_request() call (see _CallbackHandler), which
+        # means more than one call may be needed to reach the real
+        # callback -- loop against the same overall 5-minute budget
+        # instead of a single call, so a stray hit can't either eat the
+        # real callback's turn or extend the wait past what was intended.
+        deadline = loop.time() + 300
+        while getattr(server, "oauth_result", None) is None and loop.time() < deadline:
+            await loop.run_in_executor(None, server.handle_request)
         code, state = getattr(server, "oauth_result", (None, None))
         server.server_close()
         if not code:

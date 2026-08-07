@@ -183,7 +183,15 @@ class OptionsPanel:
                 )
                 columns[sym] = merged["value"].to_numpy()
             wide = pd.DataFrame(columns, index=pd.DatetimeIndex(dates))
-            wide = wide.reindex(columns=[s for s in names if s in wide.columns])
+            # Reindex against the full requested list, not a subset already
+            # filtered down to what's present -- filtering first meant
+            # reindex could only reorder/subset existing columns, never add
+            # a missing one, so a requested symbol with zero rows for this
+            # metric (a brand-new IPO, or one added mid-backtest) was
+            # silently dropped from the output entirely instead of coming
+            # back as an all-NaN column. A caller indexing by symbol
+            # (wide[symbol]) got a KeyError instead of NaN.
+            wide = wide.reindex(columns=names)
             out[metric] = wide
         return out
 

@@ -313,7 +313,18 @@ class Backtester:
         peak = self.initial_equity
         opened_on: dict[str, pd.Timestamp] = {}
 
-        pending: tuple[int, pd.Series] | None = None
+        # A queue, not a single slot -- a single `tuple | None` here used to
+        # silently drop an entire rebalance whenever a new decision arrived
+        # before the previous one's fill executed (any rebalance cadence
+        # faster than delay_bars, e.g. rebalance="D" with delay_bars=2):
+        # the second decision's assignment overwrote the first with no
+        # error, no warning, and no trace, while target_rows/audit_rows
+        # still recorded the dropped decision as if it were normal. A
+        # decision's own fill_bar (i + delay_bars) is strictly increasing
+        # in i, so two entries can never collide on the same bar -- this
+        # queue never grows past what a single pending fill already
+        # implied, it just stops erasing history.
+        pending: list[tuple[int, pd.Series]] = []
         equity_curve = np.full(n, np.nan)
         cost_curve = np.zeros(n)
         holdings_rows: dict[pd.Timestamp, pd.Series] = {}
@@ -400,10 +411,12 @@ class Backtester:
             px_close = close.iloc[i]
 
             # --- 1. fill anything scheduled for this bar -----------------
-            if pending is not None and pending[0] == i:
-                _, queued = pending
-                pending = None
-                execute(i, queued)
+            if pending:
+                due = [queued for fill_bar, queued in pending if fill_bar == i]
+                if due:
+                    pending = [p for p in pending if p[0] != i]
+                    for queued in due:
+                        execute(i, queued)
 
             # --- 2. decide, using data through this bar's close ----------
             if date in decision_days and (i + 1) >= self.warmup:
@@ -463,8 +476,21 @@ class Backtester:
                 target_rows[date] = final_w
                 if self.exec.delay_bars == 0:
                     execute(i, final_w)
+                    audit_rows[-1]["scheduled"] = True
                 elif i + self.exec.delay_bars < n:
-                    pending = (i + self.exec.delay_bars, final_w)
+                    pending.append((i + self.exec.delay_bars, final_w))
+                    audit_rows[-1]["scheduled"] = True
+                else:
+                    # Near the panel's end: no bar left to schedule this
+                    # decision's fill at (i + delay_bars would run past
+                    # the last bar). The decision is still recorded here
+                    # and in target_rows for transparency, but it was
+                    # never actually executed -- flag it so a reader of
+                    # the tail of these frames doesn't mistake "decided"
+                    # for "filled." Not a look-ahead or return-fabrication
+                    # bug, just an unavoidable edge effect of a finite
+                    # panel; the flag exists so it's visible, not silent.
+                    audit_rows[-1]["scheduled"] = False
 
             # --- 3. mark to market on the close --------------------------
             position_value = state["shares_np"] * close_np[i]

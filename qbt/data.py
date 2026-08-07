@@ -282,14 +282,30 @@ class OpenBBRepository:
         df = out.to_dataframe().reset_index()
 
         # Normalise the two shapes OpenBB returns: single-symbol frames have
-        # no `symbol` column, multi-symbol frames do.
+        # no `symbol`/`ticker` column, multi-symbol frames do.
         lower = {c.lower(): c for c in df.columns}
         date_col = lower.get("date") or df.columns[0]
         df = df.rename(columns={date_col: "date"})
-        if "symbol" not in [c.lower() for c in df.columns]:
+        symbol_col = lower.get("symbol") or lower.get("ticker")
+        if symbol_col is not None:
+            df = df.rename(columns={symbol_col: "symbol"})
+        elif len(symbols) == 1:
+            # No symbol-identifying column at all -- OpenBB's documented
+            # single-symbol shape. Safe only because there's exactly one
+            # requested symbol to attribute every row to.
             df["symbol"] = symbols[0]
         else:
-            df = df.rename(columns={lower.get("symbol", "symbol"): "symbol"})
+            # More than one symbol was requested but the response has no
+            # column identifying which row belongs to which. Blindly
+            # labeling every row symbols[0] here -- the previous
+            # behavior -- would silently merge unrelated price series
+            # into one column with no error. Fail loudly instead of
+            # fabricating an attribution the provider never gave us.
+            raise ValueError(
+                f"requested {len(symbols)} symbols but the response has no "
+                f"'symbol' or 'ticker' column to attribute rows to -- "
+                f"columns: {list(df.columns)}, provider={self.provider!r}"
+            )
 
         rename = {}
         for want in ("open", "high", "low", "close", "volume", "adj_close"):

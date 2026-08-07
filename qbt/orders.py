@@ -47,6 +47,7 @@ import pandas as pd
 
 from .broker import BrokerAccount, BrokerAdapter, BrokerOrder
 from .live import LivePlan, OrderIntent
+from .risk import DayTradeLedger
 
 try:
     import fcntl  # POSIX advisory file locking; unavailable on Windows.
@@ -206,11 +207,22 @@ class OrderManager:
         policy: ExecutionPolicy | None = None,
         audit: AuditLog | None = None,
         journal_path: str = "audit/journal.jsonl",
+        day_trade_ledger: DayTradeLedger | None = None,
     ) -> None:
         self.broker = broker
         self.policy = policy or ExecutionPolicy()
         self.audit = audit or AuditLog()
         self.journal_path = journal_path
+        # Confirmed live (2026-08): RiskGate's PDT check (step 5 of
+        # apply()) reads day_trades_remaining, but nothing in the live
+        # path ever called .record() -- only Backtester.run() did (see
+        # qbt/engine.py's opened_on/ledger.record() tracking). Every
+        # LiveSignalRunner got a fresh, empty DayTradeLedger every cycle,
+        # so the PDT limit could never actually trigger in live trading.
+        # Pass the *same* ledger instance the caller gives LiveSignalRunner
+        # (see run_cycle.py) so a day trade recorded here during execute()
+        # is visible to the next cycle's plan() via .remaining().
+        self.day_trade_ledger = day_trade_ledger or DayTradeLedger()
         os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
 
     # -- concurrency --------------------------------------------------------
@@ -284,91 +296,102 @@ class OrderManager:
 
         Never retries. Reads the broker's orders and matches fingerprints to
         decide what actually happened, then closes out the journal entry.
+
+        Wrapped in the same lock :meth:`execute` takes around its own
+        read-then-write dedup sequence -- recover() reads and writes this
+        exact journal too, and without the lock a genuinely concurrent
+        second process (the same double-scheduled-run risk _dedup_lock's
+        own docstring calls out) could have its execute() mid-flight while
+        this read a partial view: a "submitting" entry that's actually
+        just in progress, not orphaned by a crash, queried against the
+        broker and resolved before the other process's own attempt ever
+        got there.
         """
-        entries = self._journal_entries()
-        by_key: dict[str, list[dict]] = {}
-        for e in entries:
-            key = f"{e.get('plan_id')}::{e.get('intent_key')}"
-            by_key.setdefault(key, []).append(e)
+        with self._dedup_lock():
+            entries = self._journal_entries()
+            by_key: dict[str, list[dict]] = {}
+            for e in entries:
+                key = f"{e.get('plan_id')}::{e.get('intent_key')}"
+                by_key.setdefault(key, []).append(e)
 
-        unresolved = [
-            (k, es) for k, es in by_key.items()
-            if any(e.get("stage") == "submitting" for e in es)
-            and not any(e.get("stage") in ("submitted", "rejected", "resolved",
-                                           "skipped")
-                        for e in es)
-        ]
-        if not unresolved:
-            self.audit.emit("recover_clean", unresolved=0)
-            return pd.DataFrame()
+            unresolved = [
+                (k, es) for k, es in by_key.items()
+                if any(e.get("stage") == "submitting" for e in es)
+                and not any(e.get("stage") in ("submitted", "rejected", "resolved",
+                                               "skipped")
+                            for e in es)
+            ]
+            if not unresolved:
+                self.audit.emit("recover_clean", unresolved=0)
+                return pd.DataFrame()
 
-        # The *first* "submitting" entry per key anchors the broker-query
-        # window (the earliest moment something might have been sent); the
-        # *last* one is what was actually most recently sent and is what
-        # fingerprinting must match against. These differ whenever execute()
-        # retried at a corrected quantity -- e.g. a fractional-share
-        # rejection followed by a whole-share retry (see execute()) writes
-        # a second "submitting" entry at the corrected size. Confirmed live
-        # (2026-08): fingerprinting against the first entry's now-stale
-        # original quantity searched for an order that was never actually
-        # requested, and never found the one that was -- a real fill got
-        # misresolved as not_at_broker.
-        first_submitting = {
-            key: next(e for e in es if e.get("stage") == "submitting")
-            for key, es in unresolved
-        }
-        latest_submitting = {
-            key: [e for e in es if e.get("stage") == "submitting"][-1]
-            for key, es in unresolved
-        }
+            # The *first* "submitting" entry per key anchors the broker-query
+            # window (the earliest moment something might have been sent); the
+            # *last* one is what was actually most recently sent and is what
+            # fingerprinting must match against. These differ whenever execute()
+            # retried at a corrected quantity -- e.g. a fractional-share
+            # rejection followed by a whole-share retry (see execute()) writes
+            # a second "submitting" entry at the corrected size. Confirmed live
+            # (2026-08): fingerprinting against the first entry's now-stale
+            # original quantity searched for an order that was never actually
+            # requested, and never found the one that was -- a real fill got
+            # misresolved as not_at_broker.
+            first_submitting = {
+                key: next(e for e in es if e.get("stage") == "submitting")
+                for key, es in unresolved
+            }
+            latest_submitting = {
+                key: [e for e in es if e.get("stage") == "submitting"][-1]
+                for key, es in unresolved
+            }
 
-        # Anchor the broker query to when the earliest unresolved attempt
-        # actually happened, not to "today". recover() running on a later
-        # calendar day than the crash -- the process was down over a
-        # weekend, say, and comes back up Monday after a Friday-close
-        # crash -- would otherwise never even ask the broker about an
-        # order from before today's midnight, and a genuinely-placed order
-        # gets wrongly resolved as not_at_broker.
-        sub_times = []
-        for sub in first_submitting.values():
-            try:
-                sub_times.append(datetime.fromisoformat(sub["ts"]))
-            except (KeyError, ValueError, TypeError):
-                continue
-        since = (
-            min(sub_times) - timedelta(minutes=5)
-            if sub_times
-            else datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
-                                                     microsecond=0)
-        )
-        broker_orders = list(self.broker.get_orders(since=since))
-
-        rows = []
-        for key, sub in first_submitting.items():
-            latest = latest_submitting[key]
-            fp = (str(latest.get("symbol", "")).upper(),
-                  str(latest.get("side", "")).lower(),
-                  round(float(latest.get("quantity", 0.0)) / 0.02))
-            # Consume the match so a second unresolved entry with the same
-            # (symbol, side, quantity-bucket) -- two ghost entries from one
-            # crash, say -- can't also claim the same one broker order.
-            match_idx = next(
-                (i for i, o in enumerate(broker_orders) if o.fingerprint() == fp),
-                None,
+            # Anchor the broker query to when the earliest unresolved attempt
+            # actually happened, not to "today". recover() running on a later
+            # calendar day than the crash -- the process was down over a
+            # weekend, say, and comes back up Monday after a Friday-close
+            # crash -- would otherwise never even ask the broker about an
+            # order from before today's midnight, and a genuinely-placed order
+            # gets wrongly resolved as not_at_broker.
+            sub_times = []
+            for sub in first_submitting.values():
+                try:
+                    sub_times.append(datetime.fromisoformat(sub["ts"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            since = (
+                min(sub_times) - timedelta(minutes=5)
+                if sub_times
+                else datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                         microsecond=0)
             )
-            match = broker_orders.pop(match_idx) if match_idx is not None else None
-            outcome = "found_at_broker" if match else "not_at_broker"
-            self._journal(stage="resolved", plan_id=sub.get("plan_id"),
-                          intent_key=sub.get("intent_key"), outcome=outcome,
-                          order_id=match.order_id if match else None)
-            self.audit.emit("recover_resolved", intent=key, outcome=outcome,
-                            order_id=match.order_id if match else None,
-                            state=match.state if match else None)
-            rows.append({"intent": key, "symbol": fp[0], "side": fp[1],
-                         "outcome": outcome,
-                         "order_id": match.order_id if match else "",
-                         "state": match.state if match else ""})
-        return pd.DataFrame(rows)
+            broker_orders = list(self.broker.get_orders(since=since))
+
+            rows = []
+            for key, sub in first_submitting.items():
+                latest = latest_submitting[key]
+                fp = (str(latest.get("symbol", "")).upper(),
+                      str(latest.get("side", "")).lower(),
+                      round(float(latest.get("quantity", 0.0)) / 0.02))
+                # Consume the match so a second unresolved entry with the same
+                # (symbol, side, quantity-bucket) -- two ghost entries from one
+                # crash, say -- can't also claim the same one broker order.
+                match_idx = next(
+                    (i for i, o in enumerate(broker_orders) if o.fingerprint() == fp),
+                    None,
+                )
+                match = broker_orders.pop(match_idx) if match_idx is not None else None
+                outcome = "found_at_broker" if match else "not_at_broker"
+                self._journal(stage="resolved", plan_id=sub.get("plan_id"),
+                              intent_key=sub.get("intent_key"), outcome=outcome,
+                              order_id=match.order_id if match else None)
+                self.audit.emit("recover_resolved", intent=key, outcome=outcome,
+                                order_id=match.order_id if match else None,
+                                state=match.state if match else None)
+                rows.append({"intent": key, "symbol": fp[0], "side": fp[1],
+                             "outcome": outcome,
+                             "order_id": match.order_id if match else "",
+                             "state": match.state if match else ""})
+            return pd.DataFrame(rows)
 
     # -- preflight --------------------------------------------------------
 
@@ -386,6 +409,54 @@ class OrderManager:
         # NOTE: this does not know about market holidays or half days. Wire in
         # exchange_calendars before trusting it unattended.
         return True, f"open ({local.strftime('%a %H:%M %Z')})"
+
+    def _session_date(self, now: datetime | None = None) -> pd.Timestamp:
+        """The trading-session calendar date for ``now``, in the policy's
+        market timezone -- not the caller's local time or UTC.
+
+        Needed to detect a same-session day trade correctly: a trade at
+        11pm UTC and one at 2am UTC the next day can be the same New York
+        session or a different one depending which side of midnight ET
+        they land on, and a naive UTC-date comparison gets that wrong
+        right around the boundary.
+        """
+        now = now or datetime.now(timezone.utc)
+        ts = pd.Timestamp(now)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(self.policy.market_tz).normalize()
+
+    def _opened_from_flat_today(self, symbol: str, session_date: pd.Timestamp) -> bool:
+        """Was ``symbol`` bought into a new (from-flat) position in *this*
+        trading session?
+
+        Scans the journal for a successfully-submitted buy of this symbol
+        timestamped in the same market-tz session -- the "opened" half of
+        the same flat -> position -> flat round trip
+        :meth:`~qbt.engine.Backtester.run` tracks via its own
+        ``opened_on``/``ledger.record()`` bookkeeping. Deliberately mirrors
+        that exact same-day-round-trip definition, not the broader FINRA
+        rule (any buy-then-sell pair, not just a full round trip back to
+        flat) -- kept consistent with what the backtester already
+        enforces, rather than stricter, so live and research trip the PDT
+        limit on the same trades.
+        """
+        key = f"{symbol}:buy"
+        for e in self._journal_entries():
+            if e.get("intent_key") != key or e.get("stage") != "submitted":
+                continue
+            ts = e.get("ts")
+            if not ts:
+                continue
+            try:
+                entry_ts = pd.Timestamp(ts)
+            except (ValueError, TypeError):
+                continue
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.tz_localize("UTC")
+            if entry_ts.tz_convert(self.policy.market_tz).normalize() == session_date:
+                return True
+        return False
 
     def _refit_turnover(self, plan: LivePlan, account: BrokerAccount) -> LivePlan:
         """Re-scale the plan against *this* account read, right before
@@ -528,6 +599,7 @@ class OrderManager:
         dry = self.policy.dry_run if dry_run is None else dry_run
         pid = self.plan_id(plan, strategy_name)
         report = ExecutionReport(plan_id=pid, dry_run=dry)
+        session_date = self._session_date(now)
 
         self.audit.emit("plan_received", plan_id=pid, asof=str(plan.asof),
                         n_intents=len(plan.intents), equity=round(plan.equity, 2),
@@ -677,6 +749,22 @@ class OrderManager:
                                     avg_price=order.average_price,
                                     reason=order.reject_reason)
                     report.submitted.append(order)
+                    # PDT accounting: a sell that closes a position to
+                    # flat, where that same position was opened (bought
+                    # from flat) earlier in this same session, is a day
+                    # trade -- mirrors Backtester.run()'s
+                    # opened_on/ledger.record() tracking (qbt/engine.py),
+                    # so live trading enforces the same rolling PDT budget
+                    # the backtester already does, instead of never
+                    # tripping it at all.
+                    if (stage == "submitted" and intent.side == "sell"
+                            and abs(intent.current_weight) > 1e-9
+                            and abs(intent.target_weight) < 1e-9
+                            and self._opened_from_flat_today(intent.symbol, session_date)):
+                        self.day_trade_ledger.record(session_date)
+                        self.audit.emit("day_trade_recorded", plan_id=pid, intent=key,
+                                        symbol=intent.symbol,
+                                        session_date=str(session_date.date()))
 
                 try:
                     order = self.broker.place_order(
