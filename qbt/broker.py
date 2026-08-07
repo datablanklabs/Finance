@@ -748,9 +748,24 @@ class RobinhoodMCPBroker:
         recs = _as_records(self._call_sync("quotes", {key: payload}))
         out: dict[str, float] = {}
         for r in recs:
-            sym = _pick(r, "symbol", "ticker", default=None)
-            px = _to_float(_pick(r, "last_trade_price", "last_price", "price",
+            # Confirmed live (2026-08): each record bundles a live "quote"
+            # sub-object and a stale end-of-day "close" sub-object as
+            # siblings, {"quote": {...}, "close": {...}} -- symbol/price
+            # fields live inside "quote", not at the top level of the
+            # record. A naive top-level _pick found neither and silently
+            # returned an empty series for every request. Fall back to the
+            # record itself for a server that returns a flatter shape.
+            q = r.get("quote") if isinstance(r.get("quote"), dict) else r
+            sym = (_pick(q, "symbol", "ticker", default=None)
+                   or _pick(r, "symbol", "ticker", default=None))
+            px = _to_float(_pick(q, "last_trade_price", "last_price", "price",
                                  "mark_price", "ask_price", default=np.nan))
+            if not np.isfinite(px):
+                # "close" is yesterday's price, not live, but still better
+                # than nothing when the market's closed or a live field
+                # didn't parse.
+                c = r.get("close") if isinstance(r.get("close"), dict) else {}
+                px = _to_float(_pick(c, "price", default=np.nan))
             if sym and np.isfinite(px):
                 out[str(sym).upper()] = px
         return pd.Series(out, dtype=float)
