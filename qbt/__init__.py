@@ -66,6 +66,7 @@ from .research import (
 )
 from .risk import DayTradeLedger, RiskContext, RiskDecision, RiskGate
 from .signals import (
+    BreadthRegimeFilter,
     CalendarSeasonality,
     Composite,
     CrossSectionalMomentum,
@@ -95,7 +96,7 @@ __all__ = [
     "OptionsPanel", "OptionsRepository", "derive_options_indicators",
     "Strategy", "EqualWeightBuyHold", "CrossSectionalMomentum",
     "TimeSeriesMomentum", "ShortHorizonReversal", "TrendFilter", "Composite",
-    "FundamentalsValueFilter", "MacroRegimeFilter",
+    "FundamentalsValueFilter", "MacroRegimeFilter", "BreadthRegimeFilter",
     "InverseVolWeighted", "PairsTrading", "MultiFactorCrossSectional",
     "CalendarSeasonality", "RiskParityAllocation", "OptionsMeanReversion",
     "InsiderEventDrift",

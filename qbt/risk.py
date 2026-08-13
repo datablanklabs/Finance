@@ -22,12 +22,46 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-__all__ = ["RiskContext", "RiskDecision", "RiskGate", "DayTradeLedger"]
+__all__ = [
+    "RiskContext", "RiskDecision", "RiskGate", "DayTradeLedger",
+    "as_session_date",
+]
 
 
 # ---------------------------------------------------------------------------
 # Pattern day trader accounting
 # ---------------------------------------------------------------------------
+
+
+def as_session_date(value: pd.Timestamp | str) -> pd.Timestamp:
+    """Normalise anything timestamp-like to a **tz-naive** session date.
+
+    A day trade is an event on a *trading session*, which is a calendar date
+    in the exchange's own timezone -- not an instant. Once a caller has
+    decided which session a fill belongs to, the timezone has done its job
+    and carrying it further only creates a naive/aware seam.
+
+    That seam was a real, confirmed bug (2026-08).
+    :meth:`qbt.orders.OrderManager._session_date` records tz-aware
+    ``America/New_York`` midnights, while :class:`~qbt.live.LiveSignalRunner`
+    passes a tz-naive panel date as ``asof``; comparing them raised
+    ``TypeError: Cannot compare tz-naive and tz-aware timestamps`` inside
+    :meth:`DayTradeLedger.count`. In ``run_cycle.py`` that surfaced as a
+    *permanent* outage rather than a one-off error: the exception aborted
+    the cycle before ``save_day_trade_ledger`` could rewrite the file, so
+    every subsequent run reloaded the same poisoned event and failed
+    identically, with nothing but ``cycle_error`` in the audit log.
+
+    Dropping the tz here keeps the *wall-clock* date, which is exactly
+    right for an already-market-tz-resolved timestamp: deciding which
+    session a fill belongs to is the caller's job (``_session_date`` does
+    the ``tz_convert``), and storing that decision consistently is this
+    ledger's.
+    """
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.normalize()
 
 
 @dataclass
@@ -42,6 +76,12 @@ class DayTradeLedger:
     Monthly or weekly rebalancing essentially never trips this. It binds when
     you shorten the holding period, which is exactly when you are least likely
     to be watching for it -- hence tracking it from day one.
+
+    Events are stored as tz-naive session dates (see :func:`as_session_date`).
+    Callers resolve *which* session a fill belongs to -- see
+    :meth:`qbt.orders.OrderManager._session_date`, which does the market-tz
+    conversion -- and this ledger stores that decision in one consistent
+    form so a naive ``asof`` can always be compared against it.
     """
 
     limit: int = 3
@@ -52,8 +92,15 @@ class DayTradeLedger:
     def count(self, asof: pd.Timestamp) -> int:
         if not self.events:
             return 0
-        cutoff = pd.Timestamp(asof) - pd.tseries.offsets.BDay(self.window_days)
-        return sum(1 for d in self.events if d > cutoff)
+        cutoff = as_session_date(asof) - pd.tseries.offsets.BDay(self.window_days)
+        # Normalise on read as well as on write. `events` is a plain list
+        # that callers assign to directly -- run_cycle.py's
+        # load_day_trade_ledger() rebuilds it straight from JSON rather
+        # than replaying record() -- so this is what makes an already-
+        # persisted tz-aware event from before this fix load and compare
+        # cleanly instead of re-raising, healing the poisoned state file
+        # rather than requiring someone to notice and delete it.
+        return sum(1 for d in self.events if as_session_date(d) > cutoff)
 
     def remaining(self, asof: pd.Timestamp, equity: float) -> int:
         if equity >= self.equity_threshold:
@@ -61,7 +108,7 @@ class DayTradeLedger:
         return max(0, self.limit - self.count(asof))
 
     def record(self, date: pd.Timestamp) -> None:
-        self.events.append(pd.Timestamp(date))
+        self.events.append(as_session_date(date))
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +277,22 @@ class RiskGate:
                 # tripping. That shadow return is the actual signal for
                 # "has the market recovered" -- independent of the fact
                 # that we're sitting it out.
-                if len(ctx.returns) > 0 and not self._shadow_weights.empty:
+                if self._shadow_weights.empty or self._shadow_weights.abs().sum() == 0:
+                    # Nothing to shadow. The breaker tripped on a bar where
+                    # the strategy proposed an empty (or all-zero) book, so
+                    # there are no weights whose recovery we could track --
+                    # and a flat shadow book earns exactly 0% forever, which
+                    # means _shadow_ratio never moves and the breaker never
+                    # resets. That is a permanent, silent halt: the same
+                    # failure shape as the stuck peak-equity bug, arrived at
+                    # from a different direction. Re-arm from the current
+                    # proposal instead, so recovery is tracked from the
+                    # first bar there is actually something to track.
+                    if w.abs().sum() > 0:
+                        self._shadow_weights = w.copy()
+                        notes.append("drawdown breaker shadow book re-armed "
+                                     "(tripped with nothing to track)")
+                elif len(ctx.returns) > 0:
                     shadow = self._shadow_weights.reindex(
                         ctx.returns.columns
                     ).fillna(0.0)

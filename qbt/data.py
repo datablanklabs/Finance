@@ -18,8 +18,10 @@ point-in-time store to eliminate survivorship bias.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Iterable, Protocol, Sequence
 
@@ -31,6 +33,7 @@ __all__ = [
     "PriceRepository",
     "OpenBBRepository",
     "SyntheticRepository",
+    "prune_cache",
 ]
 
 
@@ -65,6 +68,17 @@ class PricePanel:
             raise ValueError("close index must be sorted ascending")
         if self.close.index.has_duplicates:
             raise ValueError("close index has duplicate dates")
+        if self.close.columns.has_duplicates:
+            # Caught here rather than left to surface downstream: a
+            # duplicated symbol column constructs fine, survives as_of()
+            # and every strategy, then dies deep inside Backtester.run()
+            # with pandas' own "cannot reindex on an axis with duplicate
+            # labels" -- a message that names neither the panel nor the
+            # symbol. Confirmed reachable by passing a bare string as
+            # `symbols` to either repository (see their fetch()), which
+            # used to split it into duplicate single-character names.
+            dupes = sorted(set(self.close.columns[self.close.columns.duplicated()]))
+            raise ValueError(f"close has duplicate symbol columns: {dupes}")
         for name in ("open_", "volume"):
             other = getattr(self, name)
             if other is None:
@@ -185,6 +199,58 @@ class PricePanel:
         )
 
 
+def prune_cache(cache_dir: str | None, max_age_days: int = 30,
+                pattern: str = "*.csv.gz") -> int:
+    """Delete cache entries not read in ``max_age_days``. Returns the count.
+
+    These caches key on the request, *including its end date*. That's
+    correct for research -- the same fixed window re-fetched all afternoon
+    hits cache every time -- but it means a daily scheduled run, whose end
+    date is "today", writes a new entry every day and never reads it again.
+    Left alone that grows without bound while its hit rate on the live path
+    stays at zero, so the entries that are actually dead get swept.
+
+    Keyed on access time, not creation, so a window you keep coming back to
+    survives however old it is. Failures are ignored on purpose: a cache is
+    an optimisation, and being unable to tidy it must never take down a
+    trading cycle.
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return 0
+    cutoff = time.time() - max_age_days * 86_400
+    removed = 0
+    for path in glob.glob(os.path.join(cache_dir, pattern)):
+        try:
+            if os.path.getatime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _require_symbol_sequence(symbols) -> list[str]:
+    """Reject a bare string where a sequence of symbols is expected.
+
+    ``str`` is itself an iterable of characters, so ``fetch("AAPL", ...)``
+    silently became the four symbols ``['A', 'A', 'P', 'L']`` instead of
+    raising -- and, being duplicated, then crashed deep inside
+    ``Backtester.run()`` with pandas' opaque "cannot reindex on an axis with
+    duplicate labels". Against :class:`SyntheticRepository` it was worse than
+    a crash: it fabricated a plausible four-symbol panel of generated prices
+    with no error at all. One wrong pair of brackets is an easy mistake and
+    an expensive one to debug from either symptom.
+    """
+    if isinstance(symbols, str):
+        raise TypeError(
+            f"symbols must be a sequence of tickers, not a bare string "
+            f"{symbols!r} -- a string iterates as characters, which would "
+            f"silently request {list(dict.fromkeys(symbols))}. "
+            f"Pass [{symbols!r}] for a single symbol."
+        )
+    return list(symbols)
+
+
 # ---------------------------------------------------------------------------
 # Repository protocol
 # ---------------------------------------------------------------------------
@@ -247,10 +313,13 @@ class OpenBBRepository:
         start: str | pd.Timestamp,
         end: str | pd.Timestamp,
     ) -> PricePanel:
+        symbols = _require_symbol_sequence(symbols)
         symbols = list(dict.fromkeys(symbols))
         start_s = str(pd.Timestamp(start).date())
         end_s = str(pd.Timestamp(end).date())
 
+        # Sweep dead entries before writing a new one -- see prune_cache.
+        prune_cache(self.cache_dir)
         path = self._cache_path(symbols, start_s, end_s)
         if path and os.path.exists(path):
             tidy = pd.read_csv(path, parse_dates=["date"])
@@ -403,7 +472,7 @@ class SyntheticRepository:
         end: str | pd.Timestamp = "2025-12-31",
     ) -> PricePanel:
         dates = pd.bdate_range(pd.Timestamp(start), pd.Timestamp(end))
-        names = list(symbols) if symbols else self.universe()
+        names = _require_symbol_sequence(symbols) if symbols else self.universe()
         n, t = len(names), len(dates)
 
         rng = np.random.default_rng(self.seed)

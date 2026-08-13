@@ -99,6 +99,29 @@ def _tradeable(view: PricePanel, min_history: int) -> list[str]:
     return list(view.close.columns[ok & live])
 
 
+def _trailing_ma(view: PricePanel, lookback: int) -> tuple[pd.Series, pd.Series]:
+    """Trailing ``lookback``-bar mean, plus a mask of who it's actually valid for.
+
+    Returns ``(ma, complete)`` where ``complete`` marks symbols whose
+    trailing window is *fully* populated -- the same all-bars-present rule
+    :func:`_tradeable` applies, so a filter built on this agrees with the
+    strategies it wraps about who has enough history.
+
+    Splitting the mask out is the whole point. ``DataFrame.mean()`` skips
+    NaN, so a symbol with 20 real bars inside a 200-bar window returns a
+    perfectly finite 20-bar average rather than NaN -- a "200-day moving
+    average" that is nothing of the sort, and one that ``ma.isna()`` cannot
+    detect. Confirmed (2026-08): a name listed 20 bars ago passed a 200-day
+    trend gate outright, and counted as fully scoreable in a breadth read.
+    Callers must consult ``complete``; the mean alone cannot tell you
+    whether it means anything.
+    """
+    window = view.close.tail(lookback)
+    ma = window.mean()
+    complete = window.notna().sum() >= lookback
+    return ma, complete
+
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
@@ -148,8 +171,15 @@ class CrossSectionalMomentum:
         because short-horizon reversal works against you in the last week or
         so of the formation window.
     top_n:
-        Number of names held. ``None`` means hold every name with a positive
-        rank score above the median.
+        Number of names held. ``None`` means hold the top half of the
+        universe by score (``len(scores) // 2``, at least one name).
+
+        Note this is *relative* momentum throughout: the top names are held
+        whatever the sign of their trailing return, so in a universe where
+        every name is falling this still runs fully invested in the ones
+        falling least. That is the definition, not an oversight -- an
+        absolute-momentum gate on top of it is what :class:`TrendFilter`
+        is for, and composing the two is the usual dual-momentum setup.
     weighting:
         ``"equal"`` or ``"rank"`` (linear in cross-sectional rank).
     """
@@ -366,19 +396,27 @@ class TrendFilter:
         w = self.inner.target_weights(view, fundamentals, macros, corps, options)
         if w.abs().sum() == 0:
             return w
-        ma = view.close.tail(self.lookback).mean()
+        ma, complete = _trailing_ma(view, self.lookback)
         last = view.close.iloc[-1]
-        # A NaN moving average -- a symbol whose trailing `lookback` window
-        # isn't fully populated, e.g. a recently-added or short-history
-        # name that still cleared the *inner* strategy's shorter
-        # min_history -- must block, not pass through. `last <= ma`
-        # evaluates to False, not NaN, when `ma` is NaN, so a plain
-        # comparison silently granted a position zero trend confirmation:
-        # exactly backwards for a filter whose entire job is requiring
-        # that confirmation. Same fail-safe direction as
-        # TimeSeriesMomentum.qualifies and FundamentalsValueFilter
-        # elsewhere in this module -- unknown means blocked, not unblocked.
-        insufficient_history = ma.isna() | last.isna()
+        # A symbol whose trailing `lookback` window isn't fully populated --
+        # a recently-added or short-history name that still cleared the
+        # *inner* strategy's shorter min_history -- must block, not pass
+        # through. Two distinct ways that used to leak, both fixed here:
+        #
+        # 1. `last <= ma` evaluates to False, not NaN, when `ma` is NaN, so
+        #    a plain comparison silently granted a position zero trend
+        #    confirmation -- exactly backwards for a filter whose entire job
+        #    is requiring that confirmation.
+        # 2. `ma` is usually not NaN at all in this case. mean() skips NaN,
+        #    so a 20-of-200-bar window yields a finite 20-bar average and an
+        #    isna() check sees nothing wrong with it. `complete` (see
+        #    _trailing_ma) is what actually catches this, and it's the same
+        #    all-bars-present rule _tradeable applies.
+        #
+        # Same fail-safe direction as TimeSeriesMomentum.qualifies and
+        # FundamentalsValueFilter elsewhere in this module -- unknown means
+        # blocked, not unblocked.
+        insufficient_history = ma.isna() | last.isna() | ~complete
         blocked = ((last <= ma) | insufficient_history).reindex(w.index).fillna(True)
         return w.mask(blocked, 0.0)
 
@@ -493,6 +531,7 @@ class MacroRegimeFilter:
     max_increase: float | None = None
     lookback: int = 63
     scale_when_blocked: float = 0.0
+    max_age_days: int | None = None
     name: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -504,18 +543,28 @@ class MacroRegimeFilter:
             )
         if not 0.0 <= self.scale_when_blocked <= 1.0:
             raise ValueError("scale_when_blocked must be in [0, 1]")
+        if self.max_age_days is not None and self.max_age_days < 1:
+            raise ValueError("max_age_days must be >= 1 (or None to disable)")
 
     @property
     def min_history(self) -> int:
         return max(self.inner.min_history, self.lookback + 2)
 
     def blocked(self, view: PricePanel, macros: MacrosPanel | None) -> bool:
-        """Exposed separately so research code can study the regime read directly."""
+        """Exposed separately so research code can study the regime read directly.
+
+        A reading older than ``max_age_days`` is treated as no reading at
+        all -- the same no-op pass-through as ``macros=None``, per this
+        class's own "absence of information is not bad news" rule. Without
+        it a series that quietly stopped updating keeps answering with its
+        last value indefinitely, and this filter would go on gating a live
+        book on a months-old number believing it current.
+        """
         if macros is None or len(macros.frame) == 0:
             return False
 
         today = view.last_date()
-        snap_now = macros.snapshot(today)
+        snap_now = macros.snapshot(today, max_age_days=self.max_age_days)
         if self.metric not in snap_now.index:
             return False
         level_now = float(snap_now[self.metric])
@@ -545,6 +594,98 @@ class MacroRegimeFilter:
         if w.abs().sum() == 0:
             return w
         if self.blocked(view, macros):
+            return w * self.scale_when_blocked
+        return w
+
+
+@dataclass
+class BreadthRegimeFilter:
+    """Wrap a strategy and de-risk the whole book when market breadth is weak.
+
+    Same axis as :class:`MacroRegimeFilter`: this decides *how much of the
+    book* trades, not which names -- but the regime read comes from the
+    price panel's own cross-section, not an external data source. No new
+    data dependency: every strategy already receives a
+    :class:`~qbt.data.PricePanel`.
+
+    "Breadth" here is participation within the *strategy's own tradeable
+    universe*, not some broad-market index this system doesn't necessarily
+    trade: the fraction of symbols currently trading above their own
+    trailing ``lookback``-bar moving average. A handful of names carrying
+    the whole basket higher while most lag behind is a classically
+    fragile setup -- ``min_breadth`` scales the book down (or fully flat,
+    the default) once that fraction falls below the floor.
+
+    Same asymmetry as :class:`MacroRegimeFilter`, for the same reason: a
+    breadth reading that can't be computed at all (every symbol lacking
+    enough of its own history to score, which ordinarily shouldn't
+    survive the panel's own ``min_history`` gate, but is handled
+    defensively anyway) passes the inner strategy's weights through
+    unchanged rather than blocking. It's specifically a *breadth read as
+    weak* that scales the book down, not the absence of a read -- and,
+    unlike :class:`TrendFilter`'s per-name NaN handling, a symbol that
+    can't be scored here is excluded from *both* the numerator and the
+    denominator, not silently treated as passing (or failing) the
+    threshold.
+    """
+
+    inner: Strategy
+    lookback: int = 200
+    min_breadth: float = 0.4
+    scale_when_blocked: float = 0.0
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"{self.inner.name}+breadth{self.lookback}"
+        if not 0.0 <= self.min_breadth <= 1.0:
+            raise ValueError("min_breadth must be in [0, 1]")
+        if not 0.0 <= self.scale_when_blocked <= 1.0:
+            raise ValueError("scale_when_blocked must be in [0, 1]")
+
+    @property
+    def min_history(self) -> int:
+        return max(self.inner.min_history, self.lookback + 2)
+
+    def breadth(self, view: PricePanel) -> float:
+        """Fraction of the universe trading above its own trailing moving
+        average. NaN if not a single symbol has enough history to score.
+        Exposed separately so research code can study the raw signal, the
+        same reason :meth:`MacroRegimeFilter.blocked` is its own method.
+
+        "Enough history" means a *fully populated* trailing window, not
+        merely a non-NaN average -- mean() skips NaN, so a name with 20 real
+        bars inside a 200-bar window otherwise counts as fully scoreable
+        while contributing a 20-bar average to a 200-bar breadth read. Such
+        a name is excluded from numerator and denominator alike, which is
+        the same exclusion this class's docstring already promised for
+        unscoreable symbols; it just wasn't catching this case.
+        """
+        ma, complete = _trailing_ma(view, self.lookback)
+        last = view.close.iloc[-1]
+        scoreable = ma.notna() & last.notna() & complete
+        if not scoreable.any():
+            return float("nan")
+        above = (last > ma) & scoreable
+        return float(above.sum()) / float(scoreable.sum())
+
+    def blocked(self, view: PricePanel) -> bool:
+        """Exposed separately so research code can study the regime read directly."""
+        b = self.breadth(view)
+        return bool(np.isfinite(b) and b < self.min_breadth)
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        if w.abs().sum() == 0:
+            return w
+        if self.blocked(view):
             return w * self.scale_when_blocked
         return w
 
@@ -611,6 +752,16 @@ class InverseVolWeighted:
     Distinct from the portfolio-level vol targeting in :mod:`qbt.risk`: this
     changes the *relative* sizing inside the book, the risk gate changes the
     *total*. Keeping them separate means you can study each in isolation.
+
+    A pick whose volatility can't be measured (too little history in the
+    ``vol_lookback`` window) is dropped, and its weight becomes **cash** --
+    it is not silently absorbed by the picks that could be measured. Gross
+    is preserved across the *scoreable* subset only. Redistributing it
+    would quietly lever up the remaining names on the strength of a name
+    this wrapper just admitted it can't size, and it would make this the
+    one wrapper in the module that grows a position in response to missing
+    data -- see :class:`TrendFilter` and :class:`MacroRegimeFilter`, where
+    removed weight always becomes cash.
     """
 
     inner: Strategy
@@ -641,9 +792,13 @@ class InverseVolWeighted:
         inv = (1.0 / vol.replace(0.0, np.nan)).dropna()
         if inv.empty:
             return w
-        gross = held.abs().sum()
+        # Gross of the scoreable names only, not of everything the inner
+        # strategy picked -- an unscoreable pick's weight becomes cash
+        # rather than being handed to its neighbours.
+        scoreable = held.reindex(inv.index)
+        gross = scoreable.abs().sum()
         out = _empty(view)
-        out.loc[inv.index] = np.sign(held.reindex(inv.index)) * gross * inv / inv.sum()
+        out.loc[inv.index] = np.sign(scoreable) * gross * inv / inv.sum()
         return out
 
 

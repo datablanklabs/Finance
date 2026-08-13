@@ -50,6 +50,8 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .data import prune_cache
+
 __all__ = ["MacrosPanel", "MacrosRepository", "DEFAULT_INDICATORS"]
 
 _ID_COLUMNS = ("metric", "period_end", "as_of_date", "value")
@@ -127,11 +129,23 @@ class MacrosPanel:
         date = pd.Timestamp(date).normalize()
         return MacrosPanel(frame=self.frame[self.frame["as_of_date"] <= date])
 
-    def snapshot(self, date: pd.Timestamp) -> pd.Series:
+    def snapshot(self, date: pd.Timestamp,
+                 max_age_days: int | None = None) -> pd.Series:
         """Latest known value of every indicator as of ``date``.
 
         Returns a ``Series`` indexed by metric -- there's no symbol axis to
         pivot against. Safe to call on an already-truncated panel.
+
+        ``max_age_days`` drops readings released longer ago than that,
+        rather than returning a stale value as though it were current.
+        There is no default, because the right answer is per indicator: VIX
+        is daily and a week-old print is suspect, while CPI is monthly and
+        a five-week-old print is simply the newest one that exists. Callers
+        that act on a reading as a *current* regime read should set it --
+        see :class:`~qbt.signals.MacroRegimeFilter`. Without it, a series
+        that silently stopped updating (a dead API key, a provider outage,
+        a cache that never refreshed) keeps answering with its last value
+        forever, and nothing downstream can tell.
         """
         known = self.as_of(date).frame
         if known.empty:
@@ -139,7 +153,25 @@ class MacrosPanel:
         latest = known.sort_values("as_of_date").drop_duplicates(
             "metric", keep="last"
         )
+        if max_age_days is not None:
+            cutoff = pd.Timestamp(date).normalize() - pd.Timedelta(days=max_age_days)
+            latest = latest[latest["as_of_date"] >= cutoff]
         return latest.set_index("metric")["value"].rename(None)
+
+    def snapshot_age_days(self, date: pd.Timestamp) -> pd.Series:
+        """Days between each metric's latest release and ``date``.
+
+        The diagnostic behind :meth:`snapshot`'s ``max_age_days``: how old
+        is the number you are about to act on.
+        """
+        known = self.as_of(date).frame
+        if known.empty:
+            return pd.Series(dtype=float)
+        latest = known.sort_values("as_of_date").drop_duplicates(
+            "metric", keep="last"
+        ).set_index("metric")
+        age = (pd.Timestamp(date).normalize() - latest["as_of_date"]).dt.days
+        return age.astype(float).rename(None)
 
     def to_daily(
         self,
@@ -233,6 +265,8 @@ class MacrosRepository:
         if not self.indicators:
             raise ValueError("no indicators configured")
 
+        # Sweep dead entries before writing new ones -- see prune_cache.
+        prune_cache(self.cache_dir)
         frames = []
         for name, (series_id, lag_days) in self.indicators.items():
             path = self._cache_path(name, series_id, start_s, end_s)

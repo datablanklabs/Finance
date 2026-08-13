@@ -124,14 +124,42 @@ class BrokerOrder:
         return self.state in ("filled", "cancelled", "rejected", "failed")
 
     def fingerprint(self, qty_tolerance: float = 0.02) -> tuple:
-        """Coarse identity for matching against an intent we may have sent.
+        """Coarse bucketed identity, for grouping and display only.
 
-        Quantity is bucketed because a broker may round fractional shares, and
-        an exact float match would make reconciliation miss its own orders --
-        which is the failure that causes double submission.
+        **Not for deciding whether two orders are the same** -- use
+        :meth:`matches` for that. Bucketing quantity makes this cheap to
+        hash but puts hard edges in the middle of the tolerance window: a
+        quantity landing exactly on a half-bucket boundary flips buckets
+        under a rounding smaller than the tolerance is meant to absorb.
+        ``round`` is banker's rounding, so ``0.89 -> 44`` while a broker
+        echoing ``0.890001`` gives ``45``, and an equality test on these
+        tuples then reports a genuinely-placed order as missing.
         """
         bucket = round(self.quantity / max(qty_tolerance, 1e-9))
         return (self.symbol.upper(), self.side.lower(), bucket)
+
+    def matches(self, symbol: str, side: str, quantity: float,
+                qty_tolerance: float = 0.02) -> bool:
+        """Is this the order described by ``(symbol, side, quantity)``?
+
+        Symbol and side must match exactly; quantity only within
+        ``qty_tolerance``, because a broker may round or renormalise a
+        fractional share count on the way in. Comparing the distance
+        directly is what :meth:`fingerprint`'s bucketing was approximating,
+        without the boundary artefact: every quantity within the tolerance
+        matches, and nothing outside it does, regardless of where the value
+        happens to fall relative to a bucket edge.
+
+        This is the comparison :meth:`qbt.orders.OrderManager.recover` uses.
+        Getting it wrong is expensive in one specific direction -- a missed
+        match resolves a real, filled order as ``not_at_broker``, which
+        halts the next cycle for an order that was never actually lost.
+        """
+        return (
+            self.symbol.upper() == str(symbol).upper()
+            and self.side.lower() == str(side).lower()
+            and abs(self.quantity - float(quantity)) <= max(qty_tolerance, 1e-9)
+        )
 
 
 # ---------------------------------------------------------------------------

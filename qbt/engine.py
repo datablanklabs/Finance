@@ -33,7 +33,7 @@ from .data import PricePanel
 from .fundamentals import FundamentalsPanel
 from .macro import MacrosPanel
 from .options import OptionsPanel
-from .risk import DayTradeLedger, RiskContext, RiskGate
+from .risk import DayTradeLedger, RiskContext, RiskGate, as_session_date
 from .signals import Strategy
 
 __all__ = [
@@ -308,9 +308,29 @@ class Backtester:
 
         decision_days = set(rebalance_dates(dates, self.rebalance))
 
-        shares = pd.Series(0.0, index=symbols, dtype=float)
-        cash = self.initial_equity
         peak = self.initial_equity
+        # symbol -> session date it was last opened from flat. Feeds the
+        # day-trade detection in execute().
+        #
+        # **On a daily panel this detection is structurally always zero**,
+        # and that is the correct answer rather than a gap: execute() runs
+        # at most once per bar (with delay_bars=0 nothing is ever queued;
+        # with delay_bars>=1 fills only come off the queue, and fill_bar =
+        # i + delay_bars is strictly increasing so two decisions can never
+        # land on one bar), and a symbol appears at most once in `traded`
+        # per call. One fill per symbol per bar, one bar per session, so a
+        # position cannot open and close inside the same session. Verified
+        # empirically: daily rebalancing of a 3-day reversal strategy over
+        # 976 rebalances and ~1,420 trades produces zero symbol-days with
+        # more than one trade, at delay_bars 0, 1 and 2 alike.
+        #
+        # The consequence worth knowing is about *parity*, not correctness:
+        # live trading (qbt/orders.py) genuinely can day-trade and so can
+        # trip RiskGate's PDT block, while a daily backtest never will.
+        # A backtest is therefore not evidence that a strategy stays inside
+        # the PDT budget in production. Seed `day_trade_ledger` explicitly
+        # to research an already-restricted account -- ledger.remaining()
+        # still feeds RiskContext below either way.
         opened_on: dict[str, pd.Timestamp] = {}
 
         # A queue, not a single slot -- a single `tuple | None` here used to
@@ -383,13 +403,25 @@ class Backtester:
             slip_cost = float((traded.abs() * ref_px).sum()) * self.costs.slippage_bps / 1e4
             cost_curve[bar] += fees + slip_cost
 
+            session = as_session_date(date_)
             for sym, qty in traded.items():
                 prev = float(held.get(sym, 0.0))
                 new = prev + float(qty)
                 if prev == 0.0 and new != 0.0:
-                    opened_on[sym] = date_
-                if new == 0.0 and opened_on.get(sym) == date_:
-                    self.ledger.record(date_)
+                    opened_on[sym] = session
+                # Keyed on the *session date*, not the raw bar timestamp.
+                # A strict no-op today -- daily bar dates are already
+                # midnight, verified -- so this changes no existing result.
+                # It's here because the raw timestamp encodes the wrong
+                # concept: "same session" is a calendar-date question, and
+                # comparing bar timestamps would answer it wrongly the
+                # moment bars carried a time component. (They can't yet:
+                # PricePanel.as_of() normalises its argument to midnight,
+                # so it cannot slice mid-session and intraday panels aren't
+                # a supported configuration. This is hardening against a
+                # future change, not a fix for a reachable bug.)
+                if new == 0.0 and opened_on.get(sym) == session:
+                    self.ledger.record(session)
                 if new == 0.0:
                     opened_on.pop(sym, None)
                 trade_rows.append(
