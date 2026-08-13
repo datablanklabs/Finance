@@ -4,12 +4,20 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    Backtester, FundamentalsPanel, LiveSignalRunner, PortfolioState,
-    SyntheticRepository,
+    Backtester, EqualWeightBuyHold, FundamentalsPanel, LiveSignalRunner,
+    MacroRegimeFilter, PortfolioState, PricePanel, SyntheticRepository,
 )
 from qbt.macro import MacrosPanel, MacrosRepository
 
 FAILS = []
+
+
+def _raises(fn, exc_type):
+    try:
+        fn()
+    except exc_type:
+        return True
+    return False
 
 
 def check(name, cond, detail=""):
@@ -262,6 +270,58 @@ check(
     "live runner still works with no macros argument at all",
     seen_calls["n"] == 1 and plan2.asof == plan.asof,
 )
+
+print()
+print("=" * 72)
+print("Staleness: a reading that stopped updating is not a current reading")
+print("=" * 72)
+
+# snapshot() returns the newest reading at *any* age. That's right for a
+# monthly series (a five-week-old CPI print is simply the newest one that
+# exists) and wrong for a daily one acted on as a current regime read: a
+# dead API key, a provider outage or a frozen cache leaves VIX answering
+# with its last value indefinitely, and nothing downstream can tell.
+_stale_dates = pd.date_range("2026-01-01", periods=3)
+_stale_panel = MacrosPanel(frame=pd.DataFrame(
+    [("vix", d, d, 45.0) for d in _stale_dates],
+    columns=["metric", "period_end", "as_of_date", "value"],
+))
+_late = pd.Timestamp("2026-06-01")
+
+check("without an age bound, a five-month-old reading is still returned",
+      float(_stale_panel.snapshot(_late)["vix"]) == 45.0)
+check("snapshot_age_days reports how old that reading actually is",
+      float(_stale_panel.snapshot_age_days(_late)["vix"]) == 149.0,
+      _stale_panel.snapshot_age_days(_late).to_dict())
+check("max_age_days drops it entirely rather than presenting it as current",
+      "vix" not in _stale_panel.snapshot(_late, max_age_days=7).index)
+check("a fresh reading inside the age bound is still returned",
+      float(_stale_panel.snapshot(_stale_dates[-1], max_age_days=7)["vix"]) == 45.0)
+
+# MacroRegimeFilter must treat an over-age reading as no reading at all --
+# the same documented no-op as macros=None, not a block and not a gate on
+# stale data.
+_stale_idx = pd.bdate_range("2025-06-01", periods=300)
+_stale_view = PricePanel(close=pd.DataFrame(
+    {"A": np.linspace(100, 110, 300)}, index=_stale_idx))
+_bounded = MacroRegimeFilter(inner=EqualWeightBuyHold(), metric="vix",
+                             max_level=35.0, max_age_days=7)
+_unbounded = MacroRegimeFilter(inner=EqualWeightBuyHold(), metric="vix",
+                               max_level=35.0)
+check("unbounded, the filter gates the book on a five-month-old VIX=45",
+      _unbounded.blocked(_stale_view, _stale_panel))
+check("bounded by max_age_days, the same stale reading is a no-op",
+      not _bounded.blocked(_stale_view, _stale_panel))
+
+_fresh_panel = MacrosPanel(frame=pd.DataFrame(
+    [("vix", d, d, 45.0) for d in pd.date_range(_stale_idx[-1], periods=1)],
+    columns=["metric", "period_end", "as_of_date", "value"],
+))
+check("a genuinely current elevated reading still blocks with the bound on",
+      _bounded.blocked(_stale_view, _fresh_panel))
+check("max_age_days=0 is rejected as a construction error",
+      _raises(lambda: MacroRegimeFilter(inner=EqualWeightBuyHold(), metric="vix",
+                                        max_level=35.0, max_age_days=0), ValueError))
 
 print()
 print("=" * 72)

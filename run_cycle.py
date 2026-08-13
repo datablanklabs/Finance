@@ -35,17 +35,58 @@ import sys
 import pandas as pd
 
 from qbt import (
-    CrossSectionalMomentum, DayTradeLedger, LiveSignalRunner, OpenBBRepository,
-    PortfolioState, RiskGate, SyntheticRepository,
+    BreadthRegimeFilter, CrossSectionalMomentum, DayTradeLedger,
+    LiveSignalRunner, MacroRegimeFilter, MacrosPanel, MacrosRepository,
+    OpenBBRepository, PortfolioState, RiskGate, SyntheticRepository,
 )
 from qbt.broker import MockBroker, RobinhoodMCPBroker
+from qbt.macro import DEFAULT_INDICATORS
 from qbt.oauth import build_robinhood_oauth
 from qbt.orders import AuditLog, ExecutionPolicy, OrderManager
+from qbt.risk import as_session_date
+
+# Single source of truth: the same timezone OrderManager resolves trading
+# sessions in, so a day trade recorded during execute() and the trim below
+# agree on which calendar date a fill belongs to.
+MARKET_TZ = ExecutionPolicy.market_tz
 
 UNIVERSE = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU",
             "XLV", "XLY", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "DBC"]
 
-STRATEGY = CrossSectionalMomentum(lookback=63, skip=5, top_n=5)
+# Two whole-book de-risking overlays around the same momentum core, neither
+# changing which names get picked -- both just scale total exposure down
+# (never up) when their own regime read is unfavourable, the same role
+# vol targeting plays in RiskGate:
+#
+# - MacroRegimeFilter(metric="vix"): elevated or sharply-rising implied
+#   volatility. max_level=35 is "real stress" territory (VIX's ordinary
+#   range is roughly 12-20; 30+ is a genuine risk-off regime, not routine
+#   noise). max_increase=15 over 21 trading days (~1 month) catches a fast
+#   spike even before the absolute level crosses 35 -- 2018-Q4 and
+#   2020-Q1 both moved VIX by more than that in under a month.
+# - BreadthRegimeFilter: participation *within this strategy's own
+#   18-symbol universe* -- fewer than 30% of the sleeves above their own
+#   200-day average (the same lookback TrendFilter uses) is a narrow,
+#   fragile tape, independent of what the VIX-based read says.
+#
+# scale_when_blocked=0.5 on both, not a full flatten -- de-risk, don't
+# bet the regime read is certainly right, and if both fire at once the
+# combined 0.5 x 0.5 = 25% exposure is a real, but not total, retreat.
+STRATEGY = BreadthRegimeFilter(
+    inner=MacroRegimeFilter(
+        inner=CrossSectionalMomentum(lookback=63, skip=5, top_n=5),
+        metric="vix", max_level=35.0, max_increase=15.0, lookback=21,
+        scale_when_blocked=0.5,
+        # VIX is a daily series with a 1-day publication lag, so anything
+        # older than about a week means the feed is broken, not quiet.
+        # Past that, treat it as no reading at all (a no-op pass-through)
+        # rather than gating a live book on a stale number believing it
+        # current -- a dead FRED key or a frozen cache would otherwise go
+        # on de-risking, or not de-risking, on last month's volatility.
+        max_age_days=7,
+    ),
+    lookback=200, min_breadth=0.3, scale_when_blocked=0.5,
+)
 GATE = dict(target_vol=0.12, max_weight=0.30, max_gross=1.0, max_drawdown=0.25)
 
 
@@ -117,10 +158,18 @@ def save_day_trade_ledger(path: str, ledger: DayTradeLedger) -> None:
     # Trim to what the rolling window could still matter for, so this file
     # doesn't grow forever -- a generous 10 business days; the precise
     # 5-business-day cutoff is DayTradeLedger.count()'s own job.
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.tseries.offsets.BDay(10)
-    events = [d for d in ledger.events if pd.Timestamp(d) > cutoff]
+    #
+    # Both sides go through as_session_date() so this comparison stays
+    # naive-vs-naive. It used to build a tz-aware UTC cutoff, which is the
+    # mirror image of the bug that as_session_date() exists to close: once
+    # events are stored as tz-naive session dates, an aware cutoff here
+    # raises the same TypeError from the other direction, and it would do
+    # it on the *write* path, right after a day trade was recorded.
+    cutoff = as_session_date(pd.Timestamp.now(tz=MARKET_TZ)) - pd.tseries.offsets.BDay(10)
+    events = [as_session_date(d) for d in ledger.events]
+    events = [d for d in events if d > cutoff]
     with open(path, "w") as fh:
-        json.dump({"events": [pd.Timestamp(d).isoformat() for d in events]}, fh)
+        json.dump({"events": [d.isoformat() for d in events]}, fh)
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -224,6 +273,34 @@ def main() -> int:
         audit.emit("data_fetch_failed", error=repr(exc))
         return 3
 
+    # ---- macro (vix, for the MacroRegimeFilter wrapped around STRATEGY) -
+    # Deliberately its own try/except, separate from the price fetch above:
+    # unlike price data, this is a risk *overlay*, not something the
+    # strategy strictly needs to function -- MacroRegimeFilter already
+    # treats macros=None as a no-op pass-through by design (see its own
+    # docstring), so a FRED outage or a missing API key should degrade
+    # today's cycle back to breadth-only risk management, not abort a
+    # trading day over an optional signal.
+    try:
+        if args.synthetic:
+            # No real VIX series to fetch offline -- a flat, calm-level
+            # synthetic one exercises the wiring (MacroRegimeFilter
+            # actually receiving and reading a panel) without claiming to
+            # be real data.
+            macros = MacrosPanel(frame=pd.DataFrame(
+                [("vix", d, d, 15.0) for d in panel.dates],
+                columns=["metric", "period_end", "as_of_date", "value"],
+            ))
+        else:
+            macros = MacrosRepository(
+                indicators={"vix": DEFAULT_INDICATORS["vix"]},
+                cache_dir=".cache/macro",
+            ).fetch("2010-01-01", end)
+    except Exception as exc:
+        audit.emit("macro_fetch_failed", error=repr(exc))
+        print(f"  (macro/VIX fetch failed, continuing without it: {exc!r})")
+        macros = None
+
     # ---- broker ---------------------------------------------------------
     broker = None
     try:
@@ -296,6 +373,35 @@ def main() -> int:
     peak_file = mode_path("state/peak_equity.txt", args.synthetic)
     try:
         peak = load_peak(peak_file, account.equity)
+
+        # Anything held that the price panel doesn't cover is capital this
+        # strategy does not manage: reindexing it away below (which we still
+        # have to do -- there's no price series to size or trade it with)
+        # makes it contribute nothing to plan.equity, produces no sell
+        # intent, and leaves it stranded indefinitely. Silent in every
+        # direction, so say it out loud here, while account.positions is
+        # still the broker's complete view.
+        #
+        # Deliberately not fatal on its own. A small unmanaged holding just
+        # means plan.equity understates the account, which sizes orders
+        # conservatively -- safe. A large one trips preflight's existing
+        # equity-drift check and aborts the cycle, which is the right
+        # outcome; the point of this block is that the abort then has an
+        # accurate explanation attached instead of surfacing as a bare
+        # "equity drift ... Recompute, do not send" that points at stale
+        # data rather than at an unmanaged position.
+        held_all = account.positions[account.positions.abs() > 1e-9]
+        unmanaged = held_all[~held_all.index.isin(panel.symbols)]
+        if not unmanaged.empty:
+            names = ", ".join(f"{s} x{q:g}" for s, q in unmanaged.items())
+            print(f"  UNMANAGED HOLDINGS: {names}")
+            print("    Not in the strategy universe -- excluded from equity, "
+                  "never traded, and never sold by this bot.")
+            print("    Sell or add to UNIVERSE; if large enough, preflight "
+                  "will abort on equity drift until you do.")
+            audit.emit("unmanaged_holdings", symbols=", ".join(unmanaged.index),
+                       n=int(len(unmanaged)))
+
         state = PortfolioState(
             cash=account.cash,
             shares=account.positions.reindex(panel.symbols).fillna(0.0),
@@ -313,7 +419,7 @@ def main() -> int:
         plan = LiveSignalRunner(strategy=STRATEGY, risk_gate=RiskGate(**GATE),
                                 max_turnover=args.max_turnover,
                                 day_trade_ledger=ledger).plan(
-            panel, state)
+            panel, state, macros=macros)
 
         # Surface *why* the plan looks the way it does -- these were
         # computed but never printed anywhere, which is exactly how the
@@ -328,6 +434,28 @@ def main() -> int:
             for n in plan.decision.notes:
                 print(f"  RISK GATE: {n}")
             audit.emit("risk_gate_notes", notes="; ".join(plan.decision.notes))
+
+        # BreadthRegimeFilter/MacroRegimeFilter just scale target_weights()
+        # down silently -- neither goes through plan.warnings, so without
+        # this a de-risk from either would show up only as unexplained
+        # smaller position sizes. Same view LiveSignalRunner.plan() used
+        # internally, reconstructed here purely for this diagnostic.
+        regime_view = panel.as_of(plan.asof)
+        regime_macros = macros.as_of(plan.asof) if macros is not None else None
+        breadth_filter = STRATEGY
+        macro_filter = STRATEGY.inner
+        if breadth_filter.blocked(regime_view):
+            print(f"  REGIME: market breadth below {breadth_filter.min_breadth:.0%} "
+                  f"-- book scaled to {breadth_filter.scale_when_blocked:.0%} "
+                  f"(breadth={breadth_filter.breadth(regime_view):.0%})")
+            audit.emit("breadth_regime_blocked",
+                       breadth=round(breadth_filter.breadth(regime_view), 4),
+                       scale=breadth_filter.scale_when_blocked)
+        if macro_filter.blocked(regime_view, regime_macros):
+            print(f"  REGIME: VIX regime unfavourable -- book scaled to "
+                  f"{macro_filter.scale_when_blocked:.0%}")
+            audit.emit("macro_regime_blocked", metric=macro_filter.metric,
+                       scale=macro_filter.scale_when_blocked)
 
         report = manager.execute(plan, strategy_name=STRATEGY.name)
     except Exception as exc:
@@ -345,7 +473,8 @@ def main() -> int:
         print(report.reconciliation[report.reconciliation["breach"]].to_string())
 
     audit.emit("cycle_end", aborted=report.aborted,
-               submitted=len(report.submitted), skipped=len(report.skipped))
+               submitted=len(report.submitted), rejected=len(report.rejected),
+               skipped=len(report.skipped))
     broker.close()
     return 1 if report.aborted else 0
 

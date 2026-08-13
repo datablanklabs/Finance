@@ -14,7 +14,7 @@ and production to drift apart.
 | `qbt/macro.py` | `MacrosPanel`: point-in-time macro series (CPI, Fed funds rate, unemployment, yield curve, ...) from FRED |
 | `qbt/corporate.py` | `CorpsPanel`: point-in-time SEC filing cadence (10-K/10-Q/8-K) and Form 4 insider-transaction indicators |
 | `qbt/options.py` | `OptionsPanel`: daily-archived options-chain indicators (ATM IV, put/call volume ratio) |
-| `qbt/signals.py` | `Strategy` protocol, 10 strategies, 5 composer/filter wrappers |
+| `qbt/signals.py` | `Strategy` protocol, 10 strategies, 6 composer/filter wrappers |
 | `qbt/risk.py` | `RiskGate` (vol target, caps, drawdown breaker), `DayTradeLedger` (PDT budget, persisted across cycles by `run_cycle.py`) |
 | `qbt/engine.py` | `Backtester` (T+1 fills, costs), performance metrics |
 | `qbt/research.py` | IC grid, autocorrelation, walk-forward, multiple-testing haircut |
@@ -24,17 +24,18 @@ and production to drift apart.
 | `qbt/orders.py` | `OrderManager`: journal, preflight, reconciliation, audit |
 | `research.ipynb` | 49-cell research notebook, 30 code cells |
 | `run_cycle.py` | One trading cycle. Run on a schedule, never from the notebook |
-| `test_qbt.py` | 95 engine validation checks (strategies, engine, risk gate, research) |
-| `test_orders.py` | 88 order-path checks, offline against `MockBroker` |
+| `test_qbt.py` | 116 engine validation checks (strategies, engine, risk gate, research, panel validation) |
+| `test_orders.py` | 134 order-path checks, offline against `MockBroker` |
 | `test_fundamentals.py` | 33 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
-| `test_macro.py` | 31 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter` |
+| `test_macro.py` | 39 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter`, reading staleness |
 | `test_corporate.py` | 38 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
 | `test_options.py` | 39 checks: `OptionsPanel`, daily-archive semantics |
 | `test_options_strategy.py` | 19 checks: `OptionsMeanReversion` |
 | `test_insider_drift_strategy.py` | 21 checks: `InsiderEventDrift` |
-| `test_regime_filters.py` | 25 checks: `MacroRegimeFilter`/`FundamentalsValueFilter` end-to-end |
+| `test_regime_filters.py` | 43 checks: `MacroRegimeFilter` (incl. a `vix` example)/`FundamentalsValueFilter`/`BreadthRegimeFilter` end-to-end |
 | `test_robinhood_broker.py` | 43 checks: response shapes confirmed against the live Robinhood MCP server |
 | `test_oauth.py` | 14 checks: PKCE flow, loopback callback server, token-file permissions |
+| `test_run_cycle.py` | 33 checks: `run_cycle.py`'s live `STRATEGY` composition and thresholds, regime triggering, day-trade ledger persistence, unmanaged holdings |
 | `build_notebook.py` | Regenerates `research.ipynb` |
 | `smoke_test.py` | Executes every notebook cell in one namespace |
 
@@ -76,17 +77,18 @@ pip install openbb-fmp                            # optional, for FundamentalsPa
 pip install openbb-fred                           # optional, for MacrosPanel (needs a free FRED key)
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
-python test_qbt.py                     # 95 engine checks, ~90s
-python test_orders.py                  # 88 order-path checks, ~10s
+python test_qbt.py                     # 116 engine checks, ~90s
+python test_orders.py                  # 134 order-path checks, ~10s
 python test_fundamentals.py            # 33 checks
-python test_macro.py                   # 31 checks
+python test_macro.py                   # 39 checks
 python test_corporate.py               # 38 checks
 python test_options.py                 # 39 checks
 python test_options_strategy.py        # 19 checks
 python test_insider_drift_strategy.py  # 21 checks
-python test_regime_filters.py          # 25 checks
+python test_regime_filters.py          # 43 checks
 python test_robinhood_broker.py        # 43 checks, offline against confirmed live response shapes
 python test_oauth.py                   # 14 checks
+python test_run_cycle.py               # 33 checks, live STRATEGY wiring
 python smoke_test.py                   # all 30 notebook cells
 jupyter lab research.ipynb
 ```
@@ -109,13 +111,18 @@ in cell 1 for real ETF data; nothing else changes.
 | `OptionsMeanReversion` | Buy names where options-implied fear (IV, put/call ratio) is most stretched vs. their own history. |
 | `InsiderEventDrift` | Long fresh open-market insider buying that follows an 8-K, held while the signal stays inside its drift window. |
 
-Plus five composer/filter wrappers that wrap any strategy, each deciding a
+Plus six composer/filter wrappers that wrap any strategy, each deciding a
 different axis: `TrendFilter` (absolute-momentum gate, per name),
 `FundamentalsValueFilter` (block names failing a fundamentals screen, per
 name), `MacroRegimeFilter` (scale the *whole book* down in an unfavourable
-macro regime — no symbol axis to gate on), `InverseVolWeighted` (re-weight
-picks by inverse vol), and `Composite` (blend several strategies by fixed
-capital share).
+macro regime — no symbol axis to gate on; `metric="vix"` is the concrete,
+tested example — FRED's `VIXCLS` was already in `MacrosPanel`'s default
+indicators but nothing exercised it end-to-end before), `BreadthRegimeFilter`
+(scale the whole book down when too few names in the *strategy's own
+universe* are above their own trailing moving average — no external data
+source, computed straight from the price panel), `InverseVolWeighted`
+(re-weight picks by inverse vol), and `Composite` (blend several strategies
+by fixed capital share).
 
 ## The three tests worth keeping permanently
 
@@ -213,6 +220,47 @@ risk gate, no journal or audit writes. It connects, calls the same
 `get_account()` every real cycle already calls, and prints holdings with
 current value and weight (via `get_quotes()`) so you can see what's actually
 in the account without running or dry-running a full cycle.
+
+### The live strategy
+
+`run_cycle.py`'s `STRATEGY` is not just `CrossSectionalMomentum` on its own —
+it's that core wrapped in two whole-book de-risking overlays, both scaling
+exposure down (never up, never redistributing into fewer names) when their
+own regime read is unfavourable:
+
+```
+BreadthRegimeFilter(lookback=200, min_breadth=0.3, scale_when_blocked=0.5)
+  -> MacroRegimeFilter(metric="vix", max_level=35.0, max_increase=15.0,
+                        lookback=21, scale_when_blocked=0.5)
+       -> CrossSectionalMomentum(lookback=63, skip=5, top_n=5)
+```
+
+`MacroRegimeFilter` blocks on a VIX level above 35 or a 15-point rise inside
+21 trading days — genuine risk-off territory, not routine noise.
+`BreadthRegimeFilter` blocks when fewer than 30% of `run_cycle.py`'s own
+18-symbol universe is above its own 200-day average. Neither changes which
+names get picked; each independently scales total exposure to 50% when
+triggered, so both firing at once compounds to 25% (see the comment above
+`STRATEGY` in `run_cycle.py` for the full rationale). A cycle where either
+overlay is actively scaling prints a `REGIME:` line and emits a
+`breadth_regime_blocked` / `macro_regime_blocked` audit event — without that,
+a de-risk would show up only as an unexplained smaller position size.
+`test_run_cycle.py` (33 checks) is the permanent regression guard on this
+wiring: the composition, the thresholds, and that elevated VIX alone scales
+turnover to exactly 50%.
+
+**The VIX overlay needs a working FRED fetch to do anything.** In `--live`
+and dry-run (non-`--synthetic`) modes, `run_cycle.py` fetches VIX via
+`MacrosRepository`/`openbb-fred`, cached under `.cache/macro`. If that fetch
+fails for any reason — no `openbb-fred` installed, no FRED API key
+configured, FRED itself down — the cycle does **not** abort; it emits
+`macro_fetch_failed`, prints the exception, and continues with `macros=None`.
+`MacroRegimeFilter` treats `macros=None` as a documented no-op pass-through,
+so the practical effect is silent: the VIX overlay simply does nothing every
+cycle until FRED access is actually configured, and only `BreadthRegimeFilter`
+(which needs no external data — it's computed straight from the price panel)
+is doing any regime-based de-risking in the meantime. Safe, but worth knowing
+explicitly rather than assuming both overlays are live.
 
 ### Idempotency without a broker-side key
 
@@ -356,9 +404,29 @@ trades really happened. `run_cycle.py` persists the ledger to
 live runs never share it) and passes the *same* instance to both
 `LiveSignalRunner` and `OrderManager`, so a round trip `OrderManager.execute()`
 detects — bought from flat, then sold back to flat, in the same market-tz
-session, mirroring exactly the `opened_on`/`ledger.record()` bookkeeping
-`Backtester.run()` already does — is immediately visible to the next cycle's
-`day_trades_remaining`, not just the next backtest.
+session — is immediately visible to the next cycle's `day_trades_remaining`.
+
+**A backtest cannot tell you whether a strategy will trip this.**
+`Backtester.run()` has matching `opened_on`/`ledger.record()` bookkeeping, but
+on a daily panel it is structurally unreachable: one fill per symbol per bar
+and one bar per session means nothing ever round-trips inside a session, so
+the count is always zero (measured — 976 daily rebalances of a 3-day reversal
+strategy, ~1,420 trades, zero symbol-days with more than one trade, at
+`delay_bars` 0, 1 and 2 alike). Live trading genuinely can day-trade and so
+can trip the block; research never will. Seed a `DayTradeLedger` explicitly if
+you want to study how an already-restricted account behaves —
+`ledger.remaining()` still feeds `RiskContext` either way.
+
+Events are stored as **tz-naive session dates** via `qbt.risk.as_session_date`.
+That normalisation is load-bearing, not cosmetic: `OrderManager` resolves
+sessions in the market timezone (tz-aware) while `LiveSignalRunner` passes a
+tz-naive panel date as `asof`, and comparing the two raised `TypeError` inside
+`DayTradeLedger.count()`. In `run_cycle.py` that surfaced as a *permanent*
+outage rather than a single failed cycle — the exception aborted the run before
+`save_day_trade_ledger` could rewrite the file, so every later cycle reloaded
+the same poisoned event and failed identically, with only `cycle_error` in the
+audit log. `count()` normalises on read as well as write, so a state file
+written before the fix heals itself instead of needing to be deleted by hand.
 
 ### Going live, in order
 

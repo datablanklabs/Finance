@@ -1,10 +1,15 @@
 """Validation suite. The null test is the one that matters."""
 
+import os
+import tempfile
+import time
+
 import numpy as np
 import pandas as pd
 
 from qbt import (
-    Backtester, Composite, CostModel, CrossSectionalMomentum, DayTradeLedger,
+    Backtester, BreadthRegimeFilter, Composite, CostModel,
+    CrossSectionalMomentum, DayTradeLedger,
     EqualWeightBuyHold, ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
     MultiFactorCrossSectional, OpenBBRepository, PortfolioState, PricePanel,
     RiskGate, ShortHorizonReversal, SyntheticRepository, TimeSeriesMomentum,
@@ -13,6 +18,7 @@ from qbt import (
     return_autocorrelation, trailing_signal, walk_forward_splits,
     ParameterSweep, sharpe_haircut,
 )
+from qbt.data import prune_cache
 from qbt.risk import RiskContext
 
 FAILS = []
@@ -368,6 +374,36 @@ if _reset_mask.any():
     check("reset happens strictly after the trip, not immediately",
           r_vshape.audit.index[_reset_mask][0] > r_vshape.audit.index[r_vshape.audit["halted"]][0])
 
+# The other way the breaker could latch forever: tripping on a bar where
+# the proposed book is empty. There are then no weights whose recovery to
+# shadow, and a flat shadow book earns exactly 0% in perpetuity, so
+# _shadow_ratio never moves and resume_at is never reached -- the same
+# silent permanent halt as the stuck peak-equity bug, from another
+# direction. The gate re-arms from the first proposal that has something
+# in it instead.
+_rearm_idx = pd.bdate_range("2024-01-01", periods=30)
+_rearm_rets = pd.DataFrame({"A": [0.0] * 29 + [0.05]}, index=_rearm_idx)
+_rearm_ctx = RiskContext(date=_rearm_idx[-1], equity=70.0, peak_equity=100.0,
+                         prices=pd.Series({"A": 10.0}), returns=_rearm_rets)
+_rearm_gate = RiskGate(target_vol=None, max_drawdown=0.20, resume_at=0.90)
+_trip = _rearm_gate.apply(pd.Series(dtype=float), _rearm_ctx)
+check("breaker trips on an empty proposed book",
+      _trip.halted and _rearm_gate._shadow_weights.empty)
+
+_rearm_bars = None
+for _k in range(1, 60):
+    _d = _rearm_gate.apply(pd.Series({"A": 1.0}), _rearm_ctx)
+    if _k == 1:
+        check("it re-arms the shadow book once there's something to track",
+              any("re-armed" in n for n in _d.notes), _d.notes)
+    if not _d.halted:
+        _rearm_bars = _k
+        break
+check("and then genuinely recovers instead of latching forever",
+      _rearm_bars is not None,
+      f"recovered after {_rearm_bars} bars" if _rearm_bars
+      else "still halted after 59 bars")
+
 # PDT limit must actually block new entries at the gate, not just log a note.
 pdt_gate = RiskGate(target_vol=None, max_weight=None, max_gross=None, max_drawdown=None)
 _syms = ["PA", "PB", "PC"]
@@ -492,6 +528,120 @@ check("a symbol with zero valid data in its trailing window is blocked, "
       _trend_w["NEW"] == 0.0, _trend_w.to_dict())
 check("a symbol with a genuine, fully-scoreable uptrend still passes",
       _trend_w["OLD"] == 0.5, _trend_w.to_dict())
+
+# The *realistic* version of the same bug, which the all-NaN column above
+# cannot catch. mean() skips NaN, so a name with 20 real bars inside a
+# 200-bar window produces a finite 20-bar average -- not NaN -- and
+# ma.isna() sees nothing wrong. It then gets compared against a "200-day
+# moving average" that is really a 20-day one, and a recently-listed name
+# in a short uptrend sails through the gate. TrendFilter's own comment
+# already described exactly this case ("a recently-added or short-history
+# name that still cleared the inner strategy's shorter min_history") as
+# one that must block; only the all-NaN half was actually being caught.
+class _PartialStubInner:
+    name = "stub_partial"
+    min_history = 5
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        return pd.Series({"FULL": 0.5, "YOUNG": 0.5}).reindex(
+            view.symbols).fillna(0.0)
+
+
+_partial_young = np.full(250, np.nan)
+_partial_young[-20:] = np.linspace(50, 60, 20)   # listed 20 bars ago, rising
+_partial_close = pd.DataFrame({
+    "FULL": np.linspace(100, 200, 250),          # full history, real uptrend
+    "YOUNG": _partial_young,
+}, index=_trend_dates)
+_partial_panel = PricePanel(close=_partial_close)
+
+_partial_ma = _partial_panel.close.tail(200).mean()
+check("the premise: a 20-of-200-bar window yields a finite mean, so an "
+      "isna() check alone cannot detect it",
+      np.isfinite(_partial_ma["YOUNG"]),
+      f"ma[YOUNG]={_partial_ma['YOUNG']}")
+
+_partial_w = TrendFilter(inner=_PartialStubInner(), lookback=200).target_weights(
+    _partial_panel)
+check("a symbol whose trailing window is only partially populated is blocked, "
+      "not scored against a silently-shortened moving average",
+      _partial_w["YOUNG"] == 0.0, _partial_w.to_dict())
+check("its fully-populated neighbour is unaffected",
+      _partial_w["FULL"] == 0.5, _partial_w.to_dict())
+
+# BreadthRegimeFilter shares the same trailing-MA rule and had the same
+# hole: a partially-populated name counted as fully scoreable, landing in
+# both the numerator and the denominator of a breadth read it has no
+# business contributing to.
+#
+# YOUNG must trend *down* here, unlike the TrendFilter panel above. A
+# rising YOUNG sits above its own short MA, so it lands in numerator and
+# denominator alike and breadth reads 2/2 = 1.0 -- exactly the 1/1 = 1.0
+# the fix produces, making the check pass either way and prove nothing.
+# Falling, it's counted in the denominator only: 1/2 = 0.5 before the fix
+# versus 1/1 = 1.0 after.
+_breadth_young = np.full(250, np.nan)
+_breadth_young[-20:] = np.linspace(60, 50, 20)   # listed 20 bars ago, falling
+_breadth_close = pd.DataFrame({
+    "FULL": np.linspace(100, 200, 250),
+    "YOUNG": _breadth_young,
+}, index=_trend_dates)
+_breadth_panel = PricePanel(close=_breadth_close)
+_breadth_partial = BreadthRegimeFilter(inner=_PartialStubInner(), lookback=200)
+check("breadth excludes a partially-populated symbol from both numerator "
+      "and denominator (1 of 1 fully-scoreable name above its MA -> 1.0, "
+      "not 1 of 2 -> 0.5)",
+      _breadth_partial.breadth(_breadth_panel) == 1.0,
+      _breadth_partial.breadth(_breadth_panel))
+check("breadth is NaN when no symbol has a fully-populated window",
+      np.isnan(_breadth_partial.breadth(
+          PricePanel(close=_breadth_close[["YOUNG"]]))))
+
+# InverseVolWeighted used to preserve the *inner* strategy's full gross
+# across only the vol-scoreable names, so a pick it couldn't size handed
+# its weight to the picks it could -- the one wrapper in the module that
+# grew a position in response to missing data.
+class _IVolPicks:
+    name = "ivol_picks"
+    min_history = 5
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        return pd.Series({"GOOD": 0.5, "NOVOL": 0.5}).reindex(
+            view.symbols).fillna(0.0)
+
+
+_ivol_n = 100
+_ivol_idx = pd.bdate_range("2024-01-01", periods=_ivol_n)
+_ivol_close = pd.DataFrame({
+    "GOOD": 100 * np.exp(np.cumsum(
+        np.random.default_rng(0).normal(0, 0.01, _ivol_n))),
+    "NOVOL": [100.0] * _ivol_n,          # zero variance -> unscoreable
+}, index=_ivol_idx)
+_ivol_w = InverseVolWeighted(inner=_IVolPicks(), vol_lookback=63).target_weights(
+    PricePanel(close=_ivol_close))
+check("an unscoreable pick's weight becomes cash, not absorbed by its "
+      "neighbours (gross 0.5, not the inner strategy's full 1.0)",
+      abs(float(_ivol_w.abs().sum()) - 0.5) < 1e-9, _ivol_w.to_dict())
+check("the unscoreable name itself is flat",
+      _ivol_w["NOVOL"] == 0.0, _ivol_w.to_dict())
+
+# CrossSectionalMomentum is *relative* momentum: top_n=None holds the top
+# half whatever the sign of their trailing return. The docstring used to
+# claim it filtered to positive scores, which it never did -- an
+# absolute-momentum gate is TrendFilter's job.
+_falling = pd.DataFrame(
+    {f"S{i}": np.linspace(100, 100 - (i + 1) * 5, 200) for i in range(6)},
+    index=pd.bdate_range("2020-01-01", periods=200))
+_falling_panel = PricePanel(close=_falling)
+_xsm_none = CrossSectionalMomentum(lookback=126, skip=5, top_n=None)
+check("the premise: every trailing return in this universe is negative",
+      bool((_xsm_none.score(_falling_panel) < 0).all()))
+_xsm_w = _xsm_none.target_weights(_falling_panel)
+check("top_n=None holds the top half regardless of sign, as documented",
+      abs(float(_xsm_w.abs().sum()) - 1.0) < 1e-9
+      and int((_xsm_w > 0).sum()) == 3, _xsm_w.to_dict())
 
 print()
 print("=" * 72)
@@ -775,6 +925,63 @@ for bad_freq in ("3M", "biweekly", "X"):
         check(f"rejects unrecognized freq {bad_freq!r}", False)
     except ValueError:
         check(f"rejects unrecognized freq {bad_freq!r}", True)
+
+# A duplicated symbol column used to construct fine, survive as_of() and
+# every strategy, then die deep inside Backtester.run() with pandas' own
+# "cannot reindex on an axis with duplicate labels" -- naming neither the
+# panel nor the offending symbol. PricePanel already validated its index
+# thoroughly (sorted, no duplicate dates) but never its columns.
+_dup_idx = pd.bdate_range("2020-01-01", periods=30)
+_dup_close = pd.DataFrame(np.ones((30, 3)), index=_dup_idx,
+                          columns=["AAA", "BBB", "AAA"])
+try:
+    PricePanel(close=_dup_close)
+    check("rejects duplicate symbol columns at construction", False)
+except ValueError as exc:
+    check("rejects duplicate symbol columns at construction",
+          "duplicate symbol" in str(exc) and "AAA" in str(exc), str(exc))
+
+# `str` is an iterable of characters, so a bare string silently became a
+# panel of single-character symbols. Against SyntheticRepository that was
+# worse than a crash: it fabricated a plausible 4-symbol panel of generated
+# prices with no error at all.
+for _repo_name, _repo in (("SyntheticRepository", SyntheticRepository(n_symbols=5)),
+                          ("OpenBBRepository", OpenBBRepository(cache_dir=None))):
+    try:
+        _repo.fetch("AAPL", "2020-01-01", "2020-03-01")
+        check(f"{_repo_name} rejects a bare string for symbols", False)
+    except TypeError as exc:
+        check(f"{_repo_name} rejects a bare string for symbols",
+              "bare string" in str(exc), str(exc))
+
+check("a single-symbol list is still accepted",
+      SyntheticRepository().fetch(["AAPL"], "2020-01-01", "2020-03-01").symbols
+      == ["AAPL"])
+
+# These caches key on the request including its end date, so a daily
+# scheduled run (end = "today") writes a new entry every day and never
+# reads it again -- unbounded growth at a zero hit rate on the live path.
+# Pruning is by access time, so a window you keep returning to survives.
+_cache_dir = tempfile.mkdtemp()
+for _name, _age_days in (("stale.csv.gz", 60), ("recent.csv.gz", 1)):
+    _p = os.path.join(_cache_dir, _name)
+    with open(_p, "w") as _fh:
+        _fh.write("x")
+    _t = time.time() - _age_days * 86_400
+    os.utime(_p, (_t, _t))
+check("prune_cache removes entries untouched past the age limit",
+      prune_cache(_cache_dir, max_age_days=30) == 1)
+check("and keeps recently-accessed ones",
+      sorted(os.listdir(_cache_dir)) == ["recent.csv.gz"])
+check("prune_cache is a safe no-op on a missing or disabled cache dir",
+      prune_cache(None) == 0 and prune_cache("/nonexistent/path/xyz") == 0)
+check("a tuple of symbols is still accepted",
+      SyntheticRepository().fetch(("X", "Y"), "2020-01-01", "2020-03-01").symbols
+      == ["X", "Y"])
+check("omitting symbols entirely still yields the default universe",
+      SyntheticRepository(n_symbols=4).fetch(
+          start="2020-01-01", end="2020-03-01").symbols
+      == ["SYN000", "SYN001", "SYN002", "SYN003"])
 
 print()
 print("=" * 72)

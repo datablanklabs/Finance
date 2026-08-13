@@ -13,7 +13,10 @@ from qbt import (
     OrderIntent, PortfolioState, RiskGate, SyntheticRepository,
 )
 from qbt.broker import BrokerOrder, MockBroker
-from qbt.orders import AuditLog, ExecutionPolicy, OrderManager
+from qbt.orders import (
+    AuditLog, ExecutionPolicy, ExecutionReport, OrderManager, _clean_broker_rejection,
+)
+from qbt.risk import as_session_date
 
 FAILS = []
 WORK = "/tmp/qbt_orders_test"
@@ -278,7 +281,7 @@ _drift_path = fresh("drift_refit_om")
 _drift_om = OrderManager(broker=_drift_broker, policy=_drift_policy,
                          audit=AuditLog(os.path.join(_drift_path, "a.jsonl"), stdout=False),
                          journal_path=os.path.join(_drift_path, "journal.jsonl"))
-_drift_report = _drift_om.execute(_drift_plan, strategy_name="drift-refit")
+_drift_report = _drift_om.execute(_drift_plan, strategy_name="drift-refit", now=MARKET_HOURS)
 check("a plan re-scaled to exactly the cap survives normal equity drift by "
       "execution time, instead of getting hard-aborted",
       _drift_report.aborted_reason is None, _drift_report.aborted_reason)
@@ -606,10 +609,9 @@ check("recover() finds nothing dangling after a round-up-to-1 retry succeeded",
       tiny_recover.empty)
 
 # The same sub-one-share target, but as a marginal top-up on a position
-# already held (current_weight != 0) -- must still skip cleanly, not round
-# up. Forcing a full extra share for a small rebalance nudge would be a
-# much bigger trade than intended, unlike establishing a position from
-# nothing, where the target was already going to be small.
+# already held (current_weight != 0), with a truly small delta (< 0.5
+# share) -- must still skip cleanly. Forcing a full extra share for a tiny
+# rebalance nudge would be a much bigger trade than intended.
 topup_path = fresh("fractional_topup")
 topup_broker = MockBroker(prices=pd.Series({"DDD": 300.0}), cash=100_000.0)
 topup_broker.connect()
@@ -624,20 +626,209 @@ topup_om = OrderManager(
     AuditLog(os.path.join(topup_path, "a.jsonl"), stdout=False),
     os.path.join(topup_path, "j.jsonl"),
 )
-topup_intent = OrderIntent(symbol="DDD", side="buy", shares=0.848263, reference_price=300.0,
-                           notional=254.48, current_weight=0.08, target_weight=0.09)
+topup_intent = OrderIntent(symbol="DDD", side="buy", shares=0.312, reference_price=300.0,
+                           notional=93.6, current_weight=0.08, target_weight=0.085)
 topup_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[topup_intent],
-                      target_weights=pd.Series({"DDD": 0.09}),
+                      target_weights=pd.Series({"DDD": 0.085}),
                       current_weights=pd.Series({"DDD": 0.08}), decision=None)
 topup_report = topup_om.execute(topup_plan, strategy_name="frac-topup", now=now)
-check("a sub-one-share top-up on an existing position is still skipped, not "
-      "rounded up",
+check("a small (< 0.5 share) top-up on an existing position is still "
+      "skipped, not rounded",
       any("rounds down to 0" in s[1] for s in topup_report.skipped))
 
 topup_recover = topup_om.recover()
 check("a definitively-rejected top-up leaves nothing dangling -- recover() "
       "can't misresolve it as not_at_broker and HALT the next cycle",
       topup_recover.empty)
+
+# The real bug this session hit: XLK and IWM trims on a small, whole-
+# share-only account rounding-down-to-zero *every single cycle*, forever,
+# with no whole-share holding ever getting closer to target. A top-up or
+# trim delta that's already most of the way to a full share (>= 0.5) must
+# now round to the nearest whole share and actually execute, not stall
+# indefinitely just because it isn't a brand-new position.
+nearest_path = fresh("fractional_nearest")
+nearest_broker = MockBroker(prices=pd.Series({"EEE": 300.0}), cash=100_000.0,
+                            positions=pd.Series({"EEE": 5.0}))
+nearest_broker.connect()
+_real_nearest_place = nearest_broker.place_order
+nearest_calls = []
+def _nearest_place(symbol, side, quantity, *a, **kw):
+    nearest_calls.append(quantity)
+    if quantity != round(quantity):
+        raise _fractional_shares_error()
+    return _real_nearest_place(symbol, side, quantity, *a, **kw)
+nearest_broker.place_order = _nearest_place
+
+nearest_om = OrderManager(
+    nearest_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(nearest_path, "KILL")),
+    AuditLog(os.path.join(nearest_path, "a.jsonl"), stdout=False),
+    os.path.join(nearest_path, "j.jsonl"),
+)
+nearest_intent = OrderIntent(symbol="EEE", side="sell", shares=0.72, reference_price=300.0,
+                             notional=216.0, current_weight=0.30, target_weight=0.16)
+nearest_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=[nearest_intent],
+                        target_weights=pd.Series({"EEE": 0.16}),
+                        current_weights=pd.Series({"EEE": 0.30}), decision=None)
+nearest_report = nearest_om.execute(nearest_plan, strategy_name="frac-nearest", now=now)
+check("a trim delta >= 0.5 share rounds to the nearest whole share and "
+      "actually executes, instead of skipping forever",
+      nearest_calls == [0.72, 1.0], nearest_calls)
+check("the rounded trim actually lands",
+      any(o.symbol == "EEE" for o in nearest_report.submitted))
+
+nearest_recover = nearest_om.recover()
+check("recover() finds nothing dangling after a round-to-nearest retry succeeded",
+      nearest_recover.empty)
+
+# Confirmed live (2026-08): a *different* synchronous 400 -- "not enough
+# buying power" -- used to be misclassified as a genuinely unknown outcome
+# (only "fractional shares" was recognized as a definitive rejection),
+# which left a dangling journal entry for the next cycle's recover() to
+# wrongly HALT on, and `break` abandoned every remaining intent in the
+# plan even though they don't depend on this one's cash shortfall. Any
+# synchronous "API error 4xx" is now treated as definitive.
+def _buying_power_error():
+    inner = RuntimeError(
+        'MCP tool error: [TextContent(type=\'text\', text=\'API error 400: '
+        '{"detail":"Not enough buying power."}\', annotations=None, meta=None)]')
+    return ExceptionGroup("unhandled errors in a TaskGroup",
+                          [ExceptionGroup("unhandled errors in a TaskGroup", [inner])])
+
+
+bp_path = fresh("buying_power_rejection")
+bp_broker = MockBroker(prices=pd.Series({"XLI": 185.0, "IWM": 300.0}), cash=100_000.0,
+                       positions=pd.Series({"IWM": 1.0}))
+bp_broker.connect()
+_real_bp_place = bp_broker.place_order
+bp_calls = []
+def _bp_place(symbol, side, quantity, *a, **kw):
+    bp_calls.append((symbol, side))
+    if symbol == "XLI":
+        raise _buying_power_error()
+    return _real_bp_place(symbol, side, quantity, *a, **kw)
+bp_broker.place_order = _bp_place
+
+bp_om = OrderManager(
+    bp_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(bp_path, "KILL")),
+    AuditLog(os.path.join(bp_path, "a.jsonl"), stdout=False),
+    os.path.join(bp_path, "j.jsonl"),
+)
+bp_xli_intent = OrderIntent(symbol="XLI", side="buy", shares=0.89, reference_price=185.0,
+                            notional=164.65, current_weight=0.0, target_weight=0.16)
+bp_iwm_intent = OrderIntent(symbol="IWM", side="sell", shares=0.45, reference_price=300.0,
+                            notional=135.0, current_weight=0.30, target_weight=0.16)
+bp_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0,
+                   intents=[bp_xli_intent, bp_iwm_intent],
+                   target_weights=pd.Series({"XLI": 0.16, "IWM": 0.16}),
+                   current_weights=pd.Series({"XLI": 0.0, "IWM": 0.30}), decision=None)
+bp_report = bp_om.execute(bp_plan, strategy_name="bp-test")
+check("a non-fractional synchronous rejection (buying power) is reported "
+      "as a definitive rejection, not an unknown outcome",
+      any("rejected:" in r for i, r in bp_report.skipped if i.symbol == "XLI"),
+      bp_report.skipped)
+check("the skipped note shows the clean 'Insufficient buying power' message, "
+      "not the raw ExceptionGroup/TaskGroup dump",
+      any(r == "rejected: Insufficient buying power"
+          for i, r in bp_report.skipped if i.symbol == "XLI"),
+      bp_report.skipped)
+bp_audit = bp_om.audit.read()
+bp_rejected_row = bp_audit[bp_audit["event"] == "order_rejected"].iloc[0]
+check("the audit log's printed/queryable reason field is the clean message too",
+      bp_rejected_row["reason"] == "Insufficient buying power", bp_rejected_row["reason"])
+check("the audit log's raw field still preserves the full original exception "
+      "text, so nothing forensic is actually lost",
+      "ExceptionGroup" in bp_rejected_row["raw"]
+      and "Not enough buying power" in bp_rejected_row["raw"])
+check("the rest of the plan still executes after that rejection -- the "
+      "loop no longer breaks on every kind of confirmed rejection",
+      any(o.symbol == "IWM" for o in bp_report.submitted))
+
+bp_recover = bp_om.recover()
+check("nothing is left dangling for recover() to misresolve after a "
+      "non-fractional definitive rejection",
+      bp_recover.empty)
+
+# The exact real-money scenario this session actually hit: the original
+# fractional attempt gets rejected for fractional shares, rounds up to one
+# whole share (a brand-new position), and *that* retry then hits a
+# *different* rejection -- not enough buying power, since rounding up
+# costs more than the fractional target did. The retry's own except-block
+# used to have no 4xx-detection at all (any exception there was
+# unconditionally "unknown outcome"), so this exact case slipped through.
+retry_bp_broker = MockBroker(prices=pd.Series({"XLI": 185.0, "IWM": 300.0}), cash=100_000.0,
+                             positions=pd.Series({"IWM": 1.0}))
+retry_bp_broker.connect()
+_real_retry_bp_place = retry_bp_broker.place_order
+retry_bp_calls = []
+def _retry_bp_place(symbol, side, quantity, *a, **kw):
+    retry_bp_calls.append((symbol, quantity))
+    if symbol == "XLI" and quantity != 1.0:
+        raise _fractional_shares_error()
+    if symbol == "XLI" and quantity == 1.0:
+        raise _buying_power_error()
+    return _real_retry_bp_place(symbol, side, quantity, *a, **kw)
+retry_bp_broker.place_order = _retry_bp_place
+
+retry_bp_path = fresh("retry_buying_power")
+retry_bp_om = OrderManager(
+    retry_bp_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(retry_bp_path, "KILL")),
+    AuditLog(os.path.join(retry_bp_path, "a.jsonl"), stdout=False),
+    os.path.join(retry_bp_path, "j.jsonl"),
+)
+retry_bp_xli = OrderIntent(symbol="XLI", side="buy", shares=0.8904, reference_price=185.0,
+                           notional=164.72, current_weight=0.0, target_weight=0.16)
+retry_bp_iwm = OrderIntent(symbol="IWM", side="sell", shares=0.45, reference_price=300.0,
+                           notional=135.0, current_weight=0.30, target_weight=0.16)
+retry_bp_plan = LivePlan(
+    asof=pd.Timestamp.now(), equity=100_000.0, intents=[retry_bp_xli, retry_bp_iwm],
+    target_weights=pd.Series({"XLI": 0.16, "IWM": 0.16}),
+    current_weights=pd.Series({"XLI": 0.0, "IWM": 0.30}), decision=None,
+)
+retry_bp_report = retry_bp_om.execute(retry_bp_plan, strategy_name="retry-bp-test")
+check("the retry itself hitting a different definitive rejection (buying "
+      "power) is also classified correctly, not as an unknown outcome",
+      retry_bp_calls[:2] == [("XLI", 0.8904), ("XLI", 1.0)]
+      and any("rejected:" in r for i, r in retry_bp_report.skipped if i.symbol == "XLI"),
+      retry_bp_calls)
+check("the plan still continues past the retry's own rejection too",
+      any(o.symbol == "IWM" for o in retry_bp_report.submitted))
+check("the retry's own rejection is also reported with the clean message, "
+      "not the raw exception dump",
+      any(r == "rejected: Insufficient buying power"
+          for i, r in retry_bp_report.skipped if i.symbol == "XLI"),
+      retry_bp_report.skipped)
+retry_bp_recover = retry_bp_om.recover()
+check("nothing is left dangling after the retry's own definitive rejection",
+      retry_bp_recover.empty)
+
+# _clean_broker_rejection() directly: both confirmed-live shapes, plus a
+# fallback check that an unrecognized 4xx body is never silently swallowed
+# -- a rejection reason nobody's seen before should stay fully visible,
+# not get eaten by a pattern match that only expects two known shapes.
+check("cleans the 'not enough buying power' detail shape, with the "
+      "specific rewording requested (not just a verbatim passthrough)",
+      _clean_broker_rejection(repr(_buying_power_error())) == "Insufficient buying power")
+check("cleans the 'cannot include fractional shares' field-errors shape",
+      _clean_broker_rejection(repr(_fractional_shares_error()))
+      == "Order quantity cannot include fractional shares")
+_unrecognized_error_text = (
+    "RuntimeError('MCP tool error: [TextContent(type=\\'text\\', text=\\'"
+    "API error 422: {\"nested\": {\"still\": \"unrecognized shape\"}}\\', "
+    "annotations=None, meta=None)]')"
+)
+check("an unrecognized 4xx JSON shape falls back to the untouched original "
+      "text instead of being silently hidden or mis-cleaned",
+      _clean_broker_rejection(_unrecognized_error_text) == _unrecognized_error_text)
+check("plain text with no 'API error 4xx' marker at all also falls back "
+      "unchanged (e.g. a 5xx or a non-JSON body)",
+      _clean_broker_rejection("boom, no structure here") == "boom, no structure here")
 
 # The exact real-money scenario this session hit: a fractional-share
 # rejection triggers a retry at a whole-share size, the retry *itself* then
@@ -843,6 +1034,59 @@ shared_ledger.record(today)
 check("a shared ledger correctly reports zero remaining after one recorded trade",
       shared_ledger.remaining(today, equity=1_000.0) == 0)
 
+# The naive/aware seam. This is what actually happens in production and is
+# NOT what the check above exercises: that one passes a tz-aware `today` to
+# both record() and remaining(), so both sides matched and the bug hid.
+# In run_cycle.py the two sides come from different places --
+# OrderManager._session_date() records a tz-aware America/New_York midnight,
+# while LiveSignalRunner passes a tz-naive *panel date* as asof -- and
+# comparing them raised TypeError inside count(). It surfaced as a permanent
+# outage, not one bad cycle: run_cycle aborts before save_day_trade_ledger()
+# can rewrite the file, so every later run reloads the same poisoned event.
+seam_om, seam_broker, seam_path = make("pdt_tz_seam", dry_run=False)
+aware_session = seam_om._session_date(
+    datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc))
+check("OrderManager._session_date() resolves the session in the market tz",
+      aware_session.tzinfo is not None and str(aware_session.date()) == "2026-08-13",
+      repr(aware_session))
+
+seam_ledger = DayTradeLedger()
+seam_ledger.record(aware_session)
+check("record() stores a tz-naive session date regardless of what it's given",
+      seam_ledger.events[0].tzinfo is None, repr(seam_ledger.events[0]))
+
+naive_asof = pd.Timestamp("2026-08-14")   # exactly what a PricePanel date is
+try:
+    seam_remaining = seam_ledger.remaining(naive_asof, equity=1_000.0)
+    seam_ok, seam_detail = True, f"remaining={seam_remaining}"
+except TypeError as exc:
+    seam_ok, seam_detail = False, repr(exc)
+check("a tz-aware recorded session date and a tz-naive panel asof compare "
+      "without raising -- the exact live sequence that bricked the cycle",
+      seam_ok, seam_detail)
+check("and the day trade is actually counted, not silently dropped",
+      seam_ledger.count(naive_asof) == 1, seam_ledger.count(naive_asof))
+
+# The mirror image: events already persisted in the old tz-aware format must
+# load and count cleanly rather than re-raising forever. count() normalises
+# on read, not just write, precisely so an existing poisoned state file heals
+# itself instead of needing to be noticed and deleted by hand.
+legacy_ledger = DayTradeLedger()
+legacy_ledger.events = [pd.Timestamp("2026-08-13T00:00:00-04:00")]
+try:
+    legacy_count = legacy_ledger.count(pd.Timestamp("2026-08-14"))
+    legacy_ok, legacy_detail = True, f"count={legacy_count}"
+except TypeError as exc:
+    legacy_ok, legacy_detail = False, repr(exc)
+check("a pre-fix tz-aware event assigned straight onto .events still counts, "
+      "so an already-written state file heals rather than failing forever",
+      legacy_ok and legacy_count == 1, legacy_detail)
+
+check("as_session_date() is idempotent on an already-naive date",
+      as_session_date(as_session_date(aware_session)) == as_session_date(aware_session))
+check("as_session_date() strips intraday time to the session date",
+      as_session_date(pd.Timestamp("2026-08-13 15:47:12")) == pd.Timestamp("2026-08-13"))
+
 print()
 print("=" * 72)
 print("8. Reconciliation and audit stream")
@@ -1000,6 +1244,165 @@ check("an explicit success field is honored",
 cancel_broker._call_sync = lambda capability, arguments: {"success": False}
 check("an explicit success=False is honored, not just truthiness of the payload",
       cancel_broker.cancel_order("mock-1") is False)
+
+print()
+print("=" * 72)
+print("10. Matching, reporting and staleness edge cases")
+print("=" * 72)
+
+# Bucketed fingerprints put a hard edge in the middle of the tolerance
+# window they exist to provide. round() is banker's rounding, so a
+# journaled 0.89 buckets to 44 while a broker echoing 0.890001 -- a
+# difference 20,000x smaller than the 0.02 tolerance -- buckets to 45.
+# Equality on those tuples then reports a real, filled order as missing,
+# which recover() resolves as not_at_broker and halts the next cycle.
+_bnd = BrokerOrder(order_id="b1", symbol="XLF", side="buy",
+                   quantity=0.890001, state="filled")
+check("the premise: bucket equality breaks on a half-bucket boundary",
+      _bnd.fingerprint() != ("XLF", "buy", round(0.89 / 0.02)))
+check("matches() accepts a quantity inside the tolerance regardless of "
+      "where it falls relative to a bucket edge",
+      _bnd.matches("XLF", "buy", 0.89))
+for _q in (0.25, 0.45, 0.89, 1.11):
+    check(f"boundary quantity {_q} still matches under a 1e-6 broker rounding",
+          BrokerOrder(order_id="x", symbol="AAA", side="sell",
+                      quantity=_q + 1e-6, state="filled").matches("AAA", "sell", _q))
+check("matches() still rejects a genuinely different size",
+      not _bnd.matches("XLF", "buy", 0.95))
+check("matches() still requires the symbol to agree",
+      not _bnd.matches("XLK", "buy", 0.89))
+check("matches() still requires the side to agree",
+      not _bnd.matches("XLF", "sell", 0.89))
+
+# recover() must find an order the broker echoed back at a boundary-shifted
+# quantity, not resolve it as lost.
+_bnd_path = fresh("boundary_match")
+_bnd_broker = MockBroker(prices=pd.Series({"XLF": 100.0}), cash=10_000.0)
+_bnd_broker.connect()
+_bnd_om = OrderManager(_bnd_broker, ExecutionPolicy(dry_run=False),
+                       AuditLog(os.path.join(_bnd_path, "a.jsonl"), stdout=False),
+                       os.path.join(_bnd_path, "j.jsonl"))
+_bnd_om._journal(stage="submitting", plan_id="p1", intent_key="XLF:buy",
+                 symbol="XLF", side="buy", quantity=0.89)
+_bnd_broker.orders.append(BrokerOrder(
+    order_id="real-1", symbol="XLF", side="buy", quantity=0.890001,
+    state="filled", filled_quantity=0.890001,
+    created_at=datetime.now(timezone.utc)))
+_bnd_rec = _bnd_om.recover()
+check("recover() resolves a boundary-shifted quantity as found_at_broker, "
+      "not as a lost order that halts the next cycle",
+      list(_bnd_rec["outcome"]) == ["found_at_broker"], _bnd_rec.to_dict("records"))
+
+# A rejected order is not a submitted one. It used to be appended to
+# report.submitted regardless, so a cycle where every order bounced still
+# reported "3 submitted" -- the exact shape of the user's live run.
+_rej = ExecutionReport(plan_id="r", dry_run=False)
+_rej.rejected.append(BrokerOrder(order_id=None, symbol="XLI", side="buy",
+                                 quantity=1.0, state="rejected",
+                                 reject_reason="Insufficient buying power"))
+check("a rejected order is not counted as submitted",
+      len(_rej.submitted) == 0 and len(_rej.rejected) == 1)
+check("__repr__ names the rejection instead of calling it a submission",
+      "0 submitted" in repr(_rej) and "1 rejected" in repr(_rej), repr(_rej))
+check("accepted still covers everything that reached the broker",
+      len(_rej.accepted) == 1)
+check("to_frame still shows the rejected order and its reason",
+      len(_rej.to_frame()) == 1
+      and _rej.to_frame().iloc[0]["note"] == "Insufficient buying power")
+
+# The above only pins the dataclass shape. This drives it through execute()
+# with a broker that *returns* a rejected order (rather than raising), which
+# is the path that actually did the miscounting.
+_rejpath = fresh("rejected_routing")
+_rejbroker = MockBroker(prices=pd.Series({"AAA": 100.0, "BBB": 50.0}), cash=100_000.0)
+_rejbroker.connect()
+_real_rejplace = _rejbroker.place_order
+
+
+def _rej_place(symbol, side, quantity, *a, **kw):
+    if symbol == "AAA":
+        return BrokerOrder(order_id="rej-1", symbol="AAA", side=side,
+                           quantity=quantity, state="rejected",
+                           reject_reason="Insufficient buying power")
+    return _real_rejplace(symbol, side, quantity, *a, **kw)
+
+
+_rejbroker.place_order = _rej_place
+_rej_om = OrderManager(
+    _rejbroker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    kill_switch_path=os.path.join(_rejpath, "KILL")),
+    AuditLog(os.path.join(_rejpath, "a.jsonl"), stdout=False),
+    os.path.join(_rejpath, "j.jsonl"),
+)
+_rej_plan = LivePlan(
+    asof=pd.Timestamp.now(), equity=100_000.0,
+    intents=[
+        OrderIntent(symbol="AAA", side="buy", shares=1.0, reference_price=100.0,
+                    notional=100.0, current_weight=0.0, target_weight=0.01),
+        OrderIntent(symbol="BBB", side="buy", shares=2.0, reference_price=50.0,
+                    notional=100.0, current_weight=0.0, target_weight=0.01),
+    ],
+    target_weights=pd.Series({"AAA": 0.01, "BBB": 0.01}),
+    current_weights=pd.Series({"AAA": 0.0, "BBB": 0.0}), decision=None)
+_rej_report = _rej_om.execute(_rej_plan, strategy_name="rej-routing", now=now)
+check("execute() routes a broker-rejected order to .rejected, not .submitted",
+      [o.symbol for o in _rej_report.rejected] == ["AAA"]
+      and [o.symbol for o in _rej_report.submitted] == ["BBB"],
+      f"submitted={[o.symbol for o in _rej_report.submitted]} "
+      f"rejected={[o.symbol for o in _rej_report.rejected]}")
+check("the rejection is still journalled as a terminal outcome, so recover() "
+      "finds nothing dangling",
+      _rej_om.recover().empty)
+
+# reconcile(): a held symbol the broker won't quote cannot be weighed. It
+# used to read as actual_weight 0.0 -- indistinguishable from "we hold none
+# of it" -- turning a pricing gap into a full-size drift breach, which
+# detection_rules() rates "high".
+_unp_path = fresh("reconcile_unpriced")
+_unp_broker = MockBroker(prices=pd.Series({"XLF": 40.0}), cash=100.0,
+                         positions=pd.Series({"XLF": 5.0, "AAPL": 3.0}))
+_unp_broker.connect()
+_unp_om = OrderManager(_unp_broker, ExecutionPolicy(dry_run=True),
+                       AuditLog(os.path.join(_unp_path, "a.jsonl"), stdout=False),
+                       os.path.join(_unp_path, "j.jsonl"))
+_unp_plan = LivePlan(asof=pd.Timestamp("2026-08-13"), equity=300.0, intents=[],
+                     target_weights=pd.Series({"XLF": 0.6}),
+                     current_weights=pd.Series({"XLF": 0.6}), decision=None)
+_unp_rec = _unp_om.reconcile(_unp_plan)
+check("an unpriceable holding is flagged as not priced",
+      bool(_unp_rec.loc["AAPL", "priced"]) is False)
+check("and is not counted as a drift breach on a weight never computed",
+      bool(_unp_rec.loc["AAPL", "breach"]) is False
+      and pd.isna(_unp_rec.loc["AAPL", "actual_weight"]))
+check("a normally-priced holding still reconciles and can still breach",
+      bool(_unp_rec.loc["XLF", "priced"]) is True)
+check("the unpriced symbols get their own audit event",
+      "reconcile_unpriced_positions" in _unp_om.audit.read()["event"].tolist())
+
+# preflight's staleness check localised plan.asof to UTC unconditionally,
+# which raises on an already-aware timestamp rather than converting -- the
+# same naive/aware seam that bricked DayTradeLedger.
+_tz_path = fresh("preflight_tz")
+_tz_broker = MockBroker(prices=pd.Series({"XLF": 40.0}), cash=1_000.0)
+_tz_broker.connect()
+_tz_om = OrderManager(_tz_broker, ExecutionPolicy(require_market_open=False),
+                      AuditLog(os.path.join(_tz_path, "a.jsonl"), stdout=False),
+                      os.path.join(_tz_path, "j.jsonl"))
+_tz_intent = OrderIntent(symbol="XLF", side="buy", shares=1.0, reference_price=40.0,
+                         notional=40.0, current_weight=0.0, target_weight=0.04)
+for _label, _asof in (("naive", pd.Timestamp("2026-08-13")),
+                      ("tz-aware", pd.Timestamp("2026-08-13", tz="America/New_York"))):
+    _tz_plan = LivePlan(asof=_asof, equity=1_000.0, intents=[_tz_intent],
+                        target_weights=pd.Series({"XLF": 0.04}),
+                        current_weights=pd.Series({"XLF": 0.0}), decision=None)
+    try:
+        _tz_ok, _ = _tz_om.preflight(_tz_plan, _tz_broker.get_account(),
+                                     now=datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc))
+        check(f"preflight handles a {_label} plan.asof without raising", _tz_ok)
+    except TypeError as exc:
+        check(f"preflight handles a {_label} plan.asof without raising",
+              False, repr(exc))
 
 print()
 print("=" * 72)
