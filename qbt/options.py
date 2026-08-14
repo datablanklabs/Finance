@@ -143,7 +143,7 @@ class OptionsPanel:
         known = self.as_of(date).frame
         if known.empty:
             return pd.DataFrame(columns=self.metrics)
-        latest = known.sort_values("as_of_date").drop_duplicates(
+        latest = known.sort_values(["as_of_date", "period_end"]).drop_duplicates(
             subset=["symbol", "metric"], keep="last"
         )
         return latest.pivot(index="symbol", columns="metric", values="value")

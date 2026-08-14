@@ -977,8 +977,21 @@ class MultiFactorCrossSectional:
     @staticmethod
     def _zscore(s: pd.Series) -> pd.Series:
         mu, sd = s.mean(), s.std(ddof=0)
-        if not sd or not np.isfinite(sd) or sd == 0.0:
-            return pd.Series(0.0, index=s.index)
+        if not np.isfinite(sd):
+            # A non-finite sd means the factor could not be measured at all
+            # (every observation NaN), which is *not* the same as "measured,
+            # and everyone scored alike". Returning zeros for it would let a
+            # missing factor pass silently through the dropna(how="any")
+            # below and contribute a confident nothing to every name's
+            # score -- exactly the "silently scored on a subset" case this
+            # class's docstring says it avoids.
+            return pd.Series(np.nan, index=s.index, dtype=float)
+        if sd == 0.0:
+            # Genuinely no cross-sectional dispersion: the factor was
+            # measured and simply does not separate anyone today. Zero for
+            # everyone is the right contribution, and names missing an
+            # individual reading still carry NaN through.
+            return pd.Series(0.0, index=s.index).mask(s.isna())
         return (s - mu) / sd
 
     def score(self, view: PricePanel) -> pd.Series:

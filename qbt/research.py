@@ -199,12 +199,22 @@ def return_autocorrelation(
     rets = panel.returns()
     n_dates, n_symbols = rets.shape
     date_idx = np.repeat(np.arange(n_dates), n_symbols)
+    # Standardise each symbol before pooling, which is what makes this "the
+    # typical name" rather than "whichever name is loudest". Without it the
+    # pooled correlation is dominated by the highest-variance symbols: on a
+    # universe of one high-vol trending name and three low-vol mean-reverting
+    # ones, the unstandardised pooled figure reads +0.57 while the typical
+    # name is -0.29 -- not merely imprecise, the opposite sign, and this
+    # function's whole documented use is reading that sign as momentum
+    # versus reversal.
+    sd = rets.std(ddof=0)
+    z = (rets - rets.mean()) / sd.replace(0.0, np.nan)
     rows = {}
     for lag in lags:
         if pooled:
-            a = rets.shift(lag)
+            a = z.shift(lag)
             x = a.to_numpy().ravel()
-            y = rets.to_numpy().ravel()
+            y = z.to_numpy().ravel()
             ok = np.isfinite(x) & np.isfinite(y)
             if ok.sum() < 100:
                 rows[lag] = {"autocorr": np.nan, "n": int(ok.sum())}
@@ -330,6 +340,7 @@ class ParameterSweep:
     def run(self, progress: bool = False) -> pd.DataFrame:
         rows = []
         combos = self.combinations()
+        n_failed = 0
         for i, params in enumerate(combos, 1):
             if progress:
                 print(f"  [{i}/{len(combos)}] {params}", flush=True)
@@ -337,16 +348,46 @@ class ParameterSweep:
                 metrics = self.evaluate(**params)
             except Exception as exc:  # keep the sweep alive
                 metrics = {"error": repr(exc)}
+                n_failed += 1
             rows.append({**params, **metrics})
+        # Say so. Swallowing the exception is right -- one bad corner of the
+        # grid shouldn't cost you the other 35 results -- but swallowing it
+        # *silently* means a sweep where most configurations blew up reads
+        # as a clean, narrow sweep, and the dispersion this class exists to
+        # show you is computed over whatever happened to survive.
+        if n_failed:
+            print(f"  WARNING: {n_failed} of {len(combos)} configurations "
+                  f"raised and have no metrics; see the 'error' column. "
+                  f"stability() reports only the {len(combos) - n_failed} "
+                  f"that completed.", flush=True)
         return pd.DataFrame(rows)
 
     @staticmethod
     def stability(df: pd.DataFrame, metric: str = "sharpe") -> pd.Series:
-        """Distribution of a metric across the grid."""
+        """Distribution of a metric across the grid.
+
+        ``n_failed`` counts rows that carry an ``error`` instead of a
+        metric. Read it before the rest: every other number here describes
+        only the configurations that completed, so a healthy-looking spread
+        over 6 survivors of a 36-config grid is not a healthy grid.
+        """
+        n_failed = (
+            int(df["error"].notna().sum()) if "error" in df.columns else 0
+        )
+        # If every configuration raised, `metric` was never produced by
+        # anything and the column does not exist -- df[metric] would raise a
+        # bare KeyError naming the metric, which reads like "you asked for
+        # the wrong column" rather than "your whole sweep failed". That is
+        # the one case where this summary is most worth having.
+        if metric not in df.columns:
+            return pd.Series({"n": 0.0, "n_failed": float(n_failed)})
         s = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if s.empty:
+            return pd.Series({"n": 0.0, "n_failed": float(n_failed)})
         return pd.Series(
             {
                 "n": float(len(s)),
+                "n_failed": float(n_failed),
                 "best": float(s.max()),
                 "median": float(s.median()),
                 "worst": float(s.min()),

@@ -50,7 +50,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from .data import prune_cache
+from .data import prune_cache, touch_cache
 
 __all__ = ["MacrosPanel", "MacrosRepository", "DEFAULT_INDICATORS"]
 
@@ -150,7 +150,7 @@ class MacrosPanel:
         known = self.as_of(date).frame
         if known.empty:
             return pd.Series(dtype=float)
-        latest = known.sort_values("as_of_date").drop_duplicates(
+        latest = known.sort_values(["as_of_date", "period_end"]).drop_duplicates(
             "metric", keep="last"
         )
         if max_age_days is not None:
@@ -167,7 +167,7 @@ class MacrosPanel:
         known = self.as_of(date).frame
         if known.empty:
             return pd.Series(dtype=float)
-        latest = known.sort_values("as_of_date").drop_duplicates(
+        latest = known.sort_values(["as_of_date", "period_end"]).drop_duplicates(
             "metric", keep="last"
         ).set_index("metric")
         age = (pd.Timestamp(date).normalize() - latest["as_of_date"]).dt.days
@@ -271,6 +271,7 @@ class MacrosRepository:
         for name, (series_id, lag_days) in self.indicators.items():
             path = self._cache_path(name, series_id, start_s, end_s)
             if path and os.path.exists(path):
+                touch_cache(path)      # a hit keeps it alive; see prune_cache
                 long = pd.read_csv(path, parse_dates=["period_end", "as_of_date"])
             else:
                 long = self._fetch_remote(name, series_id, lag_days, start_s, end_s)

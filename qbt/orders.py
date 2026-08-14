@@ -138,6 +138,17 @@ class ExecutionPolicy:
     allow_full_turnover_from_flat: bool = True
     max_orders_per_cycle: int = 12
     max_position_weight: float = 0.35
+    # Whether this account can hold short positions. Default False, which
+    # is what a cash or agentic brokerage account actually is.
+    #
+    # This has to be checked on the *whole plan*, before anything is sent,
+    # because a short leg is otherwise stopped one order at a time by the
+    # broker's own review -- which runs after preflight, per intent. A
+    # market-neutral plan then half-executes: the long legs fill, the short
+    # legs bounce, and the book that results is directional, hedged by
+    # nothing, and chosen by nobody. Confirmed against PairsTrading, which
+    # ships in this package and emits negative target weights by design.
+    allow_short: bool = False
     symbol_allowlist: tuple[str, ...] = ()
     require_review: bool = True
     allow_review_warnings: bool = False
@@ -598,13 +609,23 @@ class OrderManager:
             if not ok:
                 fatal.append(f"market closed: {why}")
 
-        # Compare like with like on the naive calendar date. plan.asof is a
-        # panel date (tz-naive today), but tz_localize("UTC") raises on an
-        # already-aware timestamp rather than converting -- the same
-        # naive/aware seam that broke DayTradeLedger, so it's closed the
-        # same way rather than left as a latent TypeError.
-        ref = pd.Timestamp(now or datetime.now(timezone.utc))
-        stale = (as_session_date(ref) - as_session_date(plan.asof)).days
+        # Compare like with like on the market's own calendar date. plan.asof
+        # is a panel date (tz-naive today), but tz_localize("UTC") raises on
+        # an already-aware timestamp rather than converting -- the same
+        # naive/aware seam that broke DayTradeLedger, so it's closed the same
+        # way rather than left as a latent TypeError.
+        #
+        # `now` is resolved through _session_date, not as_session_date
+        # directly: as_session_date drops the zone and keeps the wall clock,
+        # so feeding it a UTC "now" would compare a UTC date against an
+        # exchange-local asof and read one day stale for the hours between
+        # UTC midnight and the exchange's. Converting first makes both sides
+        # the same calendar.
+        # (_session_date returns a tz-aware market-local midnight, so it goes
+        # through as_session_date too -- subtracting an aware timestamp from
+        # a naive one is the very TypeError this is guarding against.)
+        ref_session = as_session_date(self._session_date(now))
+        stale = (ref_session - as_session_date(plan.asof)).days
         if stale > self.policy.max_data_staleness_days:
             fatal.append(f"plan data {stale}d stale "
                          f"(limit {self.policy.max_data_staleness_days}d)")
@@ -661,6 +682,22 @@ class OrderManager:
             fatal.append(f"target weight exceeds "
                          f"{self.policy.max_position_weight:.0%}: "
                          f"{dict(heavy.round(3))}")
+
+        # Reject the whole plan rather than let its short legs be picked off
+        # one at a time downstream -- see ExecutionPolicy.allow_short. This
+        # is deliberately a plan-level fatal, not a per-intent skip: the
+        # danger is precisely the *asymmetry* of a partial fill, so dropping
+        # only the shorts and sending the longs would be the bug, not the fix.
+        if not self.policy.allow_short:
+            shorts = plan.target_weights[plan.target_weights < -1e-9]
+            if not shorts.empty:
+                fatal.append(
+                    f"strategy proposes short positions but this account is "
+                    f"not short-capable: {dict(shorts.round(3))}. Sending only "
+                    "the long legs would leave an unhedged book -- set "
+                    "ExecutionPolicy(allow_short=True) if the account really "
+                    "can short."
+                )
 
         for w in plan.warnings:
             notes.append(f"plan warning: {w}")

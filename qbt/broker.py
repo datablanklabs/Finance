@@ -38,7 +38,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, Sequence
 
 import numpy as np
@@ -270,9 +270,20 @@ class MockBroker:
     def review_order(self, symbol: str, side: str, quantity: float,
                      order_type: str = "market", **kw) -> dict:
         self._require()
-        side = side.lower()
-        self.call_log.append(("review_order", {"symbol": symbol, "side": side,
+        self.call_log.append(("review_order", {"symbol": symbol,
+                                               "side": side.lower(),
                                                "quantity": quantity}))
+        return self._review(symbol, side, quantity)
+
+    def _review(self, symbol: str, side: str, quantity: float) -> dict:
+        """The review itself, without the call-log entry.
+
+        ``place_order`` needs this check but must not journal a
+        ``review_order`` call for it: a test counting how many times the
+        manager reviewed an order would otherwise see one phantom entry per
+        placement and conclude the review gate ran twice.
+        """
+        side = side.lower()
         px = float(self.prices.get(symbol, np.nan))
         warnings = []
         if symbol.upper() in self.fail_on_symbols:
@@ -308,7 +319,7 @@ class MockBroker:
         oid = f"mock-{self._seq:05d}"
         now = datetime.now(timezone.utc)
 
-        review = self.review_order(symbol, side, quantity, order_type)
+        review = self._review(symbol, side, quantity)
         if not review["ok"] or self.rng.random() < self.reject_rate:
             order = BrokerOrder(
                 order_id=oid, symbol=symbol, side=side, quantity=quantity,
@@ -823,7 +834,16 @@ class RobinhoodMCPBroker:
             since_key = b.resolve_arg("since", ("start_date", "since", "after",
                                                  "created_after", "start"))
             if since_key:
-                args[since_key] = since.date().isoformat()
+                # Widen by a day before truncating to a date. `since` is a
+                # UTC instant, and which calendar date that lands on depends
+                # on the server's timezone: an order placed at 20:00 New York
+                # is already "tomorrow" in UTC, so sending the bare UTC date
+                # can ask for a window that starts *after* the order we're
+                # looking for. Erring wide is free -- recover() fingerprints
+                # every returned order anyway and consumes at most one match
+                # -- whereas erring narrow resolves a real fill as
+                # not_at_broker and halts the next cycle.
+                args[since_key] = (since - timedelta(days=1)).date().isoformat()
         recs = _as_records(self._call_sync("orders", args))
         orders = []
         for r in recs:

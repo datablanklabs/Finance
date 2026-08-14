@@ -34,6 +34,7 @@ __all__ = [
     "OpenBBRepository",
     "SyntheticRepository",
     "prune_cache",
+    "touch_cache",
 ]
 
 
@@ -199,9 +200,29 @@ class PricePanel:
         )
 
 
+def touch_cache(path: str | None) -> None:
+    """Mark a cache entry as used, now.
+
+    Called on every cache *hit*. Pruning below keys on mtime, and a plain
+    read does not update mtime -- nor, on many modern filesystems, atime
+    either: macOS APFS and Linux ``relatime``/``noatime`` mounts all skip
+    atime updates on read, which was measured here (a genuine read left
+    ``st_atime`` untouched). So "last used" has to be recorded explicitly
+    rather than inferred from the filesystem, or a cache entry read every
+    single day still looks untouched since the day it was written and gets
+    swept for no reason.
+    """
+    if not path:
+        return
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
 def prune_cache(cache_dir: str | None, max_age_days: int = 30,
                 pattern: str = "*.csv.gz") -> int:
-    """Delete cache entries not read in ``max_age_days``. Returns the count.
+    """Delete cache entries unused for ``max_age_days``. Returns the count.
 
     These caches key on the request, *including its end date*. That's
     correct for research -- the same fixed window re-fetched all afternoon
@@ -210,9 +231,12 @@ def prune_cache(cache_dir: str | None, max_age_days: int = 30,
     Left alone that grows without bound while its hit rate on the live path
     stays at zero, so the entries that are actually dead get swept.
 
-    Keyed on access time, not creation, so a window you keep coming back to
-    survives however old it is. Failures are ignored on purpose: a cache is
-    an optimisation, and being unable to tidy it must never take down a
+    "Unused" means mtime, which :func:`touch_cache` refreshes on every hit
+    -- see there for why the filesystem's own access time can't be trusted
+    to answer this. A window you keep coming back to therefore survives
+    however old it is; one written once by a scheduled run and never read
+    again ages out. Failures are ignored on purpose: a cache is an
+    optimisation, and being unable to tidy it must never take down a
     trading cycle.
     """
     if not cache_dir or not os.path.isdir(cache_dir):
@@ -221,7 +245,7 @@ def prune_cache(cache_dir: str | None, max_age_days: int = 30,
     removed = 0
     for path in glob.glob(os.path.join(cache_dir, pattern)):
         try:
-            if os.path.getatime(path) < cutoff:
+            if os.path.getmtime(path) < cutoff:
                 os.remove(path)
                 removed += 1
         except OSError:
@@ -322,6 +346,7 @@ class OpenBBRepository:
         prune_cache(self.cache_dir)
         path = self._cache_path(symbols, start_s, end_s)
         if path and os.path.exists(path):
+            touch_cache(path)          # a hit keeps it alive; see prune_cache
             tidy = pd.read_csv(path, parse_dates=["date"])
         else:
             tidy = self._fetch_remote(symbols, start_s, end_s)
