@@ -323,6 +323,29 @@ check("max_age_days=0 is rejected as a construction error",
       _raises(lambda: MacroRegimeFilter(inner=EqualWeightBuyHold(), metric="vix",
                                         max_level=35.0, max_age_days=0), ValueError))
 
+# Two readings for one metric sharing a release date: a same-day revision, a
+# backfill publishing several periods at once, a 10-K and 10-Q filed
+# together. The tie used to break on incoming frame order, so reversing the
+# rows flipped the answer -- the newer *period* did not reliably win. All
+# four panels resolve "latest known reading" the same way and now sort on
+# (as_of_date, period_end) so the result is a property of the data.
+_tie_day = pd.Timestamp("2024-01-10")
+_older = ("x", pd.Timestamp("2023-09-30"), _tie_day, 1.0)
+_newer = ("x", pd.Timestamp("2023-12-31"), _tie_day, 2.0)
+_cols = ["metric", "period_end", "as_of_date", "value"]
+for _label, _rows in (("older row first", [_older, _newer]),
+                      ("newer row first", [_newer, _older])):
+    _tp = MacrosPanel(frame=pd.DataFrame(_rows, columns=_cols))
+    check(f"same-day tie resolves to the newer period ({_label})",
+          float(_tp.snapshot(_tie_day)["x"]) == 2.0,
+          float(_tp.snapshot(_tie_day)["x"]))
+
+check("a genuinely later release still wins over an earlier one",
+      float(MacrosPanel(frame=pd.DataFrame(
+          [("x", pd.Timestamp("2023-12-31"), pd.Timestamp("2024-01-05"), 2.0),
+           ("x", pd.Timestamp("2023-09-30"), pd.Timestamp("2024-01-09"), 9.0)],
+          columns=_cols)).snapshot(_tie_day)["x"]) == 9.0)
+
 print()
 print("=" * 72)
 if FAILS:

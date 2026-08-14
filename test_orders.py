@@ -3,7 +3,7 @@
 import json
 import os
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -1403,6 +1403,113 @@ for _label, _asof in (("naive", pd.Timestamp("2026-08-13")),
     except TypeError as exc:
         check(f"preflight handles a {_label} plan.asof without raising",
               False, repr(exc))
+
+print()
+print("=" * 72)
+print("11. Short positions on an account that cannot short")
+print("=" * 72)
+
+# PairsTrading ships in this package and emits negative target weights by
+# design. Nothing used to object: preflight passed, the long legs filled,
+# and the short legs were picked off one at a time by the broker's own
+# per-intent review -- which runs *after* preflight. The result was a
+# market-neutral plan executed as a directional book, hedged by nothing.
+# That is the "partially executed rebalance is a portfolio nobody chose"
+# failure this module's docstring says preflight exists to prevent.
+_short_intents = [
+    OrderIntent(symbol="AAA", side="buy", shares=10.0, reference_price=100.0,
+                notional=1_000.0, current_weight=0.0, target_weight=0.25),
+    OrderIntent(symbol="BBB", side="sell", shares=-20.0, reference_price=50.0,
+                notional=-1_000.0, current_weight=0.0, target_weight=-0.25),
+]
+_short_plan = LivePlan(
+    asof=pd.Timestamp("2026-07-21"), equity=100_000.0, intents=_short_intents,
+    target_weights=pd.Series({"AAA": 0.25, "BBB": -0.25}),
+    current_weights=pd.Series({"AAA": 0.0, "BBB": 0.0}), decision=None)
+
+_short_path = fresh("short_guard")
+_short_broker = MockBroker(prices=pd.Series({"AAA": 100.0, "BBB": 50.0}),
+                           cash=100_000.0)
+_short_broker.connect()
+
+
+def _short_om(**policy_kw):
+    return OrderManager(
+        _short_broker,
+        ExecutionPolicy(dry_run=False, require_review=True,
+                        require_market_open=False, max_plan_notional=1e9,
+                        max_order_notional=1e9,
+                        kill_switch_path=os.path.join(_short_path, "KILL"),
+                        **policy_kw),
+        AuditLog(os.path.join(_short_path, "a.jsonl"), stdout=False),
+        os.path.join(_short_path, "j.jsonl"),
+    )
+
+
+_short_ok, _short_notes = _short_om().preflight(
+    _short_plan, _short_broker.get_account(), now=MARKET_HOURS)
+check("a plan with short target weights fails preflight by default",
+      not _short_ok, "; ".join(_short_notes)[:120])
+check("and the failure names shorting, not some incidental limit",
+      any("short" in n.lower() for n in _short_notes))
+
+_short_report = _short_om().execute(_short_plan, strategy_name="short-guard",
+                                    now=MARKET_HOURS)
+check("nothing at all is sent -- not even the long leg that would have "
+      "filled fine on its own",
+      _short_report.aborted and not _short_report.submitted,
+      f"submitted={[o.symbol for o in _short_report.submitted]}")
+
+_ok_long, _ = _short_om().preflight(
+    LivePlan(asof=pd.Timestamp("2026-07-21"), equity=100_000.0,
+             intents=[_short_intents[0]],
+             target_weights=pd.Series({"AAA": 0.25}),
+             current_weights=pd.Series({"AAA": 0.0}), decision=None),
+    _short_broker.get_account(), now=MARKET_HOURS)
+check("a long-only plan is unaffected by the guard", _ok_long)
+
+_allow_ok, _ = _short_om(allow_short=True).preflight(
+    _short_plan, _short_broker.get_account(), now=MARKET_HOURS)
+check("allow_short=True lets a genuinely short-capable account through",
+      _allow_ok)
+
+# A zero target weight is not a short -- the guard must not fire on the
+# ordinary "exit this position" case, which is most of what a sell is.
+_flat_ok, _ = _short_om().preflight(
+    LivePlan(asof=pd.Timestamp("2026-07-21"), equity=100_000.0,
+             intents=[OrderIntent(symbol="AAA", side="sell", shares=-5.0,
+                                  reference_price=100.0, notional=-500.0,
+                                  current_weight=0.25, target_weight=0.0)],
+             target_weights=pd.Series({"AAA": 0.0}),
+             current_weights=pd.Series({"AAA": 0.25}), decision=None),
+    _short_broker.get_account(), now=MARKET_HOURS)
+check("selling a position down to flat is not treated as shorting", _flat_ok)
+
+# MockBroker used to log a review_order entry for the review place_order
+# runs internally, so a test counting reviews saw one phantom per placement.
+_log_broker = MockBroker(prices=pd.Series({"AAA": 10.0}), cash=1_000.0)
+_log_broker.connect()
+_log_broker.place_order("AAA", "buy", 1.0)
+check("place_order logs exactly one call, not a phantom review too",
+      [c[0] for c in _log_broker.call_log] == ["place_order"],
+      [c[0] for c in _log_broker.call_log])
+_log_broker.review_order("AAA", "buy", 1.0)
+check("an explicit review_order is still logged",
+      [c[0] for c in _log_broker.call_log] == ["place_order", "review_order"])
+check("and still returns the same verdict it always did",
+      _log_broker.review_order("AAA", "buy", 10_000.0)["ok"] is False)
+
+# get_orders' since filter is truncated to a date, and which date a UTC
+# instant lands on depends on the server's timezone. 21:00 New York is
+# already "tomorrow" in UTC, so the bare UTC date could ask for a window
+# starting after the very order recover() is looking for.
+_since = datetime(2026, 8, 14, 1, 0, tzinfo=timezone.utc)   # 21:00 Aug 13 ET
+check("the premise: the bare UTC date of a late-evening ET order is the "
+      "following day",
+      _since.date().isoformat() == "2026-08-14")
+check("get_orders widens by a day before truncating, so the window can "
+      "never start after the order it's hunting",
+      (_since - timedelta(days=1)).date().isoformat() == "2026-08-13")
 
 print()
 print("=" * 72)

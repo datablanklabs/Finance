@@ -18,7 +18,7 @@ from qbt import (
     return_autocorrelation, trailing_signal, walk_forward_splits,
     ParameterSweep, sharpe_haircut,
 )
-from qbt.data import prune_cache
+from qbt.data import prune_cache, touch_cache
 from qbt.risk import RiskContext
 
 FAILS = []
@@ -688,6 +688,75 @@ check("lag-1 autocorrelation is negative (reversal built in)",
 check("n_effective is far smaller than the raw pooled n",
       ac.loc[1, "n_effective"] < ac.loc[1, "n"] / 10,
       f"n={ac.loc[1, 'n']:.0f}  n_effective={ac.loc[1, 'n_effective']:.0f}")
+
+# pooled=True documents itself as reflecting "the typical name rather than
+# the index", which requires standardising each symbol before stacking. It
+# didn't, so the pooled figure was dominated by whichever names had the
+# largest variance -- and not merely imprecisely: on a universe of one loud
+# trending name and three quiet mean-reverting ones the unstandardised
+# result came out +0.57 against a typical name of -0.29. The sign is the
+# entire documented use of this function.
+_ac_rng = np.random.default_rng(0)
+
+
+def _ar1(n, phi, scale, rng):
+    e = rng.normal(0, scale, n)
+    x = np.zeros(n)
+    for i in range(1, n):
+        x[i] = phi * x[i - 1] + e[i]
+    return x
+
+
+_ac_idx = pd.bdate_range("2020-01-01", periods=600)
+_ac_cols = {"LOUD": _ar1(600, +0.6, 0.10, _ac_rng)}
+for _k in range(3):
+    _ac_cols[f"QUIET{_k}"] = _ar1(600, -0.6, 0.005, _ac_rng)
+_ac_rets = pd.DataFrame(_ac_cols, index=_ac_idx)
+_ac_panel = PricePanel(close=100 * np.exp(_ac_rets.cumsum()))
+_ac_pooled = float(return_autocorrelation(_ac_panel, lags=[1]).loc[1, "autocorr"])
+_ac_per = _ac_panel.returns().apply(lambda s: s.autocorr(lag=1))
+check("the premise: one loud symbol trends while the quiet majority reverts",
+      _ac_per["LOUD"] > 0.4 and (_ac_per.drop("LOUD") < -0.4).all(),
+      {k: round(v, 3) for k, v in _ac_per.items()})
+check("pooled autocorrelation tracks the typical name, not the loudest one",
+      np.sign(_ac_pooled) == np.sign(_ac_per.mean()),
+      f"pooled={_ac_pooled:+.4f} mean_per_symbol={_ac_per.mean():+.4f}")
+check("and matches the mean of the per-symbol figures it claims to summarise",
+      abs(_ac_pooled - float(_ac_per.mean())) < 0.02,
+      f"pooled={_ac_pooled:+.4f} mean_per_symbol={_ac_per.mean():+.4f}")
+
+# A sweep that mostly blew up used to look like a clean, narrow sweep.
+def _flaky_eval(a, b):
+    if a > 1:
+        raise RuntimeError("boom")
+    return {"sharpe": 0.5 * a + b}
+
+
+_flaky = ParameterSweep(grid={"a": [1, 2, 3], "b": [0, 1]},
+                        evaluate=_flaky_eval).run()
+_flaky_stab = ParameterSweep.stability(_flaky)
+check("stability() reports how many configurations failed",
+      _flaky_stab["n_failed"] == 4.0 and _flaky_stab["n"] == 2.0,
+      dict(_flaky_stab))
+_clean = ParameterSweep(grid={"a": [1], "b": [0, 1]},
+                        evaluate=_flaky_eval).run()
+check("a clean sweep reports zero failures",
+      ParameterSweep.stability(_clean)["n_failed"] == 0.0)
+check("a sweep where everything failed doesn't crash stability()",
+      ParameterSweep.stability(
+          ParameterSweep(grid={"a": [2, 3]}, evaluate=lambda a: _flaky_eval(a, 0)).run()
+      )["n_failed"] == 2.0)
+
+# MultiFactorCrossSectional._zscore returned 0.0 for an entirely unmeasurable
+# factor, which is a confident "no signal" rather than "no reading" -- it
+# survived the dropna(how="any") the docstring relies on.
+_mf_z = MultiFactorCrossSectional._zscore
+check("an entirely-NaN factor z-scores to NaN, so dropna can see it",
+      _mf_z(pd.Series([np.nan, np.nan, np.nan])).isna().all())
+check("a measured but undifferentiated factor still z-scores to zero",
+      (_mf_z(pd.Series([2.0, 2.0, 2.0])) == 0.0).all())
+check("a partially-missing factor keeps NaN only for the missing name",
+      _mf_z(pd.Series([1.0, 1.0, np.nan])).isna().tolist() == [False, False, True])
 check("n / n_effective roughly matches the symbol count",
       abs(ac.loc[1, "n"] / ac.loc[1, "n_effective"] - len(panel.symbols)) < 1,
       f"ratio={ac.loc[1, 'n'] / ac.loc[1, 'n_effective']:.1f}  "
@@ -975,6 +1044,38 @@ check("and keeps recently-accessed ones",
       sorted(os.listdir(_cache_dir)) == ["recent.csv.gz"])
 check("prune_cache is a safe no-op on a missing or disabled cache dir",
       prune_cache(None) == 0 and prune_cache("/nonexistent/path/xyz") == 0)
+
+# Pruning claims a reused entry survives. That has to be recorded
+# explicitly: a plain read updates neither mtime nor -- on macOS APFS and
+# Linux relatime/noatime mounts -- atime, which was measured here. Keying on
+# raw access time silently evicted entries read every single day.
+_reuse_dir = tempfile.mkdtemp()
+_reuse_path = os.path.join(_reuse_dir, "reused.csv.gz")
+with open(_reuse_path, "w") as _fh:
+    _fh.write("x")
+_stale_t = time.time() - 40 * 86_400
+os.utime(_reuse_path, (_stale_t, _stale_t))
+with open(_reuse_path) as _fh:      # a genuine read, the thing atime would track
+    _fh.read()
+check("the premise: a plain read does not refresh this filesystem's atime",
+      os.path.getatime(_reuse_path) < time.time() - 30 * 86_400)
+touch_cache(_reuse_path)
+check("touch_cache marks the entry as used now",
+      prune_cache(_reuse_dir, max_age_days=30) == 0
+      and os.path.exists(_reuse_path))
+
+# End to end: a 40-day-old entry served as a cache hit must survive the next
+# prune, with no network call involved.
+_hit_dir = tempfile.mkdtemp()
+_hit_repo = OpenBBRepository(provider="yfinance", cache_dir=_hit_dir)
+_hit_path = _hit_repo._cache_path(["A"], "2024-01-01", "2024-01-02")
+pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "symbol": ["A"],
+              "close": [1.0]}).to_csv(_hit_path, index=False)
+os.utime(_hit_path, (_stale_t, _stale_t))
+_hit_panel = _hit_repo.fetch(["A"], "2024-01-01", "2024-01-02")
+check("a cache hit is served without touching the network", _hit_panel.symbols == ["A"])
+check("and that hit keeps the entry alive through the next prune",
+      prune_cache(_hit_dir, max_age_days=30) == 0 and os.path.exists(_hit_path))
 check("a tuple of symbols is still accepted",
       SyntheticRepository().fetch(("X", "Y"), "2020-01-01", "2020-03-01").symbols
       == ["X", "Y"])

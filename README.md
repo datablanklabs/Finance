@@ -24,10 +24,10 @@ and production to drift apart.
 | `qbt/orders.py` | `OrderManager`: journal, preflight, reconciliation, audit |
 | `research.ipynb` | 49-cell research notebook, 30 code cells |
 | `run_cycle.py` | One trading cycle. Run on a schedule, never from the notebook |
-| `test_qbt.py` | 116 engine validation checks (strategies, engine, risk gate, research, panel validation) |
-| `test_orders.py` | 134 order-path checks, offline against `MockBroker` |
+| `test_qbt.py` | 129 engine validation checks (strategies, engine, risk gate, research, panel validation) |
+| `test_orders.py` | 145 order-path checks, offline against `MockBroker` |
 | `test_fundamentals.py` | 33 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
-| `test_macro.py` | 39 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter`, reading staleness |
+| `test_macro.py` | 42 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter`, reading staleness |
 | `test_corporate.py` | 38 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
 | `test_options.py` | 39 checks: `OptionsPanel`, daily-archive semantics |
 | `test_options_strategy.py` | 19 checks: `OptionsMeanReversion` |
@@ -77,10 +77,10 @@ pip install openbb-fmp                            # optional, for FundamentalsPa
 pip install openbb-fred                           # optional, for MacrosPanel (needs a free FRED key)
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
-python test_qbt.py                     # 116 engine checks, ~90s
-python test_orders.py                  # 134 order-path checks, ~10s
+python test_qbt.py                     # 129 engine checks, ~90s
+python test_orders.py                  # 145 order-path checks, ~10s
 python test_fundamentals.py            # 33 checks
-python test_macro.py                   # 39 checks
+python test_macro.py                   # 42 checks
 python test_corporate.py               # 38 checks
 python test_options.py                 # 39 checks
 python test_options_strategy.py        # 19 checks
@@ -261,6 +261,19 @@ cycle until FRED access is actually configured, and only `BreadthRegimeFilter`
 (which needs no external data — it's computed straight from the price panel)
 is doing any regime-based de-risking in the meantime. Safe, but worth knowing
 explicitly rather than assuming both overlays are live.
+
+### Short positions
+
+`ExecutionPolicy.allow_short` defaults to **False**, and preflight fails the
+whole plan if any target weight is negative. This is a plan-level abort on
+purpose. Short legs are otherwise stopped one at a time by the broker's own
+per-intent review, which runs *after* preflight — so a market-neutral plan
+half-executes: the long legs fill, the shorts bounce, and you hold a
+directional book nobody chose. Measured against `PairsTrading`, which ships
+here and emits negative weights by design: before the guard it submitted
+`['SYN004', 'SYN005']` long and skipped both hedges. Selling a position down
+to flat is not shorting and is unaffected. Set `allow_short=True` only if the
+account genuinely supports it.
 
 ### Idempotency without a broker-side key
 
