@@ -242,7 +242,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
                     help="actually submit orders (default is dry run)")
-    ap.add_argument("--max-order", type=float, default=250.0)
+    # $500 clears one whole share of every name in UNIVERSE (the tallest are
+    # GLD ~$392 and IWM ~$301), and clears the largest single position the
+    # risk layer will ask for on a ~$1k account -- GATE's max_weight=0.30 is
+    # ~$304, ExecutionPolicy's max_position_weight=0.35 is ~$354. Below that
+    # the cap and the weight limits disagree: a position the gate permits
+    # can't be built in one trade, and a whole-share-only instrument whose
+    # share costs more than the cap can't be entered at all (see the
+    # whole-share retry's own re-check in OrderManager.execute).
+    ap.add_argument("--max-order", type=float, default=500.0)
     ap.add_argument("--max-plan", type=float, default=5_000.0)
     ap.add_argument("--max-turnover", type=float, default=0.67)
     ap.add_argument("--synthetic", action="store_true",

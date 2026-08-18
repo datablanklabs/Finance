@@ -25,7 +25,7 @@ and production to drift apart.
 | `research.ipynb` | 49-cell research notebook, 30 code cells |
 | `run_cycle.py` | One trading cycle. Run on a schedule, never from the notebook |
 | `test_qbt.py` | 129 engine validation checks (strategies, engine, risk gate, research, panel validation) |
-| `test_orders.py` | 145 order-path checks, offline against `MockBroker` |
+| `test_orders.py` | 152 order-path checks, offline against `MockBroker` |
 | `test_fundamentals.py` | 33 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
 | `test_macro.py` | 42 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter`, reading staleness |
 | `test_corporate.py` | 38 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
@@ -78,7 +78,7 @@ pip install openbb-fred                           # optional, for MacrosPanel (n
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
 python test_qbt.py                     # 129 engine checks, ~90s
-python test_orders.py                  # 145 order-path checks, ~10s
+python test_orders.py                  # 152 order-path checks, ~10s
 python test_fundamentals.py            # 33 checks
 python test_macro.py                   # 42 checks
 python test_corporate.py               # 38 checks
@@ -261,6 +261,33 @@ cycle until FRED access is actually configured, and only `BreadthRegimeFilter`
 (which needs no external data — it's computed straight from the price panel)
 is doing any regime-based de-risking in the meantime. Safe, but worth knowing
 explicitly rather than assuming both overlays are live.
+
+### The per-order cap and whole-share instruments
+
+`--max-order` (default **$500**) caps a single order's notional. It is
+enforced per intent, skipping that order and continuing rather than aborting
+the plan.
+
+It is also re-checked on the **whole-share retry**. When a broker rejects a
+fractional size, `OrderManager` retries once at a whole-share quantity — a
+different, larger order than the one that originally cleared the cap, so it
+has to clear it again. The consequence is deliberate: any instrument whose
+*single share* costs more than the cap becomes untradeable rather than being
+bought over the limit.
+
+$500 is chosen against this universe and account size rather than picked
+round. It clears one whole share of every name in `UNIVERSE` (the tallest are
+GLD ~$392 and IWM ~$301), and it clears the largest single position the risk
+layer will ask for on ~$1,000 of equity: `GATE`'s `max_weight=0.30` is ~$304
+and `max_position_weight=0.35` is ~$354. Below roughly $400 the cap and the
+weight limits disagree — a position the gate permits cannot be built in one
+trade, and it can only be reached incrementally across cycles. At the earlier
+$250 default, IWM and GLD were not enterable at all.
+
+Two things this does *not* loosen: `--max-plan` (default $5,000) still caps
+the whole cycle, and `max_position_weight` still caps any single name's share
+of the book. Raising the per-order cap changes how large one *trade* may be,
+not how large a *position* may become.
 
 ### Short positions
 

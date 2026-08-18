@@ -1513,5 +1513,77 @@ check("get_orders widens by a day before truncating, so the window can "
 
 print()
 print("=" * 72)
+print("12. The whole-share retry is re-checked against the per-order cap")
+print("=" * 72)
+
+# max_order_notional is tested once, on the original intent, before
+# place_order. The fractional-shares retry then submits a *different, larger*
+# order: rounding 0.5 shares of a $300 ETF up to 1 turns a $150 intent into a
+# $300 order, and that used to walk straight past the cap. Live-relevant, not
+# theoretical -- IWM (~$300) and GLD (~$392) are both in run_cycle's universe
+# and both exceed the $250 default at a single share, and IWM has already hit
+# the fractional rejection in a real cycle.
+def _cap_retry_case(price, shares, cap):
+    path = fresh(f"cap_retry_{int(price)}_{int(cap)}")
+    broker = MockBroker(prices=pd.Series({"IWM": price}), cash=100_000.0)
+    broker.connect()
+    _real_place = broker.place_order
+    sent = []
+
+    def _place(symbol, side, quantity, *a, **kw):
+        sent.append(quantity)
+        if quantity != float(int(quantity)):
+            raise _fractional_shares_error()
+        return _real_place(symbol, side, quantity, *a, **kw)
+
+    broker.place_order = _place
+    om = OrderManager(
+        broker,
+        ExecutionPolicy(dry_run=False, require_review=False,
+                        require_market_open=False, max_order_notional=cap,
+                        max_plan_notional=1e9,
+                        kill_switch_path=os.path.join(path, "KILL")),
+        AuditLog(os.path.join(path, "a.jsonl"), stdout=False),
+        os.path.join(path, "j.jsonl"),
+    )
+    intent = OrderIntent(symbol="IWM", side="buy", shares=shares,
+                         reference_price=price, notional=shares * price,
+                         current_weight=0.0, target_weight=0.15)
+    plan = LivePlan(asof=pd.Timestamp("2026-07-21"),
+                    equity=broker.get_account().equity, intents=[intent],
+                    target_weights=pd.Series({"IWM": 0.15}),
+                    current_weights=pd.Series({"IWM": 0.0}), decision=None)
+    return sent, om.execute(plan, strategy_name="cap-retry", now=MARKET_HOURS), om
+
+
+_cap_sent, _cap_rep, _cap_om = _cap_retry_case(300.58, 0.5, 250.0)
+check("the premise: the original intent clears the cap on its own",
+      abs(0.5 * 300.58) < 250.0)
+check("the whole-share retry is blocked when one share exceeds the cap",
+      _cap_sent == [0.5] and not _cap_rep.submitted,
+      f"sent={_cap_sent} submitted={[o.symbol for o in _cap_rep.submitted]}")
+check("the skip reason names the share price and the cap, not just 'rejected'",
+      any("exceeds the per-order cap" in r for _i, r in _cap_rep.skipped),
+      [r for _i, r in _cap_rep.skipped])
+check("the blocked retry is audited with both quantities and the cap",
+      "order_notional_after_whole_share_retry"
+      in _cap_om.audit.read()["reason"].dropna().tolist())
+# The first attempt already wrote a "submitting" entry. Skipping the retry
+# without closing it would leave the next cycle's recover() treating a fully
+# known outcome as an unresolved in-flight order, and halting on it.
+check("the first attempt's write-ahead entry is closed, so recover() finds "
+      "nothing dangling and the next cycle doesn't halt",
+      _cap_om.recover().empty)
+
+_ok_sent, _ok_rep, _ = _cap_retry_case(300.58, 0.5, 400.0)
+check("raising the cap above one share lets the same retry through",
+      _ok_sent == [0.5, 1.0] and len(_ok_rep.submitted) == 1, _ok_sent)
+
+_cheap_sent, _cheap_rep, _ = _cap_retry_case(40.0, 0.5, 250.0)
+check("a name whose single share is well under the cap is unaffected",
+      _cheap_sent == [0.5, 1.0] and len(_cheap_rep.submitted) == 1, _cheap_sent)
+
+print()
+print("=" * 72)
 print(f"{len(FAILS)} FAILURE(S): {FAILS}" if FAILS else "ALL CHECKS PASSED")
 print("=" * 72)
