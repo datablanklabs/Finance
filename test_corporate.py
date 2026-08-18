@@ -302,6 +302,68 @@ check(
 
 print()
 print("=" * 72)
+print("One symbol's missing data does not abort the whole fetch")
+print("=" * 72)
+
+# "This issuer has no Form 4 filings" is a fact about the issuer, not a failed
+# request -- and for a fund it is the only possible answer, since an ETF has no
+# officers or directors to file one. The SEC provider signals it by raising
+# ("No Form 4 data was returned for XLK"), which used to abort the per-symbol
+# loop: one ETF in a mixed universe meant zero rows for every issuer that did
+# have real filings. Confirmed against the live SEC provider; reproduced here
+# offline by making one symbol's fetch raise.
+_rows = [
+    ("AAA", "filing", "10-Q", pd.Timestamp("2024-02-01")),
+    ("AAA", "filing", "8-K", pd.Timestamp("2024-02-10")),
+]
+_raw = pd.DataFrame(_rows, columns=["symbol", "kind", "report_type", "as_of_date"])
+
+
+class _PartialRepo(CorpsRepository):
+    """Raises for BAD's insider fetch only -- exactly the ETF shape."""
+
+    def _fetch_raw(self, symbol, kind):
+        if symbol == "BAD" and kind == "insider":
+            raise RuntimeError(f"No Form 4 data was returned for {symbol}.")
+        if kind == "filings":
+            out = _raw[_raw["kind"] == "filing"].copy()
+            out["symbol"] = symbol
+            return out.drop(columns=["kind"])
+        return pd.DataFrame(columns=["symbol", "as_of_date", "transaction_type",
+                                     "shares", "is_open_market"])
+
+
+_repo = _PartialRepo(cache_dir=None)
+_panel = _repo.fetch(["AAA", "BAD"], "2024-01-01", "2024-06-30")
+check("a symbol whose insider fetch raises does not abort the whole fetch",
+      not _panel.frame.empty, _panel.describe())
+check("the healthy symbol's real data still comes through",
+      "AAA" in set(_panel.frame["symbol"]), sorted(set(_panel.frame["symbol"])))
+check("the failing symbol still contributes what it could (its filings)",
+      "BAD" in set(_panel.frame["symbol"]), sorted(set(_panel.frame["symbol"])))
+check("the skip is recorded rather than silent",
+      _repo.skipped and _repo.skipped[0][0] == "BAD"
+      and _repo.skipped[0][1] == "insider", _repo.skipped)
+check("only the one symbol/kind is skipped, not the pair",
+      len(_repo.skipped) == 1, _repo.skipped)
+
+
+class _AllBadRepo(CorpsRepository):
+    """Every fetch fails -- e.g. a bad credential. Must not look like success."""
+
+    def _fetch_raw(self, symbol, kind):
+        raise RuntimeError("boom")
+
+
+_allbad = _AllBadRepo(cache_dir=None)
+_empty_panel = _allbad.fetch(["AAA", "BBB"], "2024-01-01", "2024-06-30")
+check("a failure affecting every symbol still yields an empty panel, so it "
+      "cannot be mistaken for real data",
+      _empty_panel.frame.empty and len(_allbad.skipped) == 4,
+      f"rows={len(_empty_panel.frame)} skipped={len(_allbad.skipped)}")
+
+print()
+print("=" * 72)
 if FAILS:
     print(f"{len(FAILS)} FAILURE(S): {FAILS}")
 else:

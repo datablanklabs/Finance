@@ -1583,6 +1583,110 @@ _cheap_sent, _cheap_rep, _ = _cap_retry_case(40.0, 0.5, 250.0)
 check("a name whose single share is well under the cap is unaffected",
       _cheap_sent == [0.5, 1.0] and len(_cheap_rep.submitted) == 1, _cheap_sent)
 
+# The position limit matters more than the notional one, and preflight checks
+# plan.target_weights -- the strategy's intended 18% -- not the size a
+# whole-share retry lands on. Confirmed against the live universe at ~$1,007
+# equity: one MSFT share ($481.63) is 47.8% of the book against a 35% cap, and
+# it clears a $500 notional cap on the way past. Rounding up to a whole share
+# is a concentration decision, so it answers to the concentration limit.
+def _weight_retry_case(price, shares, cash, cap=500.0, current_weight=0.0):
+    path = fresh(f"weight_retry_{int(price)}_{int(cash)}_{int(current_weight*100)}")
+    broker = MockBroker(prices=pd.Series({"MSFT": price}), cash=cash)
+    broker.connect()
+    _real_place = broker.place_order
+    sent = []
+
+    def _place(symbol, side, quantity, *a, **kw):
+        sent.append(quantity)
+        if quantity != float(int(quantity)):
+            raise _fractional_shares_error()
+        return _real_place(symbol, side, quantity, *a, **kw)
+
+    broker.place_order = _place
+    om = OrderManager(
+        broker,
+        ExecutionPolicy(dry_run=False, require_review=False,
+                        require_market_open=False, max_order_notional=cap,
+                        max_plan_notional=1e9,
+                        kill_switch_path=os.path.join(path, "KILL")),
+        AuditLog(os.path.join(path, "a.jsonl"), stdout=False),
+        os.path.join(path, "j.jsonl"),
+    )
+    intent = OrderIntent(symbol="MSFT", side="buy", shares=shares,
+                         reference_price=price, notional=shares * price,
+                         current_weight=current_weight, target_weight=0.181)
+    plan = LivePlan(asof=pd.Timestamp("2026-07-21"),
+                    equity=broker.get_account().equity, intents=[intent],
+                    target_weights=pd.Series({"MSFT": 0.181}),
+                    current_weights=pd.Series({"MSFT": current_weight}), decision=None)
+    return sent, om.execute(plan, strategy_name="weight-retry", now=MARKET_HOURS), om
+
+
+_w_sent, _w_rep, _w_om = _weight_retry_case(481.63, 0.38, 1_007.22)
+check("the premise: the retry clears the notional cap it is checked against",
+      481.63 <= 500.0)
+check("a whole-share retry that would breach max_position_weight is blocked",
+      _w_sent == [0.38] and not _w_rep.submitted,
+      f"sent={_w_sent} submitted={[o.symbol for o in _w_rep.submitted]}")
+check("the reason states the resulting weight and the cap",
+      any("position cap" in r and "47.8%" in r for _i, r in _w_rep.skipped),
+      [r for _i, r in _w_rep.skipped])
+check("it is audited distinctly from the notional block",
+      "position_weight_after_whole_share_retry"
+      in _w_om.audit.read()["reason"].dropna().tolist())
+check("the write-ahead entry is closed, so recover() finds nothing dangling",
+      _w_om.recover().empty)
+
+# The limit is proportional, not absolute: the same share on a big account is
+# a small position and must go through.
+_big_sent, _big_rep, _ = _weight_retry_case(481.63, 0.38, 50_000.0)
+check("the same share on a large account is a small position and is allowed",
+      _big_sent == [0.38, 1.0] and len(_big_rep.submitted) == 1, _big_sent)
+
+# Existing holdings count toward the resulting weight, not just the delta.
+_held_sent, _held_rep, _ = _weight_retry_case(100.0, 0.5, 1_000.0, current_weight=0.30)
+check("an existing position counts toward the limit (30% held + 10% more "
+      "exceeds 35%)",
+      _held_sent == [0.5] and not _held_rep.submitted,
+      f"sent={_held_sent}")
+
+# A sell can only shrink a position, so it must never be blocked by this.
+_sell_path = fresh("weight_retry_sell")
+_sell_broker = MockBroker(prices=pd.Series({"MSFT": 481.63}), cash=1_000.0,
+                          positions=pd.Series({"MSFT": 2.0}))
+_sell_broker.connect()
+_sell_real = _sell_broker.place_order
+_sell_sent = []
+
+
+def _sell_place(symbol, side, quantity, *a, **kw):
+    _sell_sent.append(quantity)
+    if quantity != float(int(quantity)):
+        raise _fractional_shares_error()
+    return _sell_real(symbol, side, quantity, *a, **kw)
+
+
+_sell_broker.place_order = _sell_place
+_sell_om = OrderManager(
+    _sell_broker,
+    ExecutionPolicy(dry_run=False, require_review=False, require_market_open=False,
+                    max_order_notional=500.0, max_plan_notional=1e9,
+                    kill_switch_path=os.path.join(_sell_path, "KILL")),
+    AuditLog(os.path.join(_sell_path, "a.jsonl"), stdout=False),
+    os.path.join(_sell_path, "j.jsonl"))
+_sell_intent = OrderIntent(symbol="MSFT", side="sell", shares=-0.6,
+                           reference_price=481.63, notional=-288.98,
+                           current_weight=0.49, target_weight=0.20)
+_sell_plan = LivePlan(asof=pd.Timestamp("2026-07-21"),
+                      equity=_sell_broker.get_account().equity,
+                      intents=[_sell_intent],
+                      target_weights=pd.Series({"MSFT": 0.20}),
+                      current_weights=pd.Series({"MSFT": 0.49}), decision=None)
+_sell_rep = _sell_om.execute(_sell_plan, strategy_name="weight-sell", now=MARKET_HOURS)
+check("a sell is never blocked by the position limit -- it shrinks the position",
+      _sell_sent == [0.6, 1.0] and len(_sell_rep.submitted) == 1,
+      f"sent={_sell_sent} skipped={[r for _i, r in _sell_rep.skipped]}")
+
 print()
 print("=" * 72)
 print(f"{len(FAILS)} FAILURE(S): {FAILS}" if FAILS else "ALL CHECKS PASSED")

@@ -7,6 +7,7 @@ from qbt import (
     Backtester, CorpsPanel, FundamentalsPanel, LiveSignalRunner, MacrosPanel,
     PortfolioState, SyntheticRepository,
 )
+from qbt.data import as_merge_key
 from qbt.options import OptionsPanel, OptionsRepository, derive_indicators
 
 FAILS = []
@@ -343,6 +344,56 @@ check(
     "live runner still works with no options argument at all",
     seen_calls["n"] == 1 and plan2.asof == plan.asof,
 )
+
+print()
+print("=" * 72)
+print("to_daily joins across mismatched datetime resolutions")
+print("=" * 72)
+
+# pd.merge_asof will not coerce its join keys: mismatched datetime resolution
+# raises "incompatible merge keys ... must be the same type". Resolution now
+# depends on how a column was produced -- a price index read back from CSV
+# lands on datetime64[s], an as_of_date built from Timestamp.now() on [us].
+# Confirmed (2026-08): this broke the notebook the first time the options
+# panel held live data instead of a synthetic stand-in whose dtypes happened
+# to agree. All four panels share this to_daily shape, so all four had it.
+_res_rows = [
+    ("AAA", "iv_atm_near", pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-05"), 0.25),
+    ("AAA", "iv_atm_near", pd.Timestamp("2024-01-08"), pd.Timestamp("2024-01-08"), 0.30),
+]
+_res_frame = pd.DataFrame(
+    _res_rows, columns=["symbol", "metric", "period_end", "as_of_date", "value"])
+_cal = pd.DatetimeIndex(pd.bdate_range("2024-01-04", periods=5))
+
+for _panel_res, _cal_res in (("datetime64[s]", "datetime64[us]"),
+                             ("datetime64[us]", "datetime64[s]"),
+                             ("datetime64[ns]", "datetime64[s]")):
+    _f = _res_frame.copy()
+    _f["as_of_date"] = _f["as_of_date"].astype(_panel_res)
+    _p = OptionsPanel(frame=_f)
+    try:
+        _out = _p.to_daily(_cal.astype(_cal_res), metrics=["iv_atm_near"])
+        _col = _out["iv_atm_near"]["AAA"]
+        _ok = float(_col.iloc[-1]) == 0.30 and pd.isna(_col.iloc[0])
+        check(f"to_daily joins {_panel_res} panel against {_cal_res} calendar",
+              _ok, _col.to_dict())
+    except Exception as exc:
+        check(f"to_daily joins {_panel_res} panel against {_cal_res} calendar",
+              False, f"{type(exc).__name__}: {str(exc)[:70]}")
+
+# as_merge_key must preserve the caller's index. Callers assign it back onto a
+# groupby subset whose index is not 0..n-1; renumbering makes that assignment
+# align a fresh RangeIndex against the original labels and silently fill the
+# column with NaN, which merge_asof then rejects for null keys.
+_sub = _res_frame.iloc[[1]].copy()          # index == [1], deliberately not 0
+_converted = as_merge_key(_sub["as_of_date"])
+check("as_merge_key preserves a non-default index",
+      list(_converted.index) == [1], list(_converted.index))
+_sub["as_of_date"] = _converted
+check("so assigning it back does not introduce nulls",
+      _sub["as_of_date"].notna().all(), _sub["as_of_date"].tolist())
+check("and it lands on one fixed resolution",
+      str(_converted.dtype) == "datetime64[ns]", str(_converted.dtype))
 
 print()
 print("=" * 72)

@@ -50,8 +50,29 @@ from qbt.risk import as_session_date
 # agree on which calendar date a fill belongs to.
 MARKET_TZ = ExecutionPolicy.market_tz
 
-UNIVERSE = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU",
-            "XLV", "XLY", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "DBC"]
+# 11 GICS sector ETFs, plus small-cap/intl/EM equity, duration, gold and
+# broad commodities -- breadth across asset classes, and every sleeve
+# internally diversified.
+ETFS = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU",
+        "XLV", "XLY", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "DBC"]
+
+# Individual issuers, spread across sectors, all continuously listed since
+# 2010. Two things change by including them, both worth holding in mind:
+#
+# 1. **Idiosyncratic risk.** A sector ETF diversifies away single-name
+#    earnings and headline risk; these do not. One of these gapping 20% on
+#    a print is a real outcome that no sector sleeve can produce.
+# 2. **Volatility heterogeneity.** Measured on this data, single names run
+#    ~1.5x the annualised vol of the ETFs (median 24.1% vs 16.4%).
+#    CrossSectionalMomentum ranks on trailing *return*, not risk-adjusted
+#    return, so the higher-vol names occupy both tails of the ranking
+#    disproportionately and top_n will skew toward them. RiskGate's vol
+#    targeting still controls total book volatility -- this changes *which
+#    names get chosen*, not how much risk the book carries.
+EQUITIES = ["AAPL", "MSFT", "CSCO", "JNJ", "PFE", "JPM",
+            "XOM", "CVX", "PG", "KO", "WMT", "HD"]
+
+UNIVERSE = ETFS + EQUITIES
 
 # Two whole-book de-risking overlays around the same momentum core, neither
 # changing which names get picked -- both just scale total exposure down
