@@ -35,6 +35,7 @@ __all__ = [
     "SyntheticRepository",
     "prune_cache",
     "touch_cache",
+    "as_merge_key",
 ]
 
 
@@ -251,6 +252,34 @@ def prune_cache(cache_dir: str | None, max_age_days: int = 30,
         except OSError:
             continue
     return removed
+
+
+def as_merge_key(values) -> pd.Series:
+    """Coerce a datetime column to one fixed resolution for ``merge_asof``.
+
+    ``pd.merge_asof`` requires its join keys to have *identical* dtypes and
+    raises ``MergeError: incompatible merge keys ... must be the same type``
+    otherwise -- it will not coerce, unlike most pandas joins. Datetime
+    resolution now varies by how a column was produced: a price index read
+    back from CSV lands on ``datetime64[s]``, while an ``as_of_date`` built
+    from ``Timestamp.now()`` or arithmetic lands on ``datetime64[us]``.
+
+    Confirmed (2026-08): every ``to_daily`` in this package joins a price
+    calendar against a panel's ``as_of_date``, and the options panel tripped
+    exactly this the first time it held live data rather than a synthetic
+    stand-in whose dtypes happened to agree. Normalising both sides through
+    here is what makes those joins independent of how either column was
+    built.
+
+    The input's index is preserved deliberately. Callers assign the result
+    back onto an existing frame (``right["as_of_date"] = as_merge_key(...)``)
+    whose index is a groupby subset, not ``0..n-1``; renumbering here would
+    make that assignment align a fresh RangeIndex against the original
+    labels and silently fill the column with NaN, which ``merge_asof`` then
+    rejects as "Merge keys contain null values".
+    """
+    s = values if isinstance(values, pd.Series) else pd.Series(values)
+    return pd.to_datetime(s).astype("datetime64[ns]")
 
 
 def _require_symbol_sequence(symbols) -> list[str]:

@@ -52,6 +52,8 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .data import as_merge_key
+
 __all__ = ["CorpsPanel", "CorpsRepository"]
 
 _ID_COLUMNS = ("symbol", "metric", "period_end", "as_of_date", "value")
@@ -162,7 +164,7 @@ class CorpsPanel:
         """
         names = list(symbols) if symbols is not None else self.symbols
         wanted = list(metrics) if metrics is not None else self.metrics
-        calendar = pd.DataFrame({"as_of_date": pd.DatetimeIndex(dates)})
+        calendar = pd.DataFrame({"as_of_date": as_merge_key(pd.DatetimeIndex(dates))})
 
         out: dict[str, pd.DataFrame] = {}
         for metric in wanted:
@@ -174,8 +176,10 @@ class CorpsPanel:
                 g = g.sort_values("as_of_date").drop_duplicates(
                     "as_of_date", keep="last"
                 )
+                right = g[["as_of_date", "value"]].copy()
+                right["as_of_date"] = as_merge_key(right["as_of_date"])
                 merged = pd.merge_asof(
-                    calendar, g[["as_of_date", "value"]], on="as_of_date",
+                    calendar, right, on="as_of_date",
                     direction="backward",
                 )
                 columns[sym] = merged["value"].to_numpy()
@@ -294,12 +298,33 @@ class CorpsRepository:
         symbols = list(dict.fromkeys(symbols))
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
 
+        # Per symbol *and* per kind, tolerating absence. "This issuer has no
+        # Form 4 filings" is a fact about the issuer, not a failure of the
+        # request -- and for a fund it is the only possible answer, since an
+        # ETF has no officers or directors to file one. The SEC provider
+        # signals that by raising ("No Form 4 data was returned for XLK"),
+        # which previously aborted the whole multi-symbol loop: one ETF in a
+        # 30-name universe meant zero rows for the 12 issuers that did have
+        # real filings. A panel whose columns already tolerate a symbol with
+        # no rows should tolerate the fetch that produces none.
+        #
+        # Deliberately narrow: only this symbol/kind is skipped, it is
+        # recorded on `self.skipped` so a caller can see what was missing
+        # rather than guess, and nothing here suppresses a failure that
+        # would affect every symbol (a bad credential still surfaces on the
+        # first one, because every subsequent symbol fails the same way and
+        # the panel comes back empty).
+        self.skipped: list[tuple[str, str, str]] = []
         frames = []
         for sym in symbols:
-            filings = self._fetch_raw(sym, "filings")
-            insider = self._fetch_raw(sym, "insider")
-            frames.append(self._derive_filing_indicators(sym, filings))
-            frames.append(self._derive_insider_indicators(sym, insider))
+            for kind, derive in (("filings", self._derive_filing_indicators),
+                                 ("insider", self._derive_insider_indicators)):
+                try:
+                    raw = self._fetch_raw(sym, kind)
+                except Exception as exc:
+                    self.skipped.append((sym, kind, f"{type(exc).__name__}: {exc}"))
+                    continue
+                frames.append(derive(sym, raw))
 
         frame = pd.concat(frames, ignore_index=True) if frames else _empty_frame()
         if not frame.empty:

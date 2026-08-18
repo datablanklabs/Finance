@@ -30,6 +30,8 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .data import as_merge_key
+
 __all__ = ["FundamentalsPanel", "FundamentalsRepository"]
 
 _ID_COLUMNS = ("symbol", "metric", "period_end", "as_of_date", "value")
@@ -128,7 +130,7 @@ class FundamentalsPanel:
         """
         names = list(symbols) if symbols is not None else self.symbols
         wanted = list(metrics) if metrics is not None else self.metrics
-        calendar = pd.DataFrame({"as_of_date": pd.DatetimeIndex(dates)})
+        calendar = pd.DataFrame({"as_of_date": as_merge_key(pd.DatetimeIndex(dates))})
 
         out: dict[str, pd.DataFrame] = {}
         for metric in wanted:
@@ -140,8 +142,10 @@ class FundamentalsPanel:
                 g = g.sort_values("as_of_date").drop_duplicates(
                     "as_of_date", keep="last"
                 )
+                right = g[["as_of_date", "value"]].copy()
+                right["as_of_date"] = as_merge_key(right["as_of_date"])
                 merged = pd.merge_asof(
-                    calendar, g[["as_of_date", "value"]], on="as_of_date",
+                    calendar, right, on="as_of_date",
                     direction="backward",
                 )
                 columns[sym] = merged["value"].to_numpy()

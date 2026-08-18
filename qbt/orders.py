@@ -1054,6 +1054,47 @@ class OrderManager:
                         report.skipped.append((intent, note))
                         continue
 
+                    # Same argument for the *position* limit, which is the
+                    # more consequential of the two. preflight checks
+                    # plan.target_weights -- the strategy's intended 18% --
+                    # not the size a whole-share retry actually lands on. On
+                    # a small account an expensive single name blows straight
+                    # through it: confirmed against this universe at ~$1,007
+                    # equity, one share of MSFT ($481.63) is 47.8% of the
+                    # book against a 35% cap, and it clears the $500 notional
+                    # cap on the way past. GLD (39.6%) and JPM (36.1%) do the
+                    # same. Rounding *up* to a whole share is a concentration
+                    # decision, not just a sizing one, and it has to answer
+                    # to the concentration limit.
+                    #
+                    # Measured against the fresh account read, and including
+                    # what's already held, since the limit is about the
+                    # resulting position rather than the trade. Only buys can
+                    # breach it -- a sell shrinks the position.
+                    if account.equity > 0 and intent.side == "buy":
+                        resulting_weight = (
+                            intent.current_weight + retry_notional / account.equity
+                        )
+                        if resulting_weight > self.policy.max_position_weight:
+                            self._journal(stage="rejected", plan_id=pid,
+                                          intent_key=key, order_id=None,
+                                          state="rejected")
+                            note = (f"{intent.symbol} requires whole shares and one "
+                                    f"share would take the position to "
+                                    f"{resulting_weight:.1%}, over the "
+                                    f"{self.policy.max_position_weight:.0%} "
+                                    f"position cap")
+                            self.audit.emit(
+                                "intent_blocked", plan_id=pid, intent=key,
+                                reason="position_weight_after_whole_share_retry",
+                                original_quantity=round(abs(intent.shares), 6),
+                                retry_quantity=float(whole_qty),
+                                target_weight=round(intent.target_weight, 4),
+                                resulting_weight=round(resulting_weight, 4),
+                                cap=self.policy.max_position_weight)
+                            report.skipped.append((intent, note))
+                            continue
+
                     # A second write-ahead entry, at the corrected quantity
                     # -- recover() reads the *last* "submitting" entry per
                     # intent for fingerprint matching precisely so this
