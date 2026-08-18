@@ -966,10 +966,11 @@ class OrderManager:
                         # targeting 5 equal-weight ETF sleeves at ~$160 each
                         # hit this on every sleeve whose share price exceeds
                         # that. One whole share is the smallest unit that
-                        # gets any exposure at all; downstream limits
-                        # (max_order_notional, max_position_weight) still
-                        # catch it if that one share is unreasonably large
-                        # for the account. A magnitude already >= 1 floors
+                        # gets any exposure at all; the re-check below is
+                        # what stops that one share being unreasonably large
+                        # for the account (it is deliberately *below* this
+                        # branch, so it applies to both the buy-from-flat
+                        # and round-to-nearest cases). A magnitude >= 1 floors
                         # normally -- this exception only kicks in when
                         # flooring would otherwise leave the position at
                         # zero forever.
@@ -1011,6 +1012,47 @@ class OrderManager:
                                          f"({abs(intent.shares):.4f}) rounds down "
                                          "to 0"))
                             continue
+
+                    # The corrected quantity is a *different, larger* order
+                    # than the one that cleared the per-order cap above, so
+                    # it has to clear it too. Rounding 0.5 shares of a $300
+                    # ETF up to 1 turns a $150 intent into a $300 order; the
+                    # cap was checked once, before the first attempt, and
+                    # this path used to walk straight past it. The comment on
+                    # the buy-from-flat branch above asserted that
+                    # max_order_notional "still catches it if that one share
+                    # is unreasonably large for the account" -- it did not,
+                    # and this is what makes that true.
+                    #
+                    # The cap wins, deliberately: ExecutionPolicy exists to
+                    # be dumb and absolute. The cost is real and worth
+                    # stating -- any instrument whose single share costs more
+                    # than max_order_notional becomes untradeable rather
+                    # than being bought slightly over the limit. If that
+                    # rules out a name you want, the cap is the wrong number
+                    # for the universe; raise it deliberately instead of
+                    # letting a retry quietly exceed it.
+                    retry_notional = abs(float(whole_qty) * intent.reference_price)
+                    if retry_notional > self.policy.max_order_notional:
+                        # Close the write-ahead entry from the first attempt.
+                        # Leaving it dangling at "submitting" would have the
+                        # next cycle's recover() treat a fully-known outcome
+                        # as an unresolved in-flight order and halt on it.
+                        self._journal(stage="rejected", plan_id=pid,
+                                      intent_key=key, order_id=None,
+                                      state="rejected")
+                        note = (f"{intent.symbol} requires whole shares and one "
+                                f"share ({retry_notional:,.2f}) exceeds the "
+                                f"per-order cap "
+                                f"({self.policy.max_order_notional:,.2f})")
+                        self.audit.emit("intent_blocked", plan_id=pid, intent=key,
+                                        reason="order_notional_after_whole_share_retry",
+                                        original_quantity=round(abs(intent.shares), 6),
+                                        retry_quantity=float(whole_qty),
+                                        retry_notional=round(retry_notional, 2),
+                                        cap=self.policy.max_order_notional)
+                        report.skipped.append((intent, note))
+                        continue
 
                     # A second write-ahead entry, at the corrected quantity
                     # -- recover() reads the *last* "submitting" entry per
