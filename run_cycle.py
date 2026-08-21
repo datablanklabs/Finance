@@ -108,7 +108,24 @@ STRATEGY = BreadthRegimeFilter(
     ),
     lookback=200, min_breadth=0.3, scale_when_blocked=0.5,
 )
+# The live risk policy, complete as written. --max-position overrides
+# max_weight for a single run (and is what --help reports as its default), but
+# this dict always describes the configured policy on its own: leaving
+# max_weight out and filling it in only inside main() meant RiskGate(**GATE)
+# from anywhere else -- a research probe, a notebook, a test -- silently fell
+# back to RiskGate's own 0.25 default instead of the 0.30 configured here.
 GATE = dict(target_vol=0.12, max_weight=0.30, max_gross=1.0, max_drawdown=0.25)
+
+# How much looser ExecutionPolicy's backstop sits than the gate that actually
+# shapes the book. The two caps are not redundant, they are layered:
+# RiskGate.max_weight *clips* proposed weights, so under normal operation no
+# target ever reaches the backstop; ExecutionPolicy.max_position_weight is a
+# preflight fatal that only fires if something upstream misbehaved, plus the
+# re-check on the whole-share retry in OrderManager.execute (which preflight
+# cannot see, because it inspects target weights rather than retried
+# quantities). Moving them together preserves that gap -- setting the backstop
+# equal to the gate would leave nothing to back up.
+POSITION_BACKSTOP_MARGIN = 0.05
 
 
 def mode_path(base: str, synthetic: bool) -> str:
@@ -274,6 +291,14 @@ def main() -> int:
     ap.add_argument("--max-order", type=float, default=500.0)
     ap.add_argument("--max-plan", type=float, default=5_000.0)
     ap.add_argument("--max-turnover", type=float, default=0.67)
+    ap.add_argument("--max-position", type=float, default=GATE["max_weight"],
+                    # argparse runs help through %-formatting, so a literal
+                    # percent sign has to be doubled or it swallows the rest
+                    # of the string and prints the raw action dict instead.
+                    help="max single-name weight as a fraction, e.g. 0.30 for "
+                         "30%%; the ExecutionPolicy backstop is set "
+                         f"{POSITION_BACKSTOP_MARGIN:.2f} above it "
+                         "(default: 0.30)")
     ap.add_argument("--synthetic", action="store_true",
                     help="use generated data and a mock broker")
     ap.add_argument("--ignore-market-hours", action="store_true")
@@ -281,6 +306,22 @@ def main() -> int:
                     help="fetch and print the agentic account's current "
                          "holdings, then exit -- no planning or trading")
     args = ap.parse_args()
+
+    # Validate before anything else touches the broker. This is a risk limit
+    # being widened from the command line, so a typo has to fail loudly here
+    # rather than quietly become the new ceiling: --max-position 30 (meaning
+    # 30%) would otherwise sail through as 3000% and disable the cap
+    # entirely, and a negative one would make every plan fail preflight for
+    # reasons that read like a strategy bug.
+    if not 0.0 < args.max_position <= 1.0:
+        ap.error(f"--max-position must be a weight in (0, 1], got "
+                 f"{args.max_position} (30% is 0.30, not 30)")
+    gate_kwargs = dict(GATE, max_weight=args.max_position)
+    # Clamped, so an operator who sets --max-position 1.0 gets a backstop of
+    # 1.0 rather than an impossible 1.05. Note that at exactly 1.0 the gap
+    # closes and the backstop stops backing anything up -- which is the
+    # honest consequence of asking for no concentration limit at all.
+    max_position_weight = min(1.0, args.max_position + POSITION_BACKSTOP_MARGIN)
 
     if args.check_portfolio:
         return check_portfolio(args)
@@ -368,6 +409,7 @@ def main() -> int:
         max_order_notional=args.max_order,
         max_plan_notional=args.max_plan,
         max_plan_turnover=args.max_turnover,
+        max_position_weight=max_position_weight,
         symbol_allowlist=tuple(panel.symbols) if args.synthetic else tuple(UNIVERSE),
         require_review=True,
         require_market_open=not args.ignore_market_hours,
@@ -445,7 +487,7 @@ def main() -> int:
         # means that check now does what it was actually meant to do: a
         # rarely-firing safety net for equity drift between planning and
         # submission, not the real enforcement point.
-        plan = LiveSignalRunner(strategy=STRATEGY, risk_gate=RiskGate(**GATE),
+        plan = LiveSignalRunner(strategy=STRATEGY, risk_gate=RiskGate(**gate_kwargs),
                                 max_turnover=args.max_turnover,
                                 day_trade_ledger=ledger).plan(
             panel, state, macros=macros)

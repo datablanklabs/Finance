@@ -10,17 +10,21 @@ MacroRegimeFilter themselves (that's test_regime_filters.py's job).
 
 import importlib.util
 import json
+import subprocess
+import sys
 import os
 import pathlib
 import tempfile
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 from qbt import (
     Backtester, BreadthRegimeFilter, CrossSectionalMomentum, DayTradeLedger,
     ExecutionConfig, LiveSignalRunner, MacroRegimeFilter, MacrosPanel,
-    PortfolioState, ShortHorizonReversal, SyntheticRepository,
+    PortfolioState, PricePanel, RiskGate, ShortHorizonReversal,
+    SyntheticRepository,
 )
 from qbt.broker import MockBroker
 from qbt.orders import AuditLog, ExecutionPolicy, OrderManager
@@ -273,6 +277,91 @@ check("a large unmanaged holding drives equity drift past the 5% preflight "
 
 check("run_cycle exposes the audit event name used to report this",
       "unmanaged_holdings" in pathlib.Path("run_cycle.py").read_text())
+
+print()
+print("=" * 72)
+print("8. --max-position drives both concentration caps, keeping them layered")
+print("=" * 72)
+
+# There are two position caps and they are layered, not redundant:
+# RiskGate.max_weight *clips* proposed weights so no target normally reaches
+# the backstop, while ExecutionPolicy.max_position_weight is a preflight fatal
+# for when something upstream misbehaves -- plus the re-check on the
+# whole-share retry, which preflight cannot see because it inspects target
+# weights rather than retried quantities. One flag moves both so there is a
+# single number to reason about; the margin keeps the backstop a backstop.
+# GATE must describe the configured policy completely on its own. Filling
+# max_weight in only inside main() meant RiskGate(**GATE) from a probe, a
+# notebook or a test silently fell back to RiskGate's own 0.25 default rather
+# than the 0.30 configured here -- a tighter cap than the operator set, and
+# invisible.
+check("GATE is complete at import, not half-filled by main()",
+      "max_weight" in run_cycle.GATE, run_cycle.GATE)
+check("RiskGate(**GATE) yields the configured cap, not RiskGate's own default",
+      RiskGate(**run_cycle.GATE).max_weight == 0.30,
+      RiskGate(**run_cycle.GATE).max_weight)
+_helptext = subprocess.run(
+    [sys.executable, "run_cycle.py", "--help"], capture_output=True, text=True,
+    cwd=str(pathlib.Path(__file__).parent)).stdout
+check("the flag's default is sourced from GATE rather than restated",
+      f"(default: {run_cycle.GATE['max_weight']:.2f})" in _helptext,
+      [l for l in _helptext.splitlines() if "default:" in l])
+check("main() does not mutate the module-level GATE",
+      run_cycle.GATE["max_weight"] == 0.30, run_cycle.GATE)
+check("the backstop margin is a named constant, not a literal at the use site",
+      run_cycle.POSITION_BACKSTOP_MARGIN == 0.05,
+      run_cycle.POSITION_BACKSTOP_MARGIN)
+
+
+class _AllIn:
+    """Wants the whole book in one name, so the cap is the only thing binding."""
+    name = "allin"
+    min_history = 5
+
+    def target_weights(self, view, fundamentals=None, macros=None,
+                       corps=None, options=None):
+        return pd.Series({view.symbols[0]: 1.0}).reindex(view.symbols).fillna(0.0)
+
+
+_pos_idx = pd.bdate_range("2024-01-01", periods=300)
+_pos_panel = PricePanel(close=pd.DataFrame(
+    {"AAA": np.linspace(100, 200, 300), "BBB": np.linspace(100, 120, 300)},
+    index=_pos_idx))
+_pos_state = PortfolioState(cash=10_000.0, shares=pd.Series(dtype=float))
+
+for _mp in (0.30, 0.45, 0.60):
+    _gate = dict(run_cycle.GATE, max_weight=_mp, target_vol=None)
+    _backstop = min(1.0, _mp + run_cycle.POSITION_BACKSTOP_MARGIN)
+    _plan = LiveSignalRunner(strategy=_AllIn(), risk_gate=RiskGate(**_gate),
+                             max_turnover=None).plan(_pos_panel, _pos_state)
+    _got = float(_plan.target_weights.max())
+    check(f"--max-position {_mp} clips the book to exactly {_mp}",
+          abs(_got - _mp) < 1e-9, _got)
+    check(f"and the backstop stays strictly looser ({_backstop:.2f} > {_mp:.2f})",
+          _backstop > _mp)
+
+# A weight is a fraction. Passing 30 meaning "30%" would otherwise disable the
+# cap outright rather than tightening it, which is the worst possible
+# direction for a typo in a live risk limit to fail.
+_bad = subprocess.run(
+    [sys.executable, "run_cycle.py", "--max-position", "30", "--synthetic"],
+    capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+check("--max-position 30 is rejected rather than read as 3000%",
+      _bad.returncode != 0 and "must be a weight in (0, 1]" in _bad.stderr,
+      _bad.stderr.strip()[-90:])
+for _v in ("0", "-0.1", "1.5"):
+    _r = subprocess.run(
+        [sys.executable, "run_cycle.py", "--max-position", _v, "--synthetic"],
+        capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+    check(f"--max-position {_v} is rejected", _r.returncode != 0)
+
+# argparse %-formats help strings, so an unescaped percent sign swallows the
+# rest and prints the raw action dict in --help.
+_help = subprocess.run([sys.executable, "run_cycle.py", "--help"],
+                       capture_output=True, text=True,
+                       cwd=str(pathlib.Path(__file__).parent)).stdout
+check("--help renders the flag's help text rather than an action dict",
+      "max single-name weight" in _help and "option_strings" not in _help)
 
 print()
 print("=" * 72)
