@@ -53,6 +53,7 @@ __all__ = [
     "TrendFilter",
     "FundamentalsValueFilter",
     "MacroRegimeFilter",
+    "BreadthRegimeFilter",
     "Composite",
     "InverseVolWeighted",
     "PairsTrading",
@@ -925,26 +926,43 @@ class PairsTrading:
 
 @dataclass
 class MultiFactorCrossSectional:
-    """Blend several price-derived cross-sectional factors into one score.
+    """Blend several cross-sectional factors into one score.
 
-    Fundamentals (value, quality) aren't available from a price-only panel
-    (see the README's "no point-in-time data" gap), so every factor here is
-    derived from price and volatility: ``momentum`` (trailing return over
-    ``momentum_lookback``, skipping the most recent ``momentum_skip`` bars,
-    same construction as :class:`CrossSectionalMomentum`), ``low_vol``
-    (inverse realised volatility over ``vol_lookback``), and ``reversal``
-    (negative short-horizon return over ``reversal_lookback`` -- the one
-    factor here with real independent information, since a price-only stand-in
-    for "quality" doesn't exist). Each factor is cross-sectionally z-scored
-    before blending so factors on different natural scales don't dominate by
-    magnitude alone; names missing any factor are dropped rather than
-    silently scored on a subset.
+    Three factors are derived from price and volatility alone: ``momentum``
+    (trailing return over ``momentum_lookback``, skipping the most recent
+    ``momentum_skip`` bars, same construction as :class:`CrossSectionalMomentum`),
+    ``low_vol`` (inverse realised volatility over ``vol_lookback``), and
+    ``reversal`` (negative short-horizon return over ``reversal_lookback``).
+    A fourth, ``quality``, is optional and price-independent: the
+    cross-sectional z-score of a single :class:`~qbt.fundamentals.
+    FundamentalsPanel` metric (``quality_metric``, default
+    ``"ratios_return_on_equity"`` -- check ``fundamentals.metrics`` against
+    whatever your provider actually produced, same caveat as
+    :class:`FundamentalsValueFilter`), point-in-time as of ``view.last_date()``
+    the same way that filter reads it. Set ``quality_higher_is_better=False``
+    for a metric where lower is better (e.g. a leverage ratio). Every factor
+    is cross-sectionally z-scored before blending so factors on different
+    natural scales don't dominate by magnitude alone; names missing any
+    factor are dropped rather than silently scored on a subset.
+
+    That drop rule has a sharp edge for ``quality`` specifically: it is the
+    one factor here that depends on data the caller has to supply.
+    ``factor_weights`` excludes it by default, so leaving it out costs
+    nothing -- but giving it a nonzero weight without ever passing
+    ``fundamentals`` (or passing one with no reading for ``quality_metric``)
+    means the quality column is NaN for every name, which the "drop rather
+    than score on a subset" rule above turns into *no name qualifying at
+    all* -- an empty book, not a book that quietly ignores quality. This is
+    the same "unknown means blocked" default the rest of this module uses
+    (see e.g. :class:`TrendFilter`), not a special case.
     """
 
     momentum_lookback: int = 126
     momentum_skip: int = 5
     vol_lookback: int = 63
     reversal_lookback: int = 5
+    quality_metric: str = "ratios_return_on_equity"
+    quality_higher_is_better: bool = True
     factor_weights: dict[str, float] = field(
         default_factory=lambda: {"momentum": 0.5, "low_vol": 0.3, "reversal": 0.2}
     )
@@ -955,7 +973,7 @@ class MultiFactorCrossSectional:
     def __post_init__(self) -> None:
         if not self.name:
             self.name = f"multifactor_{self.top_n}"
-        unknown = set(self.factor_weights) - {"momentum", "low_vol", "reversal"}
+        unknown = set(self.factor_weights) - {"momentum", "low_vol", "reversal", "quality"}
         if unknown:
             raise ValueError(f"unknown factor(s) in factor_weights: {unknown}")
         if not any(self.factor_weights.values()):
@@ -994,7 +1012,26 @@ class MultiFactorCrossSectional:
             return pd.Series(0.0, index=s.index).mask(s.isna())
         return (s - mu) / sd
 
-    def score(self, view: PricePanel) -> pd.Series:
+    def _quality_raw(
+        self, names: list[str], fundamentals: FundamentalsPanel | None, date: pd.Timestamp
+    ) -> pd.Series:
+        """Point-in-time quality reading per name; NaN wherever it's unknown.
+
+        Mirrors :meth:`FundamentalsValueFilter.target_weights`: ``fundamentals``
+        has already been through the look-ahead firewall by the time a
+        strategy sees it, so this calls ``.snapshot(date)`` directly rather
+        than re-deriving the cutoff.
+        """
+        if fundamentals is None or len(fundamentals.frame) == 0:
+            return pd.Series(np.nan, index=names, dtype=float)
+        snap = fundamentals.snapshot(date)
+        if self.quality_metric not in snap.columns:
+            return pd.Series(np.nan, index=names, dtype=float)
+        return snap[self.quality_metric].reindex(names)
+
+    def score(
+        self, view: PricePanel, fundamentals: FundamentalsPanel | None = None
+    ) -> pd.Series:
         """Exposed separately so research code can study the blended signal."""
         names = _tradeable(view, self.min_history)
         if not names:
@@ -1014,6 +1051,13 @@ class MultiFactorCrossSectional:
         if w:
             rev = sub.trailing_return(self.reversal_lookback)
             parts.append(-self._zscore(rev) * w)
+        w = self.factor_weights.get("quality", 0.0)
+        if w:
+            qual = self._quality_raw(names, fundamentals, view.last_date())
+            z = self._zscore(qual)
+            if not self.quality_higher_is_better:
+                z = -z
+            parts.append(z * w)
         if not parts:
             return pd.Series(dtype=float)
 
@@ -1029,7 +1073,7 @@ class MultiFactorCrossSectional:
         options: OptionsPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
-        scores = self.score(view)
+        scores = self.score(view, fundamentals)
         if scores.empty:
             return w
 

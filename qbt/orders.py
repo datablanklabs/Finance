@@ -46,7 +46,7 @@ from typing import Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from .broker import BrokerAccount, BrokerAdapter, BrokerOrder
+from .broker import BrokerAccount, BrokerAdapter, BrokerOrder, BrokerRejection
 from .live import LivePlan, OrderIntent
 from .risk import DayTradeLedger, as_session_date
 
@@ -55,7 +55,39 @@ try:
 except ImportError:  # pragma: no cover
     fcntl = None
 
-__all__ = ["ExecutionPolicy", "OrderManager", "ExecutionReport", "AuditLog"]
+__all__ = ["ExecutionPolicy", "OrderManager", "ExecutionReport", "AuditLog",
+           "durable_write"]
+
+
+# ---------------------------------------------------------------------------
+# Durable writes
+# ---------------------------------------------------------------------------
+
+
+def durable_write(path: str, content: str, mode: str = "w") -> None:
+    """Write ``content`` to ``path`` and fsync before returning.
+
+    fsync costs a millisecond and buys a file that survives a hard kill --
+    a page-cache write alone does not, and every file this matters for here
+    is either the crash-recovery journal itself or state a crash must not
+    be allowed to silently roll back (the peak-equity high-water mark, the
+    day-trade ledger). One primitive rather than three independent copies
+    of the same open/write/flush/fsync pattern (this module's own
+    ``AuditLog.emit``/``OrderManager._journal``, and ``run_cycle.py``'s
+    ``save_peak``/``save_day_trade_ledger``) -- three copies is how one of
+    them quietly ends up missing a fix the other two got.
+
+    ``mode="a"`` for an append-only line (audit event, journal entry);
+    ``mode="w"`` for a single current-value file. Does not create the
+    parent directory -- a caller that writes repeatedly (``AuditLog``,
+    ``OrderManager``) does that once at construction; a caller that writes
+    occasionally and has no constructor to do it in once (``run_cycle.py``'s
+    savers) does it per call, right before calling this.
+    """
+    with open(path, mode) as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -87,10 +119,7 @@ class AuditLog:
             **fields,
         }
         line = json.dumps(rec, default=str, sort_keys=True)
-        with open(self.path, "a") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        durable_write(self.path, line + "\n", mode="a")
         if self.stdout:
             print(f"  [{event}] " + " ".join(
                 f"{k}={v}" for k, v in fields.items() if k != "raw"))
@@ -330,10 +359,9 @@ class OrderManager:
 
     def _journal(self, **fields) -> None:
         rec = {"ts": datetime.now(timezone.utc).isoformat(), **fields}
-        with open(self.journal_path, "a") as fh:
-            fh.write(json.dumps(rec, default=str, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        durable_write(self.journal_path,
+                      json.dumps(rec, default=str, sort_keys=True) + "\n",
+                      mode="a")
 
     def _journal_entries(self) -> list[dict]:
         if not os.path.exists(self.journal_path):
@@ -819,8 +847,45 @@ class OrderManager:
                     continue
 
                 if self.policy.require_review:
-                    review = self.broker.review_order(
-                        intent.symbol, intent.side, abs(intent.shares))
+                    try:
+                        review = self.broker.review_order(
+                            intent.symbol, intent.side, abs(intent.shares))
+                    except Exception as exc:
+                        # A review that raises must not abort the whole
+                        # sleeve. Confirmed live (2026-08) on the first real
+                        # review_crypto_order call: Robinhood rejects an
+                        # over-precise crypto quantity with a synchronous
+                        # "API error 400" ({"quantity": ["...too much
+                        # precision..."]}) here, before place_order is ever
+                        # reached -- and require_review=True means this fires
+                        # even on a dry run. Same definitive-4xx reasoning as
+                        # the place_order handler below: an "API error 4xx"
+                        # from review means this intent cannot be priced as
+                        # sized, nothing was submitted, and the rest of the
+                        # plan does not depend on it -- skip and continue. A
+                        # BrokerRejection is the adapter saying the same thing
+                        # about an order it declined to even send (a crypto
+                        # size below the pair's min_order_size). No write-ahead
+                        # journal entry exists yet (that is below the dry-run
+                        # check), so there is nothing to close out. Anything
+                        # else (timeout, 5xx) is an unknown state on a
+                        # connection the rest of the plan also needs, so stop
+                        # -- matching place_order's own unknown-outcome break.
+                        text = repr(exc)
+                        if (isinstance(exc, BrokerRejection)
+                                or re.search(r"API error 4\d\d", text) is not None):
+                            clean_reason = (str(exc) if isinstance(exc, BrokerRejection)
+                                            else _clean_broker_rejection(text))
+                            self.audit.emit("order_review_rejected", plan_id=pid,
+                                            intent=key, reason=clean_reason,
+                                            raw=text)
+                            report.skipped.append(
+                                (intent, f"review rejected: {clean_reason}"))
+                            continue
+                        self.audit.emit("order_unknown_outcome", plan_id=pid,
+                                        intent=key, error=text)
+                        report.skipped.append((intent, f"unknown outcome: {exc!r}"))
+                        break
                     warns = review.get("warnings") or []
                     # review.get("ok") is authoritative on its own -- both
                     # broker adapters define ok = not warnings today, but an
@@ -917,7 +982,14 @@ class OrderManager:
                     # recover() to wrongly HALT on, and `break` abandoned
                     # every remaining intent in the plan even though they
                     # don't depend on this one's cash shortfall.
-                    definitive_rejection = re.search(r"API error 4\d\d", text) is not None
+                    # A BrokerRejection is the adapter's own definitive "this
+                    # was never sent" -- a crypto size below the pair's
+                    # min_order_size -- and belongs in the same bucket as a
+                    # live 4xx: known outcome, nothing dangling, rest of the
+                    # plan independent of it.
+                    definitive_rejection = (
+                        isinstance(exc, BrokerRejection)
+                        or re.search(r"API error 4\d\d", text) is not None)
                     if not definitive_rejection:
                         # Genuinely unknown outcome (a timeout, 5xx, or
                         # anything else that doesn't match a known
@@ -931,17 +1003,18 @@ class OrderManager:
                     if "fractional shares" not in text.lower():
                         # A confirmed rejection with no mechanical
                         # correction to apply (e.g. insufficient buying
-                        # power) -- unlike the fractional-shares case
-                        # below, there's no single well-defined retry
-                        # that doesn't second-guess the strategy's own
-                        # sizing. Close the journal entry now that the
-                        # outcome is fully known, and keep going: the rest
-                        # of the plan's intents are independent of this
-                        # one's rejection.
+                        # power, or a sub-minimum crypto size) -- unlike the
+                        # fractional-shares case below, there's no single
+                        # well-defined retry that doesn't second-guess the
+                        # strategy's own sizing. Close the journal entry now
+                        # that the outcome is fully known, and keep going:
+                        # the rest of the plan's intents are independent of
+                        # this one's rejection.
                         self._journal(stage="rejected", plan_id=pid,
                                       intent_key=key, order_id=None,
                                       state="rejected")
-                        clean_reason = _clean_broker_rejection(text)
+                        clean_reason = (str(exc) if isinstance(exc, BrokerRejection)
+                                        else _clean_broker_rejection(text))
                         self.audit.emit("order_rejected", plan_id=pid, intent=key,
                                         order_id=None, state="rejected",
                                         filled=0.0, avg_price=None,

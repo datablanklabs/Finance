@@ -33,6 +33,7 @@ __all__ = [
     "PriceRepository",
     "OpenBBRepository",
     "SyntheticRepository",
+    "align_panels",
     "prune_cache",
     "touch_cache",
     "as_merge_key",
@@ -334,6 +335,23 @@ class OpenBBRepository:
 
     Results are cached on disk keyed by the request, because pulling a wide
     universe repeatedly during research is slow and rate-limited.
+
+    ``asset_class="crypto"`` calls OpenBB's separate ``obb.crypto.price.
+    historical`` endpoint instead of ``obb.equity.price.historical`` --
+    genuinely two different endpoints in OpenBB's own API, not a naming
+    convenience, because a crypto ticker on ``yfinance`` (``"BTC-USD"``,
+    not a bare ``"BTC"``) isn't resolvable through the equity one. This is
+    plain OpenBB/yfinance behaviour, unrelated to and independent of
+    anything about the Robinhood MCP surface -- it works (and is worth
+    testing with ``USE_OPENBB=True`` / ``--consider-crypto`` without a
+    broker at all) whether or not crypto trading itself is ever wired up.
+    Two other differences follow from crypto trading 24/7: the resulting
+    panel's dates include weekends, which is exactly why a crypto panel is
+    never merged into the same :class:`PricePanel` as equities (see
+    ``run_cycle.py``'s crypto pipeline) -- a shared date index would either
+    invent fake weekend bars for equities or silently drop weekend crypto
+    bars, and either corrupts every lookback-window calculation in
+    :mod:`qbt.signals`.
     """
 
     def __init__(
@@ -342,18 +360,23 @@ class OpenBBRepository:
         cache_dir: str | None = ".cache/prices",
         include_open: bool = True,
         include_volume: bool = True,
+        asset_class: str = "equity",
     ) -> None:
+        if asset_class not in ("equity", "crypto"):
+            raise ValueError(f"asset_class must be 'equity' or 'crypto', got {asset_class!r}")
         self.provider = provider
         self.cache_dir = cache_dir
         self.include_open = include_open
         self.include_volume = include_volume
+        self.asset_class = asset_class
 
     # -- cache ------------------------------------------------------------
 
     def _cache_path(self, symbols: Sequence[str], start: str, end: str) -> str | None:
         if not self.cache_dir:
             return None
-        key = "|".join([self.provider, start, end, ",".join(sorted(symbols))])
+        key = "|".join([self.asset_class, self.provider, start, end,
+                        ",".join(sorted(symbols))])
         digest = hashlib.sha256(key.encode()).hexdigest()[:16]
         os.makedirs(self.cache_dir, exist_ok=True)
         return os.path.join(self.cache_dir, f"{digest}.csv.gz")
@@ -371,8 +394,6 @@ class OpenBBRepository:
         start_s = str(pd.Timestamp(start).date())
         end_s = str(pd.Timestamp(end).date())
 
-        # Sweep dead entries before writing a new one -- see prune_cache.
-        prune_cache(self.cache_dir)
         path = self._cache_path(symbols, start_s, end_s)
         if path and os.path.exists(path):
             touch_cache(path)          # a hit keeps it alive; see prune_cache
@@ -380,6 +401,17 @@ class OpenBBRepository:
         else:
             tidy = self._fetch_remote(symbols, start_s, end_s)
             if path:
+                # Sweep dead entries before adding a new one -- see
+                # prune_cache's own docstring for why this matters
+                # specifically for a daily scheduled run (whose end date is
+                # "today," so it always misses and always writes a new
+                # entry, which is exactly the growth prune_cache exists to
+                # bound). Only on the miss path: a hit isn't adding
+                # anything to the cache, so it has nothing to sweep before
+                # -- paying an O(cache-directory-size) glob+stat on every
+                # single fetch(), hit or miss, was strictly more sweeping
+                # than the docstring's own stated reason for doing this.
+                prune_cache(self.cache_dir)
                 tidy.to_csv(path, index=False)
 
         return self._to_panel(tidy, symbols)
@@ -395,7 +427,11 @@ class OpenBBRepository:
                 "openbb-yfinance`, or use SyntheticRepository."
             ) from exc
 
-        out = obb.equity.price.historical(
+        endpoint = (
+            obb.crypto.price.historical if self.asset_class == "crypto"
+            else obb.equity.price.historical
+        )
+        out = endpoint(
             symbol=symbols,
             start_date=start,
             end_date=end,

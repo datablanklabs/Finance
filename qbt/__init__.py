@@ -25,6 +25,7 @@ from .broker import (
     BrokerAccount,
     BrokerAdapter,
     BrokerOrder,
+    BrokerRejection,
     MockBroker,
     RobinhoodMCPBroker,
     ToolBinding,
@@ -107,7 +108,7 @@ __all__ = [
     "ic_summary", "ic_grid", "return_autocorrelation", "walk_forward_splits",
     "expected_max_sharpe", "sharpe_haircut", "ParameterSweep",
     "LiveSignalRunner", "LivePlan", "OrderIntent", "PortfolioState",
-    "BrokerAdapter", "BrokerAccount", "BrokerOrder", "MockBroker",
-    "RobinhoodMCPBroker", "ToolBinding",
+    "BrokerAdapter", "BrokerAccount", "BrokerOrder", "BrokerRejection",
+    "MockBroker", "RobinhoodMCPBroker", "ToolBinding",
     "OrderManager", "ExecutionPolicy", "ExecutionReport", "AuditLog",
 ]
