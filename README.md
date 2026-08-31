@@ -9,7 +9,7 @@ and production to drift apart.
 
 | File | Role |
 |---|---|
-| `qbt/data.py` | `PricePanel` + `as_of()` look-ahead firewall; OpenBB (confirmed live via yfinance) and synthetic price sources |
+| `qbt/data.py` | `PricePanel` + `as_of()` look-ahead firewall; OpenBB (confirmed live via yfinance for equities; `asset_class="crypto"` calls OpenBB's separate crypto endpoint, unverified for trading purposes) and synthetic price sources |
 | `qbt/fundamentals.py` | `FundamentalsPanel`: point-in-time financial-statement ratios, keyed by filing date, not fiscal period |
 | `qbt/macro.py` | `MacrosPanel`: point-in-time macro series (CPI, Fed funds rate, unemployment, yield curve, ...) from FRED |
 | `qbt/corporate.py` | `CorpsPanel`: point-in-time SEC filing cadence (10-K/10-Q/8-K) and Form 4 insider-transaction indicators |
@@ -19,13 +19,14 @@ and production to drift apart.
 | `qbt/engine.py` | `Backtester` (T+1 fills, costs), performance metrics |
 | `qbt/research.py` | IC grid, autocorrelation, walk-forward, multiple-testing haircut |
 | `qbt/live.py` | `LiveSignalRunner` → order intents (no execution) |
-| `qbt/broker.py` | `BrokerAdapter` protocol, `MockBroker`, `RobinhoodMCPBroker` |
+| `qbt/broker.py` | `BrokerAdapter` protocol, `MockBroker`, `RobinhoodMCPBroker` (equity confirmed live; `asset_class="crypto"`/`crypto_view()` unverified — see "Crypto support") |
 | `qbt/oauth.py` | OAuth 2.0 Authorization Code + PKCE for `RobinhoodMCPBroker`, via the MCP SDK's own client |
 | `qbt/orders.py` | `OrderManager`: journal, preflight, reconciliation, audit |
 | `research.ipynb` | 49-cell research notebook, 30 code cells |
-| `run_cycle.py` | One trading cycle. Run on a schedule, never from the notebook |
+| `run_cycle.py` | One trading cycle: equity `STRATEGY`, plus the crypto sleeve (`--consider-crypto`) as a second, independent pass. Run on a schedule, never from the notebook |
+| `debug_robinhood_crypto.py` | Read-only: dumps the raw crypto tool list/responses, the same role `debug_robinhood_accounts.py` played in confirming the equity shapes |
 | `test_qbt.py` | 129 engine validation checks (strategies, engine, risk gate, research, panel validation) |
-| `test_orders.py` | 152 order-path checks, offline against `MockBroker` |
+| `test_orders.py` | 164 order-path checks, offline against `MockBroker` |
 | `test_fundamentals.py` | 33 checks: `FundamentalsPanel` PIT semantics, `FundamentalsValueFilter` |
 | `test_macro.py` | 42 checks: `MacrosPanel` PIT semantics, `MacroRegimeFilter`, reading staleness |
 | `test_corporate.py` | 38 checks: `CorpsPanel` PIT semantics, filing/insider indicators |
@@ -33,9 +34,9 @@ and production to drift apart.
 | `test_options_strategy.py` | 19 checks: `OptionsMeanReversion` |
 | `test_insider_drift_strategy.py` | 21 checks: `InsiderEventDrift` |
 | `test_regime_filters.py` | 43 checks: `MacroRegimeFilter` (incl. a `vix` example)/`FundamentalsValueFilter`/`BreadthRegimeFilter` end-to-end |
-| `test_robinhood_broker.py` | 43 checks: response shapes confirmed against the live Robinhood MCP server |
+| `test_robinhood_broker.py` | 68 checks: response shapes confirmed against the live Robinhood MCP server, offline crypto capability-dispatch checks (unverified shapes — see file docstring), and the persistent-session lifecycle mechanics (§11, against a faked MCP session — live network behavior unconfirmed) |
 | `test_oauth.py` | 14 checks: PKCE flow, loopback callback server, token-file permissions |
-| `test_run_cycle.py` | 33 checks: `run_cycle.py`'s live `STRATEGY` composition and thresholds, regime triggering, day-trade ledger persistence, unmanaged holdings |
+| `test_run_cycle.py` | 85 checks: `run_cycle.py`'s live `STRATEGY`/`CRYPTO_STRATEGY` composition and thresholds, regime triggering, day-trade ledger persistence, unmanaged holdings, `--max-price`, `--consider-crypto` end to end |
 | `build_notebook.py` | Regenerates `research.ipynb` |
 | `smoke_test.py` | Executes every notebook cell in one namespace |
 
@@ -77,8 +78,8 @@ pip install openbb-fmp                            # optional, for FundamentalsPa
 pip install openbb-fred                           # optional, for MacrosPanel (needs a free FRED key)
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
-python test_qbt.py                     # 129 engine checks, ~90s
-python test_orders.py                  # 152 order-path checks, ~10s
+python test_qbt.py                     # 145 engine checks (null test now covers all 10 strategies), ~110s
+python test_orders.py                  # 164 order-path checks, ~10s
 python test_fundamentals.py            # 33 checks
 python test_macro.py                   # 42 checks
 python test_corporate.py               # 38 checks
@@ -86,11 +87,13 @@ python test_options.py                 # 39 checks
 python test_options_strategy.py        # 19 checks
 python test_insider_drift_strategy.py  # 21 checks
 python test_regime_filters.py          # 43 checks
-python test_robinhood_broker.py        # 43 checks, offline against confirmed live response shapes
+python test_robinhood_broker.py        # 68 checks: confirmed live response shapes (equity), unverified crypto dispatch, persistent-session lifecycle
 python test_oauth.py                   # 14 checks
-python test_run_cycle.py               # 33 checks, live STRATEGY wiring
+python test_run_cycle.py               # 85 checks, live STRATEGY/CRYPTO_STRATEGY wiring, --max-price, --consider-crypto end to end
 python smoke_test.py                   # all 30 notebook cells
 jupyter lab research.ipynb
+
+python debug_robinhood_crypto.py       # run before trusting --consider-crypto --live -- see "Crypto support"
 ```
 
 The notebook runs offline on generated data by default. Set `USE_OPENBB = True`
@@ -105,7 +108,7 @@ in cell 1 for real ETF data; nothing else changes.
 | `TimeSeriesMomentum` | Hold each name only while it's above its own moving average. |
 | `ShortHorizonReversal` | Buy the most oversold names by trailing-return z-score. |
 | `PairsTrading` | Market-neutral stat-arb on the log-price spread of correlated pairs. |
-| `MultiFactorCrossSectional` | Blend momentum, low-vol, and reversal into one cross-sectional score. |
+| `MultiFactorCrossSectional` | Blend momentum, low-vol, reversal, and (optionally, given a `FundamentalsPanel`) a quality factor into one cross-sectional score. |
 | `CalendarSeasonality` | Invested only in the turn-of-month window, flat the rest of the month. |
 | `RiskParityAllocation` | Equal risk contribution across the universe from the covariance matrix. |
 | `OptionsMeanReversion` | Buy names where options-implied fear (IV, put/call ratio) is most stretched vs. their own history. |
@@ -127,13 +130,18 @@ by fixed capital share).
 ## The three tests worth keeping permanently
 
 1. **Null test** (`test_qbt.py` §2). On data with no exploitable structure, every
-   strategy must score a Sharpe indistinguishable from zero. Currently 0.41
-   (t=1.60) and 0.10 (t=0.41) for `CrossSectionalMomentum` and
-   `ShortHorizonReversal`, the only two the loop currently runs. If a
-   strategy looks profitable here, the harness is leaking, not the market
-   paying. The other 8 strategies aren't in this loop yet — extending it to
-   all of them is a good next step, not something to assume passes by
-   analogy.
+   strategy must score a Sharpe indistinguishable from zero. All 10 strategies
+   are in this loop now (extended from the original 2 — `CrossSectionalMomentum`
+   at 0.41/t=1.60 and `ShortHorizonReversal` at 0.10/t=0.41 — which is why
+   those two numbers still look familiar). `OptionsMeanReversion` and
+   `InsiderEventDrift` run against synthetic iid options/corporate-events
+   panels built from an RNG independent of the price panel's own, specifically
+   so a null result there proves the *auxiliary data path* is clean too, not
+   just the price path; `MultiFactorCrossSectional` runs with its `quality`
+   factor turned on against a null `FundamentalsPanel`, for the same reason —
+   this is what gives the live composite below (see "The live strategy")
+   grounds to actually use that factor. If a strategy looks profitable here,
+   the harness is leaking, not the market paying.
 2. **Look-ahead firewall** (§1). A strategy that records the furthest date it saw
    must never exceed its decision bar.
 3. **Live parity** (`test_qbt.py` §7 and notebook §10). The live runner and a
@@ -160,12 +168,21 @@ you should expect to live with than the maximum.
 - **Point-in-time data now exists for fundamentals, macro, and filings** —
   `FundamentalsPanel`, `MacrosPanel`, and `CorpsPanel` each key off the date
   their data actually became public (see "Data sources" above), not the
-  date it describes. Two things still don't have it: `OptionsPanel` has no
+  date it describes. `OptionsPanel` is the one that still doesn't: no
   historical backfill on the free providers (documented in its own module,
-  not a bug to fix — a data-market limitation), and
-  `MultiFactorCrossSectional` deliberately stays price-only rather than
-  reaching for the new panels (see its docstring) — a genuine "quality"
-  factor from `FundamentalsPanel` is the natural next extension there.
+  not a bug to fix — a data-market limitation).
+- **`MultiFactorCrossSectional`'s `quality_metric` default
+  (`"ratios_return_on_equity"`) is unverified against a live provider.**
+  Unlike `run_cycle.py`'s Robinhood broker responses (see "Confirmed against
+  the live service" below), this column name has never been checked against
+  what `openbb-fmp`'s `ratios` statement actually returns — it's a
+  plausible guess at OpenBB's standardized naming, not a confirmed one.
+  Check `fundamentals.metrics` the first time `openbb-fmp` is actually
+  installed and pulling data, the same way `FundamentalsValueFilter`'s own
+  docstring already tells you to. If the name is wrong, the quality factor
+  degrades to "no name qualifies" (see the class docstring's "unknown means
+  blocked" rule) rather than silently scoring on a wrong column — safe, but
+  worth confirming rather than assuming.
 - **Fill model is a fixed spread.** No partial fills, gaps, halts, or
   size-dependent impact.
 - **Walk-forward retention ratio > 1 on synthetic data** (OOS 0.97 vs IS 0.60).
@@ -183,6 +200,12 @@ you should expect to live with than the maximum.
   against up to 30 names is a thin sample for a full covariance matrix;
   `max_names` and `cov_lookback` are levers to pull before trusting the
   weights on real data.
+- **The entire crypto sleeve (`--consider-crypto`) is unverified against a
+  live account** — tool names, response shapes, the starter coin list, and
+  which portfolio figure actually sizes it are all documented guesses, not
+  confirmed data, unlike everything under "Confirmed against the live
+  service" below. See "Crypto support" for the full list and
+  `debug_robinhood_crypto.py` for the diagnostic to run before trusting it.
 
 ## Suggested next steps
 
@@ -191,8 +214,10 @@ you should expect to live with than the maximum.
 3. Move `test_qbt.py` into a real `tests/` directory with pytest.
 4. Persist the `audit` frame from every run. It is the only thing that
    distinguishes "the strategy stopped working" from "I changed something".
-5. Give `MultiFactorCrossSectional` a real quality factor from
-   `FundamentalsPanel` now that one exists (see "Known gaps").
+5. ~~Give `MultiFactorCrossSectional` a real quality factor from
+   `FundamentalsPanel`.~~ Done — see "The live strategy" below and the
+   `quality_metric` caveat in "Known gaps". Verifying that metric name
+   against a live `openbb-fmp` response is the part still outstanding.
 
 ## Connecting to Robinhood
 
@@ -210,10 +235,14 @@ python run_cycle.py --synthetic --ignore-market-hours   # offline, mock broker
 python run_cycle.py                                     # dry run, real data
 python run_cycle.py --live --max-order 50               # live, minimum size
 python run_cycle.py --check-portfolio                   # read-only: print holdings, exit
+python run_cycle.py --max-price 200                     # exclude anything pricier than $200/share
+python run_cycle.py --consider-crypto                   # also run the crypto sleeve (see "Crypto support")
 ```
 
 Exit codes: `0` completed, `1` aborted at preflight, `2` unresolved in-flight
-order (halt before the next cycle), `3` setup failure.
+order (halt before the next cycle), `3` setup failure. With `--consider-crypto`
+the equity and crypto sleeves each produce one of these independently and the
+worse of the two (`3 > 2 > 1 > 0`) becomes the process exit code.
 
 `--check-portfolio` skips everything else — no price panel, no strategy, no
 risk gate, no journal or audit writes. It connects, calls the same
@@ -224,43 +253,183 @@ in the account without running or dry-running a full cycle.
 ### The live strategy
 
 `run_cycle.py`'s `STRATEGY` is not just `CrossSectionalMomentum` on its own —
-it's that core wrapped in two whole-book de-risking overlays, both scaling
-exposure down (never up, never redistributing into fewer names) when their
-own regime read is unfavourable:
+it's a two-member `Composite` core wrapped in two whole-book de-risking
+overlays, both scaling exposure down (never up, never redistributing into
+fewer names) when their own regime read is unfavourable:
 
 ```
 BreadthRegimeFilter(lookback=200, min_breadth=0.3, scale_when_blocked=0.5)
   -> MacroRegimeFilter(metric="vix", max_level=35.0, max_increase=15.0,
                         lookback=21, scale_when_blocked=0.5)
-       -> CrossSectionalMomentum(lookback=63, skip=5, top_n=5)
+       -> Composite("momentum_quality_blend")
+            -> CrossSectionalMomentum(lookback=63, skip=5, top_n=5)              [60%]
+            -> MultiFactorCrossSectional(momentum, low_vol, reversal, quality)  [40%]
 ```
+
+The core used to be `CrossSectionalMomentum` alone. One alpha source is one
+bet on one factor working, which is exactly the failure mode the two regime
+overlays above already exist to hedge against on the *macro* axis — the
+`Composite` core hedges the same concentration risk on the *strategy* axis.
+60% of the core's capital share is still the momentum strategy that's been
+through the null test and run live the longest; 40% is
+`MultiFactorCrossSectional`, itself a blend of its own price-derived
+momentum/low-vol/reversal factors plus a `quality` factor (return on equity,
+from `FundamentalsPanel` — see the `quality_metric` caveat in "Known gaps")
+so that 40% isn't just momentum measured a second way. Both members are
+covered by the same null test as the original core (`test_qbt.py` §2, now
+extended to all 10 strategies — see "The three tests worth keeping
+permanently"). Capital share, not name exclusivity: nothing stops both
+members from picking the same symbol, in which case its total weight is
+just the sum of what each sleeve independently assigned it.
 
 `MacroRegimeFilter` blocks on a VIX level above 35 or a 15-point rise inside
 21 trading days — genuine risk-off territory, not routine noise.
 `BreadthRegimeFilter` blocks when fewer than 30% of `run_cycle.py`'s own
-18-symbol universe is above its own 200-day average. Neither changes which
-names get picked; each independently scales total exposure to 50% when
+UNIVERSE (18 ETFs + 12 single names, 30 symbols) is above its own 200-day
+average. Neither overlay changes which names get picked or which Composite
+member picked them; each independently scales total exposure to 50% when
 triggered, so both firing at once compounds to 25% (see the comment above
 `STRATEGY` in `run_cycle.py` for the full rationale). A cycle where either
 overlay is actively scaling prints a `REGIME:` line and emits a
 `breadth_regime_blocked` / `macro_regime_blocked` audit event — without that,
 a de-risk would show up only as an unexplained smaller position size.
-`test_run_cycle.py` (33 checks) is the permanent regression guard on this
-wiring: the composition, the thresholds, and that elevated VIX alone scales
-turnover to exactly 50%.
+`test_run_cycle.py` (60 checks) is the permanent regression guard on this
+wiring: the composition, the capital shares, the thresholds, that elevated
+VIX alone scales turnover to exactly 50%, and that the quality sleeve
+degrades to cash (not a crash) when fundamentals aren't available.
 
-**The VIX overlay needs a working FRED fetch to do anything.** In `--live`
-and dry-run (non-`--synthetic`) modes, `run_cycle.py` fetches VIX via
-`MacrosRepository`/`openbb-fred`, cached under `.cache/macro`. If that fetch
-fails for any reason — no `openbb-fred` installed, no FRED API key
-configured, FRED itself down — the cycle does **not** abort; it emits
-`macro_fetch_failed`, prints the exception, and continues with `macros=None`.
-`MacroRegimeFilter` treats `macros=None` as a documented no-op pass-through,
-so the practical effect is silent: the VIX overlay simply does nothing every
-cycle until FRED access is actually configured, and only `BreadthRegimeFilter`
-(which needs no external data — it's computed straight from the price panel)
-is doing any regime-based de-risking in the meantime. Safe, but worth knowing
-explicitly rather than assuming both overlays are live.
+**The VIX overlay needs a working FRED fetch to do anything, and the quality
+sleeve needs a working FMP fetch.** In `--live` and dry-run
+(non-`--synthetic`) modes, `run_cycle.py` fetches VIX via
+`MacrosRepository`/`openbb-fred` (cached under `.cache/macro`) and ROE via
+`FundamentalsRepository`/`openbb-fmp` (cached under `.cache/fundamentals`).
+If either fetch fails for any reason — the package not installed, no API
+key configured, the provider itself down — the cycle does **not** abort; it
+emits `macro_fetch_failed` or `fundamentals_fetch_failed`, prints the
+exception, and continues with `macros=None` / `fundamentals=None`.
+`MacroRegimeFilter` treats `macros=None` as a documented no-op pass-through;
+`MultiFactorCrossSectional` treats `fundamentals=None` as "no name qualifies
+for the quality factor" (see its own docstring), which — because the quality
+factor is only 40% of one 60/40-split core, not the whole book — degrades
+that 40% share to cash rather than removing it. The practical effect in
+either failure is silent: no `--live` abort, just quietly less of the book
+doing what it's configured to do until access is restored. Safe, but worth
+knowing explicitly rather than assuming both overlays and both `Composite`
+members are live.
+
+### Crypto support (`--consider-crypto`, unverified)
+
+Robinhood added crypto trading to the MCP server; `run_cycle.py --consider-crypto`
+runs `CRYPTO_STRATEGY` as a **second, independent** plan/execute pass over
+the same broker connection, alongside the equity `STRATEGY` pass, in one
+process/one cycle. "Independent" is deliberate, not incidental — crypto and
+equities differ on exactly the axes that would break a shared pipeline:
+
+- **24/7 trading.** `ExecutionPolicy.require_market_open=False` for the
+  crypto pass; gating it on NYSE hours would leave it unable to trade most
+  of the week for a reason that has nothing to do with crypto markets being
+  open.
+- **No PDT rule.** Crypto trades through Robinhood Crypto, not the
+  broker-dealer FINRA's Pattern Day Trader rule applies to. The crypto pass
+  uses `DayTradeLedger(equity_threshold=0.0)`, which makes
+  `remaining()` always report the "effectively unlimited" sentinel
+  regardless of accumulated events (see `DayTradeLedger.remaining()`) — not
+  persisted, since a rule that never binds has nothing worth remembering
+  between cycles.
+- **No fundamentals.** There is no SEC filing or return-on-equity figure for
+  a coin, so `CRYPTO_STRATEGY`'s `MultiFactorCrossSectional` member drops
+  the `quality` factor entirely and re-normalises `momentum`/`low_vol`/
+  `reversal` to still sum to 1.0, rather than silently running at 60% of
+  its intended weight the way `fundamentals=None` alone would produce.
+- **Two separate balance sheets.** `qbt/broker.py`'s `RobinhoodMCPBroker`
+  gained an `asset_class` parameter threaded through `get_account`/
+  `get_quotes`/`get_orders`/`review_order`/`place_order`/`cancel_order`,
+  and `crypto_view()`, which returns a `BrokerAdapter`-shaped proxy pinned
+  to `asset_class="crypto"` — same MCP session, same account, just resolved
+  against the `crypto_*`-bound tools instead of the equity ones. This is
+  what lets `OrderManager`/`LiveSignalRunner` (which call the plain
+  `BrokerAdapter` methods with no `asset_class` argument) run the crypto
+  sleeve completely unmodified. Journal, peak-equity, and audit-log paths
+  are `_crypto`-suffixed and separate from the equity ones for the same
+  reason `--synthetic` and `--live` state files are already kept apart —
+  see `mode_path()`.
+
+**What's genuinely unverified, in order of consequence:**
+
+1. **The `crypto_*` MCP tool names.** *Names confirmed* (2026-08-30,
+   `debug_robinhood_crypto.py`): the server advertises
+   `get_crypto_positions`/`get_crypto_quotes`/`get_crypto_orders`/
+   `preview_crypto_order`/`place_crypto_order`/`cancel_crypto_order`, plus
+   `get_currency_pairs` (the pair catalog, bound as `crypto_pairs`). The
+   `CAPABILITY_CANDIDATES` guesses resolved against those. `broker.require_crypto()`
+   still raises with the full advertised tool list if a future server
+   differs, rather than failing confusingly downstream; **`debug_robinhood_crypto.py`**
+   remains the read-only diagnostic to run first (mirrors
+   `debug_robinhood_accounts.py`, which is what turned the *equity* guesses
+   below into the confirmed list).
+2. **Response shapes** for all six — field names for a crypto position/
+   quote/order record, whether `place_crypto_order` wraps the same
+   `{"data": {"order": {...}}}` way `place_equity_order` does, whether
+   `quantity` is a JSON string there too. `_pick()`'s multi-candidate
+   field matching and `_unwrap_object()`'s multi-layer unwrapping give this
+   some slack the way they already did for the equity surface's own
+   surprises, but slack isn't confirmation.
+3. **`CRYPTOS`**, the starter coin list (`BTC-USD`, `ETH-USD`, ... — the
+   yfinance ticker form; see `OpenBBRepository`'s `asset_class="crypto"`
+   docstring for why that form, not `"BTC"`) is a conservative, liquid guess,
+   not a confirmed enumeration of what the account can actually trade —
+   there's no discovery for that the way there is for tool names. An
+   unsupported symbol just never gets a quote back and is never tradeable
+   (`_tradeable()` already requires a real price), so this list leans
+   generous on purpose; trim or extend it freely.
+4. **Whether `crypto_value` (from the already-confirmed `portfolio` tool)
+   is the right figure to size the sleeve against**, vs. something derived
+   from `crypto_positions` directly — both are plausible, only one is used
+   (`_portfolio_figures(asset_class="crypto")`), and it hasn't been
+   cross-checked against a live response.
+5. **Whether crypto buying power is tracked separately from cash.** Assumed
+   not (crypto purchases draw from the same settled cash) — unconfirmed.
+6. **Per-pair quantity increments.** Confirmed live (2026-08) on the first
+   `--consider-crypto` run: `preview_crypto_order` 400s on an over-precise
+   quantity (`{"quantity": ["Your order quantity has too much precision.
+   Please round the quantity to an appropriate increment…"]}`) — a
+   *different, stricter* rule than the equity 8-dp limit, and it fires
+   during review, so `require_review=True` hits it even on a dry run.
+   *Handled:* `RobinhoodMCPBroker._load_crypto_pairs()` pulls
+   `min_order_quantity_increment` and `min_order_size` per pair from
+   `get_currency_pairs` once per cycle, and `_crypto_order_quantity()`
+   snaps every crypto order to that increment. A snapped size below the
+   pair's `min_order_size` raises `BrokerRejection`, which
+   `OrderManager.execute()` skips per-intent exactly like a live 4xx (no
+   doomed round trip). If the lookup can't answer — catalog tool unbound,
+   call failed, coin absent — it falls back to the static
+   `CRYPTO_QUANTITY_DECIMALS` table in `qbt/broker.py` (that field as
+   decimal places for every coin in `CRYPTOS`, from a live
+   `get_currency_pairs` response 2026-08-30, cross-checked against the live
+   accept/reject behaviour: ETH/BCH accepted at 6 dp; ADA/LINK/AAVE
+   rejected at 6 dp — their real increments are `0.01`/`0.0001`/`0.00001`),
+   and then to a **6 dp** default. Refresh the static table from
+   `debug_robinhood_crypto.py` if Robinhood retunes a pair or `CRYPTOS`
+   grows. A coin too fine for even the 6-dp default is a clean per-intent
+   skip (`order_review_rejected` → "review rejected: …too much precision"),
+   not a crash. *Still open:* `preview`/`place_crypto_order` also accept a
+   `dollar_amount` in place of `quantity` — sizing the sleeve by notional
+   would sidestep the increment entirely.
+
+`CRYPTO_GATE` (`max_weight=0.20`, `max_drawdown=0.20`, both tighter than the
+equity `GATE`'s 0.30/0.25) and the smaller `--max-crypto-order`/
+`--max-crypto-plan` defaults ($100/$1,000 vs. equity's $500/$5,000) exist
+for the same reason as everything above: this is a new, unverified pipeline,
+so it starts at the small end of "Going live, in order" (below) rather than
+inheriting sizing that took months of confirmed live equity behaviour to
+justify. Omitting `--consider-crypto` (the default) leaves every equity
+flag, and the entire equity pass, completely unaffected — the two sleeves
+share only the MCP connection and the audit log (each event tagged
+`sleeve=equity`/`sleeve=crypto`).
+
+Exit codes combine **worst-wins**: `3 > 2 > 1 > 0` across whichever sleeves
+actually ran, so a clean crypto pass can never mask an equity halt that
+needs investigating (or vice versa) — see `run_cycle.py`'s module docstring.
 
 ### The per-order cap and whole-share instruments
 
@@ -288,6 +457,29 @@ Two things this does *not* loosen: `--max-plan` (default $5,000) still caps
 the whole cycle, and `max_position_weight` still caps any single name's share
 of the book. Raising the per-order cap changes how large one *trade* may be,
 not how large a *position* may become.
+
+### `--max-price`: keeping one expensive name from crowding out the rest
+
+`--max-order` caps how large a single *trade* can be; it does not stop the
+whole-share retry above from still trying to buy one full share of a name
+whose price exceeds the intended position size, and then either succeeding
+at an oversized weight (if under `--max-order`) or getting skipped outright
+(if over it) — either way, that name's disproportionate price, not the
+strategy's conviction, decided the outcome. `--max-price` (default: no cap)
+fixes this earlier and more directly: any symbol whose latest close exceeds
+it is excluded from the tradeable universe *before* the strategy ever ranks
+or picks names, via `apply_price_cap()` in `run_cycle.py`. `CrossSectionalMomentum`
+and friends simply never see GLD (~$392/share) as a candidate on a small
+account with `--max-price 200`, rather than seeing it, picking it, and then
+having the order-execution layer fight the consequences one trade at a time.
+
+An already-held position above the cap is not sold — it becomes an
+*unmanaged holding*, the same diagnostic and equity-drift preflight backstop
+a position outside `UNIVERSE` already gets (see `run_cycle.py`'s own
+comment on this), until it's sold by hand or the cap is raised. `--max-crypto-price`
+is the same idea for the crypto sleeve (see "Crypto support" below), though
+it binds less often there: crypto orders are fractional-friendly, so there's
+no whole-share retry forcing an oversized buy the way there is for equities.
 
 ### Short positions
 
@@ -335,6 +527,44 @@ argument names from each input schema, so a server that says `ticker` where you
 assumed `symbol` still works. Missing capabilities raise at connect, not at the
 first order. Run `broker.list_capabilities()` first.
 
+### Connection lifecycle: one persistent session, not one per call
+
+`connect()` opens the HTTP transport and the MCP session once and keeps both
+open (via an `AsyncExitStack`) for the broker's lifetime; every `get_account`/
+`get_quotes`/`review_order`/`place_order`/... call reuses that one session's
+`call_tool()` rather than each opening and tearing down its own transport +
+session + `initialize()` handshake. A single trading cycle used to make
+roughly a dozen separate round trips for what's now one — real, avoidable
+latency (and failure surface, from simply attempting the handshake more
+times) on every scheduled run.
+
+**This specific piece of connection lifecycle is unconfirmed against the live
+service** — unlike the response shapes below, which were. The trade-off is
+real and stated plainly in `_open_session()`'s own docstring: the old
+per-call-reconnect design was, as a side effect of being wasteful,
+self-healing against a mid-cycle network blip — a failure on one call
+couldn't touch the next, which got its own fresh connection regardless.
+Reusing one session trades that away — if the persistent session breaks
+partway through a cycle, every remaining call in that cycle fails with it.
+Deliberately **not** patched over with an automatic reconnect-and-retry:
+retrying a `place_order`/`review_order`/`cancel_order` call whose outcome is
+genuinely ambiguous (did the order go through before the connection died, or
+not?) is exactly the "blind retry after an unknown outcome" the write-ahead
+journal exists to rule out (see "Idempotency without a broker-side key"
+below) — an auto-retry at the connection layer would submit a second order
+without `OrderManager`'s journal ever knowing there'd been a first attempt.
+A cycle that dies partway through from a broken connection surfaces as an
+ordinary exception, the same as it already could for any other reason, and
+recovers the same way — via `OrderManager.recover()` reading the broker's
+own order list on the next cycle, not a retry inside this one.
+
+Offline lifecycle mechanics (session reuse across calls, clean teardown, a
+failed handshake not leaking a half-open transport) are covered by
+`test_robinhood_broker.py` §11 against a faked MCP session — real network
+behavior under this pattern (does an idle session between calls survive, is
+there a server-side timeout) is not something that test, or anything else in
+this repo, can confirm without a live server.
+
 ### Confirmed against the live service (2026-08)
 
 Everything below was verified against a real agentic Robinhood account, not
@@ -367,7 +597,10 @@ follow all come from actual live calls, not the original design-time guesses.
   review schema — values are coerced to match whatever type each tool's own
   schema actually declares, not assumed.
 - **Orders must not exceed 8 decimal places**, a business rule enforced by the
-  API itself, beyond and separate from anything the schema says.
+  API itself, beyond and separate from anything the schema says. This is the
+  *equity* rule; crypto is stricter (per-pair increments — see "Crypto
+  support" point 6). `_order_args()` rounds to whichever applies via
+  `_quantity_decimals()`.
 - **Fractional-share orders are rejected outright on at least several ETFs**
   (observed on XLF, XLK, XLV, IWM, and EFA) — "Order quantity cannot include
   fractional shares." This looks like a broad account/instrument-class
@@ -481,3 +714,11 @@ Each step should run for long enough to be boring before you take the next.
    real fills, real rejections, and real reconciliation drift.
 4. **Scale** only after a full rebalance cycle has completed cleanly,
    including at least one rejection handled correctly.
+
+`--consider-crypto` is a separate ramp, not a shortcut through this one --
+its tool surface is unconfirmed (see "Crypto support"), so run
+`debug_robinhood_crypto.py` first, then repeat steps 1-4 for the crypto
+sleeve on its own before trusting it alongside a scaled-up equity sleeve.
+Nothing about having gone through this list once for equities carries over;
+a confirmed `place_equity_order` response shape says nothing about whether
+`place_crypto_order` wraps its response the same way.

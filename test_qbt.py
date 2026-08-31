@@ -8,11 +8,13 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    Backtester, BreadthRegimeFilter, Composite, CostModel,
-    CrossSectionalMomentum, DayTradeLedger,
-    EqualWeightBuyHold, ExecutionConfig, InverseVolWeighted, LiveSignalRunner,
-    MultiFactorCrossSectional, OpenBBRepository, PortfolioState, PricePanel,
-    RiskGate, ShortHorizonReversal, SyntheticRepository, TimeSeriesMomentum,
+    Backtester, BreadthRegimeFilter, CalendarSeasonality, Composite, CorpsPanel,
+    CostModel, CrossSectionalMomentum, DayTradeLedger,
+    EqualWeightBuyHold, ExecutionConfig, FundamentalsPanel, InsiderEventDrift,
+    InverseVolWeighted, LiveSignalRunner, MultiFactorCrossSectional,
+    OpenBBRepository, OptionsMeanReversion, OptionsPanel, PairsTrading,
+    PortfolioState, PricePanel, RiskGate, RiskParityAllocation,
+    ShortHorizonReversal, SyntheticRepository, TimeSeriesMomentum,
     TrendFilter, compare, ic_grid, ic_summary, information_coefficient,
     expected_max_sharpe, forward_returns, rebalance_dates,
     return_autocorrelation, trailing_signal, walk_forward_splits,
@@ -164,16 +166,112 @@ null_repo = SyntheticRepository(
 )
 null_panel = null_repo.fetch(start="2010-01-01", end="2024-12-31")
 
+# Every strategy that reads fundamentals/corps/options needs a null version
+# of *that* data source too -- a strategy can't leak off a signal that isn't
+# there, but it also isn't being tested at all if the auxiliary panel is
+# just absent (its target_weights() would return empty and the check below
+# would trivially pass without ever exercising the strategy's real logic).
+# All three are built from an RNG independent of the price panel's own --
+# "independent of price" is the entire point, since a null test of a data
+# source proves nothing if that source is secretly derived from the same
+# process as the returns it's meant to predict.
+null_rng = np.random.default_rng(97)
+
+# One filing per symbol, all dated at the panel's first bar -- constant for
+# the whole backtest, cross-sectionally random, with no relationship to any
+# symbol's subsequent path. Enough to exercise
+# MultiFactorCrossSectional's quality factor; PIT filing cadence itself is
+# test_fundamentals.py's job, not this one's.
+null_fundamentals = FundamentalsPanel(frame=pd.DataFrame(
+    {
+        "symbol": null_panel.symbols,
+        "metric": "ratios_return_on_equity",
+        "period_end": pd.DatetimeIndex([null_panel.dates[0]] * len(null_panel.symbols)),
+        "as_of_date": pd.DatetimeIndex([null_panel.dates[0]] * len(null_panel.symbols)),
+        "value": null_rng.normal(12.0, 5.0, len(null_panel.symbols)),
+    }
+))
+
+# A genuinely daily archive (real ones are too -- see OptionsPanel's module
+# docstring), iid noise per symbol per day, for OptionsMeanReversion's own
+# trailing self-z-score to chew on. np.repeat/np.tile on a DatetimeIndex
+# fall back to the underlying datetime64 ndarray, so the dtype survives;
+# still wrapped in pd.DatetimeIndex(...) explicitly rather than trusting
+# that -- FundamentalsPanel/OptionsPanel/CorpsPanel all raise TypeError on
+# anything less than true datetime64 dtype, and an accidental object column
+# of Timestamps would otherwise fail that check with a confusing error far
+# from this construction site.
+_n_dates, _n_syms = len(null_panel.dates), len(null_panel.symbols)
+_opt_rows = null_rng.normal(0.25, 0.05, (_n_dates, _n_syms))
+_pcr_rows = null_rng.normal(0.9, 0.2, (_n_dates, _n_syms))
+_opt_dates = pd.DatetimeIndex(np.repeat(null_panel.dates.values, _n_syms))
+_opt_symbols = np.tile(np.asarray(null_panel.symbols), _n_dates)
+null_options = OptionsPanel(frame=pd.concat([
+    pd.DataFrame({
+        "symbol": _opt_symbols,
+        "metric": "iv_atm_near",
+        "period_end": _opt_dates,
+        "as_of_date": _opt_dates,
+        "value": np.clip(_opt_rows, 0.01, None).ravel(),
+    }),
+    pd.DataFrame({
+        "symbol": _opt_symbols,
+        "metric": "put_call_volume_ratio",
+        "period_end": _opt_dates,
+        "as_of_date": _opt_dates,
+        "value": np.clip(_pcr_rows, 0.01, None).ravel(),
+    }),
+], ignore_index=True))
+
+# Sparse random "events" per symbol -- filing cadence and insider activity
+# are event-driven, not a dense daily grid (see CorpsPanel's own docstring),
+# so a handful of random dates per symbol is the realistic shape, not a
+# daily archive like options above. require_8k=False below (see the
+# strategy construction) so this alone drives InsiderEventDrift's entry
+# condition -- AND-ing in a second, independently sparse random event would
+# make genuine (if fake) qualifying windows too rare to say anything.
+_n_events_per_symbol = 80
+_event_rows = []
+for sym in null_panel.symbols:
+    idx = null_rng.choice(len(null_panel.dates), size=_n_events_per_symbol, replace=False)
+    for d in null_panel.dates[np.sort(idx)]:
+        _event_rows.append((sym, "insider_buy_count_90d", d, d,
+                             float(null_rng.integers(0, 3))))
+        _event_rows.append((sym, "insider_net_shares_90d", d, d,
+                             float(null_rng.normal(0.0, 5000.0))))
+null_corps = CorpsPanel(frame=pd.DataFrame(
+    _event_rows, columns=["symbol", "metric", "period_end", "as_of_date", "value"]
+))
+
 null_results = {}
-for strat in [
-    CrossSectionalMomentum(lookback=126, top_n=10),
-    ShortHorizonReversal(lookback=5, top_n=5),
-]:
+null_configs = [
+    (EqualWeightBuyHold(), {}),
+    (CrossSectionalMomentum(lookback=126, top_n=10), {}),
+    (TimeSeriesMomentum(lookback=200), {}),
+    (ShortHorizonReversal(lookback=5, top_n=5), {}),
+    (PairsTrading(formation=126, z_window=21, n_pairs=8), {}),
+    (
+        MultiFactorCrossSectional(
+            top_n=10,
+            factor_weights={"momentum": 0.3, "low_vol": 0.3, "reversal": 0.2, "quality": 0.2},
+        ),
+        {"fundamentals": null_fundamentals},
+    ),
+    (CalendarSeasonality(pre_days=3, post_days=3), {"rebalance": "D"}),
+    (RiskParityAllocation(cov_lookback=126, max_names=20), {}),
+    (OptionsMeanReversion(iv_window=20, top_n=5), {"options": null_options}),
+    (InsiderEventDrift(drift_days=10, require_8k=False, top_n=10), {"corps": null_corps}),
+]
+
+for strat, extra in null_configs:
+    extra = dict(extra)
+    rebalance = extra.pop("rebalance", "M")
     r = Backtester(
         panel=null_panel, strategy=strat,
         risk_gate=RiskGate(target_vol=0.12, max_drawdown=None),
         cost_model=CostModel(slippage_bps=0.0, sell_fee_bps=0.0),
-        rebalance="M", initial_equity=100_000,
+        rebalance=rebalance, initial_equity=100_000,
+        **extra,
     ).run()
     null_results[strat.name] = r
     s = r.summary()
@@ -181,10 +279,11 @@ for strat in [
     rr = r.returns[r.returns != 0]
     t = rr.mean() / rr.std() * np.sqrt(len(rr)) if len(rr) > 2 else np.nan
     print(f"  {strat.name:26s} sharpe={s['sharpe']:+.2f}  t={t:+.2f}  "
-          f"cagr={s['cagr']:+.2%}")
+          f"cagr={s['cagr']:+.2%}  n_trades={len(rr)}")
     check(f"null: |sharpe| < 0.6 for {strat.name}", abs(s["sharpe"]) < 0.6,
           f"sharpe={s['sharpe']:.2f}")
-    check(f"null: |t| < 2.6 for {strat.name}", abs(t) < 2.6, f"t={t:.2f}")
+    check(f"null: |t| < 2.6 for {strat.name}", np.isfinite(t) and abs(t) < 2.6,
+          f"t={t}")
 
 print()
 print("=" * 72)

@@ -12,7 +12,7 @@ from qbt import (
     CrossSectionalMomentum, DayTradeLedger, LiveSignalRunner, LivePlan,
     OrderIntent, PortfolioState, RiskGate, SyntheticRepository,
 )
-from qbt.broker import BrokerOrder, MockBroker
+from qbt.broker import BrokerOrder, BrokerRejection, MockBroker
 from qbt.orders import (
     AuditLog, ExecutionPolicy, ExecutionReport, OrderManager, _clean_broker_rejection,
 )
@@ -567,6 +567,135 @@ check("the rest of the plan still executes after a fractional rejection, not aba
 frac_recover = frac_om.recover()
 check("recover() finds nothing dangling after a fractional-rejection retry succeeded",
       frac_recover.empty)
+
+# A review_order that raises must not abort the whole sleeve. Confirmed live
+# (2026-08) on the first --consider-crypto run: review_crypto_order 400s on
+# an over-precise crypto quantity ({"quantity": ["...too much precision..."]})
+# before place_order is ever reached, and require_review=True fires that even
+# on a dry run. execute() must treat an "API error 4xx" from review the same
+# way it treats one from place_order -- skip that intent, keep going -- not
+# let the RuntimeError propagate out to run_pipeline() as a cycle_error that
+# fails the entire sleeve. Raised as a nested ExceptionGroup for the same
+# reason as _fractional_shares_error() above.
+def _review_precision_error():
+    inner = RuntimeError(
+        'MCP tool error: [TextContent(type=\'text\', text=\'API error 400: '
+        '{"quantity":["Your order quantity has too much precision. Please round '
+        'the quantity to an appropriate increment and try placing your order '
+        'again."]}\')]')
+    return ExceptionGroup("unhandled errors in a TaskGroup",
+                          [ExceptionGroup("unhandled errors in a TaskGroup", [inner])])
+
+
+rev_path = fresh("review_raises")
+rev_broker = MockBroker(prices=pd.Series({"AAA": 100.0, "BBB": 50.0}), cash=100_000.0)
+rev_broker.connect()
+_real_rev_place = rev_broker.place_order
+rev_placed = []
+def _rev_place(symbol, side, quantity, *a, **kw):
+    rev_placed.append(symbol)
+    return _real_rev_place(symbol, side, quantity, *a, **kw)
+def _rev_review(symbol, side, quantity, *a, **kw):
+    if symbol == "AAA":
+        raise _review_precision_error()
+    return {"ok": True, "warnings": [], "estimated_price": 50.0,
+            "estimated_notional": 250.0}
+rev_broker.place_order = _rev_place
+rev_broker.review_order = _rev_review
+
+rev_om = OrderManager(
+    rev_broker,
+    ExecutionPolicy(dry_run=False, require_review=True, require_market_open=False,
+                    kill_switch_path=os.path.join(rev_path, "KILL")),
+    AuditLog(os.path.join(rev_path, "a.jsonl"), stdout=False),
+    os.path.join(rev_path, "j.jsonl"),
+)
+rev_intents = [
+    OrderIntent(symbol="AAA", side="buy", shares=2.72, reference_price=100.0,
+               notional=272.0, current_weight=0.0, target_weight=0.01),
+    OrderIntent(symbol="BBB", side="buy", shares=5.0, reference_price=50.0,
+               notional=250.0, current_weight=0.0, target_weight=0.01),
+]
+rev_plan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=rev_intents,
+                    target_weights=pd.Series({"AAA": 0.01, "BBB": 0.01}),
+                    current_weights=pd.Series({"AAA": 0.0, "BBB": 0.0}), decision=None)
+try:
+    rev_report = rev_om.execute(rev_plan, strategy_name="review-raises", now=now)
+    check("a review that 400s does not propagate out of execute()", True)
+except Exception as exc:
+    check("a review that 400s does not propagate out of execute()", False, repr(exc))
+    rev_report = None
+
+if rev_report is not None:
+    check("the intent whose review 400d is skipped, not submitted",
+          "AAA" not in rev_placed
+          and any(i.symbol == "AAA" and "review rejected" in r
+                  for i, r in rev_report.skipped),
+          f"placed={rev_placed} skipped={[(i.symbol, r) for i, r in rev_report.skipped]}")
+    check("the rest of the plan still executes after a review 400, not abandoned",
+          "BBB" in rev_placed and any(o.symbol == "BBB" for o in rev_report.submitted))
+    check("recover() finds nothing dangling after a review-rejected intent",
+          rev_om.recover().empty)
+
+# A BrokerRejection -- the adapter's own "this was never sent" for a crypto
+# size below the pair's min_order_size (qbt/broker.py) -- is handled the same
+# bounded way as a live 4xx: skip that one intent, keep the rest of the plan,
+# whether it surfaces from review_order or from place_order. Not a nested
+# ExceptionGroup: the adapter raises it directly.
+for _via in ("review", "place"):
+    _bp = fresh(f"broker_rej_{_via}")
+    _bb = MockBroker(prices=pd.Series({"AAA": 100.0, "BBB": 50.0}), cash=100_000.0)
+    _bb.connect()
+    _bb_placed = []
+    _real_place = _bb.place_order
+    def _bp_place(symbol, side, quantity, *a, _p=_real_place, _log=_bb_placed, **kw):
+        _log.append(symbol)
+        if symbol == "AAA" and _via == "place":
+            raise BrokerRejection(
+                "AAA order size 0.4 rounds to 0.4 at this pair's quantity "
+                "increment, below AAA min_order_size 1 -- nothing sent")
+        return _p(symbol, side, quantity, *a, **kw)
+    def _bp_review(symbol, side, quantity, *a, **kw):
+        if symbol == "AAA" and _via == "review":
+            raise BrokerRejection(
+                "AAA order size 0.4 rounds to 0.4 at this pair's quantity "
+                "increment, below AAA min_order_size 1 -- nothing sent")
+        return {"ok": True, "warnings": [], "estimated_price": 50.0,
+                "estimated_notional": 250.0}
+    _bb.place_order = _bp_place
+    _bb.review_order = _bp_review
+    _bom = OrderManager(
+        _bb,
+        ExecutionPolicy(dry_run=False, require_review=(_via == "review"),
+                        require_market_open=False,
+                        kill_switch_path=os.path.join(_bp, "KILL")),
+        AuditLog(os.path.join(_bp, "a.jsonl"), stdout=False),
+        os.path.join(_bp, "j.jsonl"),
+    )
+    _bintents = [
+        OrderIntent(symbol="AAA", side="buy", shares=0.004, reference_price=100.0,
+                    notional=0.4, current_weight=0.0, target_weight=0.01),
+        OrderIntent(symbol="BBB", side="buy", shares=5.0, reference_price=50.0,
+                    notional=250.0, current_weight=0.0, target_weight=0.01),
+    ]
+    _bplan = LivePlan(asof=pd.Timestamp.now(), equity=100_000.0, intents=_bintents,
+                      target_weights=pd.Series({"AAA": 0.01, "BBB": 0.01}),
+                      current_weights=pd.Series({"AAA": 0.0, "BBB": 0.0}), decision=None)
+    try:
+        _brep = _bom.execute(_bplan, strategy_name=f"broker-rej-{_via}", now=now)
+        check(f"a BrokerRejection from {_via}_order does not propagate out of execute()", True)
+    except Exception as exc:  # noqa: BLE001
+        check(f"a BrokerRejection from {_via}_order does not propagate out of execute()",
+              False, repr(exc))
+        _brep = None
+    if _brep is not None:
+        check(f"the BrokerRejection intent ({_via}) is skipped with a clean reason",
+              any(i.symbol == "AAA" and "min_order_size" in r for i, r in _brep.skipped),
+              f"skipped={[(i.symbol, r) for i, r in _brep.skipped]}")
+        check(f"the rest of the plan still executes after a BrokerRejection ({_via})",
+              "BBB" in _bb_placed and any(o.symbol == "BBB" for o in _brep.submitted))
+        check(f"recover() finds nothing dangling after a BrokerRejection ({_via})",
+              _bom.recover().empty)
 
 # A target under one share for a brand-new position (current_weight ~ 0)
 # rounds UP to one whole share instead of being skipped -- confirmed live
@@ -1229,6 +1358,7 @@ except RuntimeError as exc:
 # cancel_order must not read an error payload as success -- bool(raw) alone
 # treats any non-empty response as a successful cancel.
 cancel_broker = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+cancel_broker.account_id = None
 cancel_broker.bindings = {
     "cancel": ToolBinding("cancel", "cancel_equity_order", {
         "properties": {"order_id": {}}, "required": ["order_id"]})

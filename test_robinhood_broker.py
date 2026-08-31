@@ -71,14 +71,29 @@ silently regress any of the bugs this session found:
 
 Account numbers and dollar values below are fabricated, not the real ones
 from that session -- only the field names/nesting are verbatim.
+
+Section 10 is a different kind of test from everything above it: sections
+1-9 pin down shapes *confirmed* against a live response. Nothing about
+crypto has been confirmed live yet (see qbt/broker.py's module docstring
+and debug_robinhood_crypto.py) -- section 10 only checks that
+asset_class="crypto" dispatches to the crypto_* capability bindings and
+parses a *plausible*, clearly-fabricated response correctly, i.e. that the
+plumbing this session added is internally consistent. It is not evidence
+the guessed tool names or response shapes are right.
 """
 
 import io
 import logging
+import sys
+import types
+from types import SimpleNamespace
 
 import numpy as np
 
-from qbt.broker import RobinhoodMCPBroker, ToolBinding, _schema_types, _unwrap_object
+from qbt.broker import (
+    REQUIRED_CRYPTO_CAPABILITIES, BrokerRejection, RobinhoodMCPBroker, ToolBinding,
+    _schema_types, _unwrap_object,
+)
 
 FAILS = []
 
@@ -623,6 +638,467 @@ check("multi-level unwrapping does not over-unwrap into unrelated nested "
       "fields (portfolio's real shape)",
       _unwrap_object(_portfolio_like) == {"cash": "500",
                                           "buying_power": {"buying_power": "500"}})
+
+print()
+print("=" * 72)
+print("10. Crypto: asset_class dispatch, require_crypto(), crypto_view() "
+      "(unverified shapes -- see this file's own docstring)")
+print("=" * 72)
+
+check("require_crypto() checks exactly the crypto capability set",
+      set(REQUIRED_CRYPTO_CAPABILITIES) ==
+      {"crypto_positions", "crypto_quotes", "crypto_orders", "crypto_place"})
+
+# A server with no crypto tools at all -- the common case today, since
+# crypto was only just added -- must not break plain equity usage. connect()
+# itself isn't exercised here (that needs a real MCP session); what matters
+# is that an equity-only bindings dict, exactly what today's real servers
+# produce, doesn't make require_crypto() pass by accident.
+equity_only_broker = RobinhoodMCPBroker(token="fake")
+equity_only_broker.bindings = {
+    "accounts": ToolBinding("accounts", "get_accounts", {}),
+    "positions": ToolBinding("positions", "get_equity_positions", {}),
+    "quotes": ToolBinding("quotes", "get_equity_quotes", {}),
+    "orders": ToolBinding("orders", "get_equity_orders", {}),
+    "place": ToolBinding("place", "place_equity_order", {}),
+}
+equity_only_broker._all_tools = [
+    {"name": n, "description": "", "input_schema": {}}
+    for n in ("get_accounts", "get_equity_positions", "get_equity_quotes",
+             "get_equity_orders", "place_equity_order")
+]
+try:
+    equity_only_broker.require_crypto()
+    check("require_crypto() raises when the server has no crypto tools", False)
+except RuntimeError as exc:
+    check("require_crypto() raises when the server has no crypto tools", True)
+    check("...and names exactly what's missing, not a generic message",
+          "crypto_positions" in str(exc) and "crypto_quotes" in str(exc),
+          str(exc))
+
+# A server that does advertise the guessed get_crypto_X / X_crypto_order
+# names -- discovery should bind them the same way it already binds the
+# equity ones, since it's the identical candidate-matching mechanism.
+crypto_tool_names = ["get_crypto_positions", "get_crypto_quotes",
+                     "get_crypto_orders", "review_crypto_order",
+                     "place_crypto_order", "cancel_crypto_order"]
+crypto_capable_broker = RobinhoodMCPBroker(token="fake")
+crypto_capable_broker.bindings = dict(equity_only_broker.bindings)
+crypto_capable_broker.bindings.update({
+    "crypto_positions": ToolBinding("crypto_positions", "get_crypto_positions", {}),
+    "crypto_quotes": ToolBinding("crypto_quotes", "get_crypto_quotes",
+                                 {"properties": {"symbols": {"type": "array"}}}),
+    "crypto_orders": ToolBinding("crypto_orders", "get_crypto_orders", {}),
+    "crypto_review": ToolBinding("crypto_review", "review_crypto_order", {}),
+    "crypto_place": ToolBinding("crypto_place", "place_crypto_order", {}),
+    "crypto_cancel": ToolBinding("crypto_cancel", "cancel_crypto_order", {}),
+})
+crypto_capable_broker._all_tools = equity_only_broker._all_tools + [
+    {"name": n, "description": "", "input_schema": {}} for n in crypto_tool_names
+]
+try:
+    crypto_capable_broker.require_crypto()
+    check("require_crypto() passes when the server advertises crypto tools", True)
+except RuntimeError:
+    check("require_crypto() passes when the server advertises crypto tools", False)
+
+# get_account(asset_class="crypto") reads crypto_value (not equity_value/
+# total_value) for "equity", and crypto_positions (not positions) for
+# holdings -- the same REAL_ACCOUNTS_PAYLOAD/portfolio-with-crypto_value
+# fixtures section 1/2 already use, since accounts/portfolio are the same
+# tools for both asset classes (only positions/quotes/orders/place differ).
+crypto_capable_broker.bindings["accounts"] = ToolBinding("accounts", "get_accounts", {})
+crypto_capable_broker.bindings["portfolio"] = ToolBinding("portfolio", "get_portfolio", {})
+_crypto_positions_payload = {
+    "data": {"positions": [{"symbol": "BTC-USD", "quantity": "0.5"},
+                           {"currency_code": "ETH-USD", "amount": "2.0"}]}
+}
+_crypto_portfolio_payload = {
+    "data": {"cash": "1000", "crypto_value": "3456.78",
+             "equity_value": "0", "total_value": "1000",
+             "buying_power": {"buying_power": "1000.0000"}}
+}
+
+
+def _fake_crypto_call(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "portfolio":
+        return _crypto_portfolio_payload
+    if capability == "crypto_positions":
+        return _crypto_positions_payload
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    raise AssertionError(f"unexpected capability {capability!r}")
+
+
+crypto_capable_broker._call_sync = _fake_crypto_call
+crypto_account = crypto_capable_broker.get_account(asset_class="crypto")
+check("asset_class='crypto' reads crypto_value for equity, not equity_value/total_value",
+      crypto_account.equity == 3456.78, crypto_account.equity)
+check("asset_class='crypto' reads crypto_positions, not equity positions",
+      dict(crypto_account.positions) == {"BTC-USD": 0.5, "ETH-USD": 2.0},
+      dict(crypto_account.positions))
+check("crypto accounts report day_trades_used=None (PDT doesn't apply to crypto)",
+      crypto_account.day_trades_used is None)
+
+# The plain equity path (asset_class="equity", the default) must be
+# completely unaffected by any of the above -- same broker, same bindings,
+# just the default asset_class.
+equity_account = crypto_capable_broker.get_account()
+check("the default asset_class='equity' still reads equity_value/total_value",
+      equity_account.positions.empty or "BTC-USD" not in equity_account.positions.index)
+
+# crypto_view() forwards to the parent with asset_class="crypto" fixed, and
+# never re-connects (connect()/close() are no-ops) -- OrderManager and
+# LiveSignalRunner call the plain BrokerAdapter methods with no asset_class
+# argument, so this is what makes run_pipeline() work unmodified against
+# either sleeve (see run_cycle.py).
+view = crypto_capable_broker.crypto_view()
+view.connect()  # must not raise, must not touch the network
+view_account = view.get_account()
+check("crypto_view().get_account() matches calling get_account(asset_class='crypto') directly",
+      view_account.equity == crypto_account.equity and
+      dict(view_account.positions) == dict(crypto_account.positions))
+view.close()  # must not raise
+
+# Crypto order quantity is rounded to the trading pair's own increment, not
+# the equity 8-dp limit. Confirmed live (2026-08): review_crypto_order 400s
+# on an over-precise quantity ("...too much precision. Please round the
+# quantity to an appropriate increment..."), which _order_args() must
+# pre-empt for both review and place. CRYPTO_QUANTITY_DECIMALS carries
+# min_order_quantity_increment (as decimal places) per pair, from a live
+# get_currency_pairs response (2026-08-30); a coin not listed falls back to
+# _DEFAULT_CRYPTO_QUANTITY_DECIMALS (6 dp).
+crypto_qty_broker = RobinhoodMCPBroker(token="fake")
+crypto_qty_broker.bindings = {
+    "accounts": ToolBinding("accounts", "get_accounts", {}),
+    "positions": ToolBinding("positions", "get_equity_positions", {}),
+    "review": ToolBinding("review", "review_equity_order", REVIEW_SCHEMA),
+    "crypto_review": ToolBinding("crypto_review", "review_crypto_order", REVIEW_SCHEMA),
+}
+_crypto_qty_captured = {}
+
+
+def _crypto_qty_call(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    _crypto_qty_captured[capability] = arguments
+    return {"data": {"success": True}}
+
+
+crypto_qty_broker._call_sync = _crypto_qty_call
+crypto_qty_broker.get_account()
+crypto_qty_broker.review_order("BTC-USD", "buy", 0.0003765123456789,
+                               asset_class="crypto")
+check("crypto quantity is rounded to the pair's own increment (BTC-USD 8 dp), "
+      "not left at full binary precision",
+      _crypto_qty_captured["crypto_review"]["quantity"] == "0.00037651",
+      _crypto_qty_captured["crypto_review"]["quantity"])
+crypto_qty_broker.review_order("ADA-USD", "buy", 71.108246, asset_class="crypto")
+check("a coarse pair (ADA-USD, increment 0.01) rounds to 2 dp -- the live "
+      "6-dp 'too much precision' rejection this table fixes",
+      _crypto_qty_captured["crypto_review"]["quantity"] == "71.11",
+      _crypto_qty_captured["crypto_review"]["quantity"])
+crypto_qty_broker.review_order("XLF", "buy", 2.7255578430183576)
+check("the equity path still rounds to 8 dp, unaffected by the crypto rule",
+      _crypto_qty_captured["review"]["quantity"] == "2.72555784",
+      _crypto_qty_captured["review"]["quantity"])
+
+from qbt.broker import CRYPTO_QUANTITY_DECIMALS  # noqa: E402
+
+# An explicit entry overrides whatever the shipped table / default would
+# give. Perturb a real entry to a value that matches neither (shipped 2,
+# default 6) and restore it.
+_saved_doge = CRYPTO_QUANTITY_DECIMALS["DOGE-USD"]
+CRYPTO_QUANTITY_DECIMALS["DOGE-USD"] = 3
+try:
+    crypto_qty_broker.review_order("DOGE-USD", "buy", 89.723451, asset_class="crypto")
+    check("CRYPTO_QUANTITY_DECIMALS is consulted per symbol at call time",
+          _crypto_qty_captured["crypto_review"]["quantity"] == "89.723",
+          _crypto_qty_captured["crypto_review"]["quantity"])
+finally:
+    CRYPTO_QUANTITY_DECIMALS["DOGE-USD"] = _saved_doge
+
+# When get_currency_pairs (bound as "crypto_pairs") is available, the live
+# min_order_quantity_increment / min_order_size drive rounding -- the static
+# CRYPTO_QUANTITY_DECIMALS table is only the fallback. Fetched once per
+# broker (== once per cycle) and cached.
+_PAIRS_PAGE_1 = {"data": {"results": [
+    {"symbol": "ADA-USD", "min_order_quantity_increment": "0.001",
+     "min_order_size": "0.1"},
+    {"symbol": "XLM-USD", "min_order_quantity_increment": "0.01",
+     "min_order_size": "1"},
+], "next": "http://edge/currency_pairs/?cursor=PAGE2&limit=2"}}
+_PAIRS_PAGE_2 = {"data": {"results": [
+    {"symbol": "SHIB-USD", "min_order_quantity_increment": "1",
+     "min_order_size": "800"},
+]}}
+_pairs_calls = []
+
+
+def _catalog_call(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    if capability == "crypto_pairs":
+        _pairs_calls.append(dict(arguments))
+        return _PAIRS_PAGE_2 if arguments.get("cursor") == "PAGE2" else _PAIRS_PAGE_1
+    _crypto_qty_captured[capability] = arguments
+    return {"data": {"success": True}}
+
+
+cat_broker = RobinhoodMCPBroker(token="fake")
+cat_broker.bindings = {
+    "accounts": ToolBinding("accounts", "get_accounts", {}),
+    "positions": ToolBinding("positions", "get_equity_positions", {}),
+    "crypto_review": ToolBinding("crypto_review", "review_crypto_order", REVIEW_SCHEMA),
+    "crypto_pairs": ToolBinding("crypto_pairs", "get_currency_pairs", {}),
+}
+cat_broker._call_sync = _catalog_call
+cat_broker.get_account()
+
+cat_broker.review_order("ADA-USD", "buy", 71.108246, asset_class="crypto")
+check("the live get_currency_pairs increment wins over the static table "
+      "(ADA-USD catalog 0.001 -> 3 dp, not the shipped 2 dp)",
+      _crypto_qty_captured["crypto_review"]["quantity"] == "71.108",
+      _crypto_qty_captured["crypto_review"]["quantity"])
+
+cat_broker.review_order("ADA-USD", "sell", 5.5, asset_class="crypto")
+check("the catalog is fetched once and cached, not re-fetched per order",
+      len(_pairs_calls) == 2 and [c.get("cursor") for c in _pairs_calls] == [None, "PAGE2"],
+      f"{_pairs_calls}")
+check("pagination followed the 'next' cursor -- a page-2 pair is known",
+      "SHIB-USD" in (cat_broker._crypto_pairs or {}),
+      list((cat_broker._crypto_pairs or {}).keys()))
+
+# min_order_size guard: a size that snaps below the pair minimum is refused
+# locally with BrokerRejection, never sent.
+raised = None
+try:
+    cat_broker.review_order("XLM-USD", "buy", 0.4, asset_class="crypto")
+except BrokerRejection as exc:
+    raised = exc
+check("a crypto size below the pair's min_order_size raises BrokerRejection "
+      "before any call goes out",
+      raised is not None and "min_order_size" in str(raised), repr(raised))
+check("BrokerRejection is a RuntimeError (execute()'s except Exception catches it)",
+      isinstance(raised, RuntimeError))
+
+# A coin absent from the catalog falls back to the static table, no crash.
+cat_broker.review_order("LINK-USD", "buy", 2.100654, asset_class="crypto")
+check("a coin not in the live catalog falls back to CRYPTO_QUANTITY_DECIMALS "
+      "(LINK-USD -> 4 dp)",
+      _crypto_qty_captured["crypto_review"]["quantity"] == "2.1007",
+      _crypto_qty_captured["crypto_review"]["quantity"])
+
+# If the catalog call itself fails, the static table still carries the sleeve.
+def _catalog_call_raises(capability, arguments):
+    if capability == "accounts":
+        return REAL_ACCOUNTS_PAYLOAD
+    if capability == "positions":
+        return {"data": {"positions": []}}
+    if capability == "crypto_pairs":
+        raise RuntimeError("MCP tool error: API error 503: upstream unavailable")
+    _crypto_qty_captured[capability] = arguments
+    return {"data": {"success": True}}
+
+
+err_broker = RobinhoodMCPBroker(token="fake")
+err_broker.bindings = dict(cat_broker.bindings)
+err_broker._call_sync = _catalog_call_raises
+err_broker.get_account()
+err_broker.review_order("ADA-USD", "buy", 71.108246, asset_class="crypto")
+check("a failed get_currency_pairs lookup degrades to the static table, "
+      "not an exception (ADA-USD -> shipped 2 dp)",
+      _crypto_qty_captured["crypto_review"]["quantity"] == "71.11",
+      _crypto_qty_captured["crypto_review"]["quantity"])
+
+print()
+print("=" * 72)
+print("11. Persistent MCP session -- reused across calls, torn down cleanly "
+      "(lifecycle mechanics only; live behaviour unconfirmed, see broker.py)")
+print("=" * 72)
+
+
+class _FakeTransportCtx:
+    """Stands in for streamablehttp_client(...)'s return value: an async
+    context manager yielding (read, write, ...)."""
+
+    def __init__(self):
+        self.entered = 0
+        self.exited = 0
+
+    async def __aenter__(self):
+        self.entered += 1
+        return (object(), object(), None)
+
+    async def __aexit__(self, *exc):
+        self.exited += 1
+        return False
+
+
+class _FakeSession:
+    """Stands in for mcp.ClientSession -- tracks how many times it's
+    entered/initialized/called, so the tests below can tell "one session,
+    reused" apart from "a fresh session per call."
+    """
+
+    def __init__(self, read, write):
+        self.entered = 0
+        self.exited = 0
+        self.initialized = 0
+        self.call_log = []
+
+    async def __aenter__(self):
+        self.entered += 1
+        return self
+
+    async def __aexit__(self, *exc):
+        self.exited += 1
+        return False
+
+    async def initialize(self):
+        self.initialized += 1
+
+    async def call_tool(self, name, arguments):
+        self.call_log.append((name, arguments))
+        return SimpleNamespace(isError=False, structuredContent={"ok": True}, content=[])
+
+    async def list_tools(self):
+        return SimpleNamespace(tools=[
+            SimpleNamespace(name="get_accounts", description="", inputSchema={}),
+            SimpleNamespace(name="get_equity_positions", description="", inputSchema={}),
+            SimpleNamespace(name="get_equity_quotes", description="", inputSchema={}),
+            SimpleNamespace(name="get_equity_orders", description="", inputSchema={}),
+            SimpleNamespace(name="place_equity_order", description="", inputSchema={}),
+        ])
+
+
+def _install_fake_mcp(session_factory):
+    """Monkeypatch sys.modules so `from mcp import ClientSession` /
+    `from mcp.client.streamable_http import streamablehttp_client` inside
+    RobinhoodMCPBroker._open_session() resolve to fakes, without disturbing
+    the real, already-installed `mcp` package for any other test. Returns a
+    restore function -- callers must call it, even on failure, so a later
+    section's genuine `import mcp` (if any) sees the real package again.
+    """
+    created_transports = []
+
+    def fake_streamablehttp_client(url, **kwargs):
+        ctx = _FakeTransportCtx()
+        created_transports.append(ctx)
+        return ctx
+
+    fake_mcp = types.ModuleType("mcp")
+    fake_mcp.ClientSession = session_factory
+    fake_streamable = types.ModuleType("mcp.client.streamable_http")
+    fake_streamable.streamablehttp_client = fake_streamablehttp_client
+
+    saved = {name: sys.modules.get(name) for name in
+             ("mcp", "mcp.client.streamable_http")}
+    sys.modules["mcp"] = fake_mcp
+    sys.modules["mcp.client.streamable_http"] = fake_streamable
+
+    def restore():
+        for name, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    return created_transports, restore
+
+
+_created_sessions = []
+
+
+def _tracking_session_factory(read, write):
+    s = _FakeSession(read, write)
+    _created_sessions.append(s)
+    return s
+
+
+_transports, _restore_mcp = _install_fake_mcp(_tracking_session_factory)
+try:
+    session_broker = RobinhoodMCPBroker(token="fake")
+    session_broker.connect()
+    check("connect() opens exactly one transport", len(_transports) == 1)
+    check("connect() opens exactly one session", len(_created_sessions) == 1)
+    check("connect() initializes the session exactly once",
+          _created_sessions[0].initialized == 1)
+
+    session_broker._call_sync("accounts", {})
+    session_broker._call_sync("accounts", {})
+    session_broker._call_sync("accounts", {})
+    check("three calls after connect() still open only one transport/session "
+          "(reused, not reconnected per call)",
+          len(_transports) == 1 and len(_created_sessions) == 1)
+    check("all three calls went through the one persistent session",
+          len(_created_sessions[0].call_log) == 3)
+    check("the session was still only ever initialized once, not once per call",
+          _created_sessions[0].initialized == 1)
+
+    session_broker.close()
+    check("close() tears down the persistent session and transport",
+          _created_sessions[0].exited == 1 and _transports[0].exited == 1)
+    check("close() clears the cached session/exit-stack references",
+          session_broker._mcp_session is None and session_broker._exit_stack is None)
+
+    # Idempotent and safe even if called again (e.g. an except-block close()
+    # after main() already closed once) or if connect() never ran at all.
+    try:
+        session_broker.close()
+        check("close() is safe to call a second time", True)
+    except Exception as exc:
+        check("close() is safe to call a second time", False, repr(exc))
+
+    never_connected = RobinhoodMCPBroker(token="fake")
+    try:
+        never_connected.close()
+        check("close() is safe to call when connect() was never called", True)
+    except Exception as exc:
+        check("close() is safe to call when connect() was never called", False, repr(exc))
+finally:
+    _restore_mcp()
+
+
+class _FailingInitSession(_FakeSession):
+    async def initialize(self):
+        self.initialized += 1
+        raise RuntimeError("simulated handshake failure")
+
+
+_failing_sessions = []
+
+
+def _failing_session_factory(read, write):
+    s = _FailingInitSession(read, write)
+    _failing_sessions.append(s)
+    return s
+
+
+_fail_transports, _restore_mcp_2 = _install_fake_mcp(_failing_session_factory)
+try:
+    failing_broker = RobinhoodMCPBroker(token="fake")
+    try:
+        failing_broker.connect()
+        check("connect() propagates a handshake failure rather than "
+              "swallowing it", False)
+    except RuntimeError as exc:
+        check("connect() propagates a handshake failure rather than "
+              "swallowing it", "simulated handshake failure" in str(exc))
+    check("a failed handshake still tears down the transport it had already "
+          "opened (no leaked open connection)",
+          _fail_transports[0].exited == 1)
+    check("a failed connect() leaves no half-set session/exit-stack state "
+          "behind for a later call to trip over",
+          failing_broker._mcp_session is None and failing_broker._exit_stack is None)
+finally:
+    _restore_mcp_2()
 
 print()
 print("=" * 72)

@@ -1,15 +1,20 @@
-"""Validate run_cycle.py's live STRATEGY wiring (BreadthRegimeFilter + MacroRegimeFilter).
+"""Validate run_cycle.py's live STRATEGY wiring (BreadthRegimeFilter +
+MacroRegimeFilter wrapped around a two-member Composite core).
 
 This is a script, not a package module, so it's loaded here via importlib
 rather than a normal import. The point of this file is narrow: prove the
 composition on disk is what the docstring/README claim (right nesting, right
-thresholds) and that both overlays actually fire and compound correctly when
-their regime read is unfavourable -- not to re-test BreadthRegimeFilter or
-MacroRegimeFilter themselves (that's test_regime_filters.py's job).
+capital shares, right thresholds), that both overlays actually fire and
+compound correctly when their regime read is unfavourable, and that the
+Composite core's fundamentals-dependent member degrades to cash rather than
+crashing when fundamentals aren't available -- not to re-test
+BreadthRegimeFilter, MacroRegimeFilter, or MultiFactorCrossSectional
+themselves (that's test_regime_filters.py's and test_qbt.py's job).
 """
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import os
@@ -21,8 +26,9 @@ import numpy as np
 import pandas as pd
 
 from qbt import (
-    Backtester, BreadthRegimeFilter, CrossSectionalMomentum, DayTradeLedger,
-    ExecutionConfig, LiveSignalRunner, MacroRegimeFilter, MacrosPanel,
+    Backtester, BreadthRegimeFilter, Composite, CrossSectionalMomentum,
+    DayTradeLedger, ExecutionConfig, FundamentalsPanel, LiveSignalRunner,
+    MacroRegimeFilter, MacrosPanel, MultiFactorCrossSectional,
     PortfolioState, PricePanel, RiskGate, ShortHorizonReversal,
     SyntheticRepository,
 )
@@ -55,7 +61,8 @@ core = macro.inner
 
 check("outer wrapper is BreadthRegimeFilter", isinstance(breadth, BreadthRegimeFilter))
 check("middle wrapper is MacroRegimeFilter", isinstance(macro, MacroRegimeFilter))
-check("inner strategy is CrossSectionalMomentum", isinstance(core, CrossSectionalMomentum))
+check("inner strategy is a two-member Composite", isinstance(core, Composite))
+check("Composite has exactly two members", len(core.members) == 2)
 
 check("breadth lookback is 200", breadth.lookback == 200)
 check("breadth min_breadth is 0.3", breadth.min_breadth == 0.3)
@@ -67,8 +74,27 @@ check("macro max_increase is 15.0", macro.max_increase == 15.0)
 check("macro lookback is 21", macro.lookback == 21)
 check("macro scale_when_blocked is 0.5", macro.scale_when_blocked == 0.5)
 
-check("core momentum lookback/skip/top_n untouched by the overlays",
-      (core.lookback, core.skip, core.top_n) == (63, 5, 5))
+mom_member, mom_share = core.members[0]
+mf_member, mf_share = core.members[1]
+check("first Composite member is CrossSectionalMomentum",
+      isinstance(mom_member, CrossSectionalMomentum))
+check("momentum lookback/skip/top_n untouched by the overlays",
+      (mom_member.lookback, mom_member.skip, mom_member.top_n) == (63, 5, 5))
+check("momentum member holds 60% of the core's capital share",
+      abs(mom_share / (mom_share + mf_share) - 0.6) < 1e-9,
+      f"share={mom_share}/{mom_share + mf_share}")
+
+check("second Composite member is MultiFactorCrossSectional",
+      isinstance(mf_member, MultiFactorCrossSectional))
+check("multifactor member holds 40% of the core's capital share",
+      abs(mf_share / (mom_share + mf_share) - 0.4) < 1e-9,
+      f"share={mf_share}/{mom_share + mf_share}")
+check("multifactor member's quality factor has a nonzero weight",
+      mf_member.factor_weights.get("quality", 0.0) > 0.0,
+      mf_member.factor_weights)
+check("multifactor member reads the FMP ratios ROE column",
+      mf_member.quality_metric == "ratios_return_on_equity",
+      mf_member.quality_metric)
 
 print()
 print("=" * 72)
@@ -96,7 +122,47 @@ check("calm regime picks the same names as the unwrapped core strategy",
 
 print()
 print("=" * 72)
-print("3. Elevated VIX alone scales the book to 50%, without touching breadth")
+print("3. fundamentals=None degrades the quality sleeve to cash, not a crash "
+      "-- and real fundamentals bring it back")
+print("=" * 72)
+
+# The multifactor member's quality factor has a nonzero weight (checked in
+# section 1), which means -- per MultiFactorCrossSectional's own docstring
+# -- fundamentals=None makes every name fail to qualify for that 40% share,
+# not just the ones missing a reading. bare_plan above already exercised
+# this (no fundamentals passed) without raising; this section makes it an
+# explicit, permanent check rather than an implicit side effect of section 2.
+check("no fundamentals -> the multifactor member alone contributes nothing",
+      mf_member.target_weights(panel.as_of(panel.dates[-1])).abs().sum() == 0.0)
+check("...but the momentum member is unaffected, so the core still trades",
+      bare_plan.turnover > 0, f"turnover={bare_plan.turnover}")
+
+# With real dispersion, the quality sleeve should actually pick names --
+# proving the wiring moves data, not just that it fails to crash.
+real_fundamentals = FundamentalsPanel(frame=pd.DataFrame(
+    {
+        "symbol": panel.symbols,
+        "metric": "ratios_return_on_equity",
+        "period_end": pd.DatetimeIndex([panel.dates[0]] * len(panel.symbols)),
+        "as_of_date": pd.DatetimeIndex([panel.dates[0]] * len(panel.symbols)),
+        "value": [10.0 + 5.0 * (i % 7) for i in range(len(panel.symbols))],
+    }
+))
+mf_weights = mf_member.target_weights(panel.as_of(panel.dates[-1]), real_fundamentals)
+check("real fundamentals -> the multifactor member picks names",
+      mf_weights.abs().sum() > 0.0, f"gross={mf_weights.abs().sum()}")
+
+funded_plan = LiveSignalRunner(strategy=run_cycle.STRATEGY, risk_gate=None,
+                               max_turnover=None).plan(
+    panel, state, fundamentals=real_fundamentals, macros=calm_macros)
+funded_names = {i.symbol for i in funded_plan.intents if abs(i.target_weight) > 1e-9}
+check("a funded plan's picks differ from the momentum-only core's "
+      "(the quality sleeve is actually contributing, not just failing to crash)",
+      funded_names != bare_names, f"funded={funded_names} bare={bare_names}")
+
+print()
+print("=" * 72)
+print("4. Elevated VIX alone scales the book to 50%, without touching breadth")
 print("=" * 72)
 
 high_vix_macros = MacrosPanel(frame=pd.DataFrame(
@@ -114,7 +180,7 @@ check("turnover under elevated VIX is ~50% of the unscaled plan (macro-only trig
 
 print()
 print("=" * 72)
-print("4. macros=None (a fetch failure) is a no-op on the macro overlay, not a block")
+print("5. macros=None (a fetch failure) is a no-op on the macro overlay, not a block")
 print("=" * 72)
 
 none_macro_plan = runner.plan(panel, state, macros=None)
@@ -124,7 +190,7 @@ check("macros=None leaves turnover matching the calm-VIX plan (documented pass-t
 
 print()
 print("=" * 72)
-print("5. Day-trade ledger survives a save/load round trip and stays comparable")
+print("6. Day-trade ledger survives a save/load round trip and stays comparable")
 print("=" * 72)
 
 # The failure this guards against was permanent, not transient: a tz-aware
@@ -133,6 +199,16 @@ print("=" * 72)
 # run_cycle.py aborts the cycle (exit 3) *before* save_day_trade_ledger()
 # can rewrite the file -- so every subsequent run reloaded the same poisoned
 # event and failed identically, with only cycle_error in the audit log.
+#
+# Anchored to *now*, not a fixed calendar date -- save_day_trade_ledger's own
+# trim cutoff (10 business days, see its docstring) is relative to real time,
+# so a hardcoded event date here would eventually drift outside that window
+# and start failing for reasons having nothing to do with the tz behaviour
+# under test (confirmed: a 2026-08-13 literal written when this test still
+# had headroom silently went stale and started failing once "today" passed
+# roughly two business weeks past it). 2 calendar days back is comfortably
+# inside both that 10-business-day save cutoff and DayTradeLedger.count()'s
+# own 5-business-day window on any weekday this happens to run.
 work = tempfile.mkdtemp()
 dt_path = os.path.join(work, "day_trades_live.json")
 
@@ -143,17 +219,25 @@ om = OrderManager(
     AuditLog(os.path.join(work, "a.jsonl"), stdout=False),
     os.path.join(work, "j.jsonl"),
 )
-aware_session = om._session_date(datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc))
+recent_utc = (datetime.now(timezone.utc) - pd.Timedelta(days=2)).replace(
+    hour=14, minute=0, second=0, microsecond=0)
+aware_session = om._session_date(recent_utc)
 om.day_trade_ledger.record(aware_session)
+# What record() actually stored -- as_session_date() of the same instant,
+# not the recent_utc calendar date itself, since the market-tz conversion
+# inside _session_date can shift the wall-clock date at the boundary (it
+# doesn't at 14:00 UTC / 10:00 America/New_York, but deriving the expected
+# value the same way the code under test does is the point, not assuming).
+expected_event = run_cycle.as_session_date(aware_session)
 
 run_cycle.save_day_trade_ledger(dt_path, om.day_trade_ledger)
 with open(dt_path) as fh:
     persisted = json.load(fh)
 check("save_day_trade_ledger writes tz-naive session dates",
-      persisted["events"] == ["2026-08-13T00:00:00"], persisted)
+      persisted["events"] == [expected_event.isoformat()], persisted)
 
 reloaded = run_cycle.load_day_trade_ledger(dt_path)
-naive_asof = pd.Timestamp("2026-08-14")
+naive_asof = expected_event + pd.Timedelta(days=1)
 try:
     remaining = reloaded.remaining(naive_asof, equity=1_000.0)
     rt_ok, rt_detail = True, f"remaining={remaining}"
@@ -176,9 +260,13 @@ check("re-saving an already-naive ledger doesn't raise on the trim cutoff",
       trim_ok, trim_detail)
 
 # A state file written by the pre-fix code must heal, not fail forever.
+# Same relative anchor as above (expected_event), reformatted as a pre-fix
+# tz-aware ISO string (America/New_York's UTC offset) rather than a second
+# independent hardcoded date -- the two need to land on the same calendar
+# day for this section's counts to mean anything.
 legacy_path = os.path.join(work, "legacy.json")
 with open(legacy_path, "w") as fh:
-    json.dump({"events": ["2026-08-13T00:00:00-04:00"]}, fh)
+    json.dump({"events": [f"{expected_event.date().isoformat()}T00:00:00-04:00"]}, fh)
 legacy = run_cycle.load_day_trade_ledger(legacy_path)
 try:
     legacy_count = legacy.count(naive_asof)
@@ -191,11 +279,11 @@ run_cycle.save_day_trade_ledger(legacy_path, legacy)
 with open(legacy_path) as fh:
     healed = json.load(fh)
 check("and re-saving rewrites it in the clean naive format (self-healing)",
-      healed["events"] == ["2026-08-13T00:00:00"], healed)
+      healed["events"] == [expected_event.isoformat()], healed)
 
 print()
 print("=" * 72)
-print("6. A daily backtest cannot produce a day trade -- and says so")
+print("7. A daily backtest cannot produce a day trade -- and says so")
 print("=" * 72)
 
 # Backtester.run() has opened_on/ledger.record() bookkeeping, but on a daily
@@ -231,7 +319,7 @@ check("and reports it unrestricted above the $25k equity threshold",
 
 print()
 print("=" * 72)
-print("7. Holdings outside the strategy universe are surfaced, not swallowed")
+print("8. Holdings outside the strategy universe are surfaced, not swallowed")
 print("=" * 72)
 
 # run_cycle reindexes account.positions onto panel.symbols, which it has to
@@ -280,7 +368,7 @@ check("run_cycle exposes the audit event name used to report this",
 
 print()
 print("=" * 72)
-print("8. --max-position drives both concentration caps, keeping them layered")
+print("9. --max-position drives both concentration caps, keeping them layered")
 print("=" * 72)
 
 # There are two position caps and they are layered, not redundant:
@@ -362,6 +450,173 @@ _help = subprocess.run([sys.executable, "run_cycle.py", "--help"],
                        cwd=str(pathlib.Path(__file__).parent)).stdout
 check("--help renders the flag's help text rather than an action dict",
       "max single-name weight" in _help and "option_strings" not in _help)
+
+print()
+print("=" * 72)
+print("10. Crypto sleeve -- CRYPTO_STRATEGY/CRYPTO_GATE wiring and "
+      "--consider-crypto end to end")
+print("=" * 72)
+
+check("CRYPTOS is a non-empty list of yfinance-style tickers",
+      len(run_cycle.CRYPTOS) > 0 and all("-" in s for s in run_cycle.CRYPTOS),
+      run_cycle.CRYPTOS)
+
+crypto_breadth = run_cycle.CRYPTO_STRATEGY
+crypto_macro = crypto_breadth.inner
+crypto_core = crypto_macro.inner
+check("crypto outer wrapper is BreadthRegimeFilter", isinstance(crypto_breadth, BreadthRegimeFilter))
+check("crypto middle wrapper is MacroRegimeFilter", isinstance(crypto_macro, MacroRegimeFilter))
+check("crypto inner strategy is a two-member Composite", isinstance(crypto_core, Composite))
+check("crypto Composite has exactly two members", len(crypto_core.members) == 2)
+
+crypto_mom_member, crypto_mom_share = crypto_core.members[0]
+crypto_mf_member, crypto_mf_share = crypto_core.members[1]
+check("crypto first member is CrossSectionalMomentum",
+      isinstance(crypto_mom_member, CrossSectionalMomentum))
+check("crypto momentum member holds 60% of the core's capital share",
+      abs(crypto_mom_share / (crypto_mom_share + crypto_mf_share) - 0.6) < 1e-9)
+check("crypto second member is MultiFactorCrossSectional",
+      isinstance(crypto_mf_member, MultiFactorCrossSectional))
+check("crypto multifactor member has NO quality factor -- there is no such "
+      "thing as a crypto fundamentals reading",
+      "quality" not in crypto_mf_member.factor_weights, crypto_mf_member.factor_weights)
+check("crypto multifactor's momentum/low_vol/reversal weights sum to 1.0 "
+      "(quality dropped and the rest re-normalised, not just left as a "
+      "60%-of-intended blend)",
+      abs(sum(crypto_mf_member.factor_weights.values()) - 1.0) < 1e-9,
+      crypto_mf_member.factor_weights)
+
+check("CRYPTO_GATE has its own, tighter max_weight than the equity GATE "
+      "(crypto concentration risk is a real, separate judgement call)",
+      run_cycle.CRYPTO_GATE["max_weight"] < run_cycle.GATE["max_weight"],
+      (run_cycle.CRYPTO_GATE["max_weight"], run_cycle.GATE["max_weight"]))
+
+check("--consider-crypto and --max-crypto-* flags exist",
+      "--consider-crypto" in _help and "--max-crypto-order" in _help and
+      "--max-crypto-plan" in _help and "--max-crypto-position" in _help)
+
+_bad_crypto = subprocess.run(
+    [sys.executable, "run_cycle.py", "--max-crypto-position", "20", "--synthetic"],
+    capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+check("--max-crypto-position 20 is rejected rather than read as 2000%",
+      _bad_crypto.returncode != 0 and
+      "must be a weight in (0, 1]" in _bad_crypto.stderr,
+      _bad_crypto.stderr.strip()[-90:])
+
+# End to end: both sleeves plan and place mock fills in one process, over
+# genuinely independent synthetic universes (no symbol collision -- see
+# run_crypto_pipeline's own comment on why it builds a second MockBroker
+# rather than reusing the equity one), and the process exits 0 -- the
+# strongest available offline evidence that main() keeps the shared broker
+# connection open across both sleeves (run_crypto_pipeline's MockBroker
+# path would raise "broker not connected" from MockBroker._require() if
+# main() had already closed anything the crypto sleeve still needed).
+#
+# Journal/peak-equity files under the real audit/state/ dirs persist
+# between runs by design (that's the whole point of the idempotency
+# journal -- see qbt/orders.py) -- which makes a *second* run of this exact
+# synthetic scenario correctly skip re-submitting ("already submitted for
+# this plan") rather than fill again. Deleting the synthetic-suffixed files
+# this test depends on first keeps the "submitted"/"filled" counts below
+# deterministic regardless of what other manual or automated runs left
+# behind; never touches the "_live" (real) files.
+for _stale in (
+    run_cycle.mode_path("audit/journal.jsonl", True),
+    run_cycle.mode_path("audit/journal_crypto.jsonl", True),
+    run_cycle.mode_path("state/peak_equity.txt", True),
+    run_cycle.mode_path("state/peak_equity_crypto.txt", True),
+    run_cycle.mode_path("state/day_trades.json", True),
+):
+    if os.path.exists(_stale):
+        os.remove(_stale)
+
+_e2e = subprocess.run(
+    [sys.executable, "run_cycle.py", "--synthetic", "--ignore-market-hours",
+     "--live", "--consider-crypto",
+     "--max-plan", "20000", "--max-order", "3000",
+     "--max-crypto-plan", "5000", "--max-crypto-order", "1000"],
+    capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+check("a --consider-crypto cycle exits 0 when both sleeves complete cleanly",
+      _e2e.returncode == 0, (_e2e.returncode, _e2e.stdout[-2000:], _e2e.stderr[-500:]))
+check("both sleeves' sections appear in the output",
+      "--- equity ---" in _e2e.stdout and "--- crypto ---" in _e2e.stdout)
+_crypto_cycle_end = re.search(
+    r"\[cycle_end\][^\n]*sleeve=crypto", _e2e.stdout.split("--- crypto ---")[-1])
+_crypto_submitted = (
+    int(re.search(r"submitted=(\d+)", _crypto_cycle_end.group()).group(1))
+    if _crypto_cycle_end else None
+)
+check("the crypto sleeve actually placed and filled orders, not just planned",
+      _crypto_submitted is not None and _crypto_submitted > 0,
+      (_crypto_submitted, _e2e.stdout[-800:]))
+check("crypto journal/peak-equity state land in their own crypto-suffixed "
+      "files, not the equity ones",
+      os.path.exists(run_cycle.mode_path("audit/journal_crypto.jsonl", True)) and
+      os.path.exists(run_cycle.mode_path("state/peak_equity_crypto.txt", True)))
+
+# A run without --consider-crypto must be completely unaffected -- no crypto
+# section, no crypto capability lookup, no crypto state files touched. Sized
+# the same generous --max-plan/--max-order as the e2e run above so this is
+# actually exercising a completed cycle, not an unrelated preflight abort on
+# the (much smaller) default caps.
+_no_crypto = subprocess.run(
+    [sys.executable, "run_cycle.py", "--synthetic", "--ignore-market-hours",
+     "--max-plan", "20000", "--max-order", "3000"],
+    capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+check("omitting --consider-crypto runs equity-only, no crypto section printed",
+      _no_crypto.returncode == 0 and "--- crypto ---" not in _no_crypto.stdout,
+      _no_crypto.stdout[-500:])
+
+print()
+print("=" * 72)
+print("11. --max-price excludes expensive symbols from the panel entirely")
+print("=" * 72)
+
+_price_panel = SyntheticRepository(n_symbols=18, seed=42).fetch(
+    start="2010-01-01", end="2020-01-01")
+_price_last = _price_panel.last_close()
+_price_cap = float(_price_last.median())
+_price_work = tempfile.mkdtemp()
+_price_audit = AuditLog(os.path.join(_price_work, "a.jsonl"), stdout=False)
+
+check("max_price=None is a true no-op -- returns the same object, not a copy",
+      run_cycle.apply_price_cap(_price_panel, None, "equity", _price_audit)
+      is _price_panel)
+
+_capped_panel = run_cycle.apply_price_cap(_price_panel, _price_cap, "equity", _price_audit)
+check("every remaining symbol's last close is within the cap",
+      bool((_price_last[_capped_panel.symbols] <= _price_cap).all()),
+      dict(_price_last[_capped_panel.symbols]))
+check("at least one symbol was actually excluded (the cap is the median, "
+      "not a no-op by construction)",
+      len(_capped_panel.symbols) < len(_price_panel.symbols),
+      (len(_capped_panel.symbols), len(_price_panel.symbols)))
+check("apply_price_cap() emits an audit event naming what it excluded",
+      "price_cap_excluded" in _price_audit.read()["event"].values)
+
+# A cap below every symbol's price empties the panel rather than raising --
+# consistent with the rest of this module's "degrade gracefully, don't
+# crash" philosophy (an empty PricePanel is a valid, if useless, one; the
+# strategy just proposes no positions, same as any other data-starved cycle).
+_empty_capped = run_cycle.apply_price_cap(_price_panel, 0.01, "equity", _price_audit)
+check("a cap below every price empties the panel instead of raising",
+      len(_empty_capped.symbols) == 0)
+
+# End to end: the flag actually reaches the equity pipeline and the printed
+# exclusion list matches what a direct apply_price_cap() call would produce.
+_expensive = sorted(_price_last[_price_last > _price_cap].index)
+_price_e2e = subprocess.run(
+    [sys.executable, "run_cycle.py", "--synthetic", "--ignore-market-hours",
+     "--max-price", str(_price_cap), "--max-plan", "20000", "--max-order", "3000"],
+    capture_output=True, text=True, cwd=str(pathlib.Path(__file__).parent))
+check("--max-price reaches the equity pipeline and excludes the same names "
+      "a direct apply_price_cap() call would",
+      _price_e2e.returncode == 0 and
+      all(s in _price_e2e.stdout for s in _expensive),
+      (_price_e2e.returncode, _expensive, _price_e2e.stdout[:400]))
+
+check("--max-crypto-price flag exists and is independent of --max-price",
+      "--max-crypto-price" in _help and "--max-price" in _help)
 
 print()
 print("=" * 72)
