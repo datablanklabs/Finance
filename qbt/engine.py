@@ -31,6 +31,7 @@ import pandas as pd
 from .corporate import CorpsPanel
 from .data import PricePanel
 from .fundamentals import FundamentalsPanel
+from .kalshi import KalshiPanel
 from .macro import MacrosPanel
 from .options import OptionsPanel
 from .risk import DayTradeLedger, RiskContext, RiskGate, as_session_date
@@ -234,6 +235,11 @@ class Backtester:
         Optional. Full options-indicator history, truncated the same way --
         see :mod:`qbt.options` for why this one is realistically only
         populated for backtests over a window you've personally archived.
+    kalshi:
+        Optional. Full Kalshi event-contract history, truncated the same
+        way -- see :mod:`qbt.kalshi` for the point-in-time reasoning
+        (a live quote needs no lag, so this one truncates on the snapshot
+        date directly) and which series are liquid enough to trust.
     risk_gate:
         Optional. Omit to study raw strategy behaviour with no risk overlay.
     rebalance:
@@ -248,6 +254,7 @@ class Backtester:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
         risk_gate: RiskGate | None = None,
         cost_model: CostModel | None = None,
         execution: ExecutionConfig | None = None,
@@ -262,6 +269,7 @@ class Backtester:
         self.macros = macros
         self.corps = corps
         self.options = options
+        self.kalshi = kalshi
         self.gate = risk_gate
         self.costs = cost_model or CostModel()
         self.exec = execution or ExecutionConfig()
@@ -471,8 +479,11 @@ class Backtester:
                 oview = (
                     self.options.as_of(date) if self.options is not None else None
                 )
+                kview = (
+                    self.kalshi.as_of(date) if self.kalshi is not None else None
+                )
                 proposed = self.strategy.target_weights(
-                    view, fview, mview, cview, oview
+                    view, fview, mview, cview, oview, kview
                 )
 
                 if self.gate is not None:

@@ -49,6 +49,7 @@ from .engine import (
     summary_stats,
 )
 from .fundamentals import FundamentalsPanel, FundamentalsRepository
+from .kalshi import DEFAULT_MIN_CONFIDENCE, DEFAULT_SERIES, KalshiPanel, KalshiRepository
 from .live import LivePlan, LiveSignalRunner, OrderIntent, PortfolioState
 from .macro import MacrosPanel, MacrosRepository
 from .options import OptionsPanel, OptionsRepository, derive_indicators as derive_options_indicators
@@ -75,6 +76,7 @@ from .signals import (
     FundamentalsValueFilter,
     InsiderEventDrift,
     InverseVolWeighted,
+    KalshiEventRegimeFilter,
     MacroRegimeFilter,
     MultiFactorCrossSectional,
     OptionsMeanReversion,
@@ -95,9 +97,11 @@ __all__ = [
     "MacrosPanel", "MacrosRepository",
     "CorpsPanel", "CorpsRepository",
     "OptionsPanel", "OptionsRepository", "derive_options_indicators",
+    "KalshiPanel", "KalshiRepository", "DEFAULT_SERIES", "DEFAULT_MIN_CONFIDENCE",
     "Strategy", "EqualWeightBuyHold", "CrossSectionalMomentum",
     "TimeSeriesMomentum", "ShortHorizonReversal", "TrendFilter", "Composite",
     "FundamentalsValueFilter", "MacroRegimeFilter", "BreadthRegimeFilter",
+    "KalshiEventRegimeFilter",
     "InverseVolWeighted", "PairsTrading", "MultiFactorCrossSectional",
     "CalendarSeasonality", "RiskParityAllocation", "OptionsMeanReversion",
     "InsiderEventDrift",

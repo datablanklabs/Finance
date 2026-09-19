@@ -28,6 +28,7 @@ import pandas as pd
 from .corporate import CorpsPanel
 from .data import PricePanel
 from .fundamentals import FundamentalsPanel
+from .kalshi import KalshiPanel
 from .macro import MacrosPanel
 from .options import OptionsPanel
 from .risk import DayTradeLedger, RiskContext, RiskDecision, RiskGate
@@ -165,12 +166,14 @@ class LiveSignalRunner:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> LivePlan:
         """Produce today's plan.
 
-        ``fundamentals``, ``macros``, ``corps``, and ``options``, if given,
-        are each truncated here to ``as_of(asof_ts)`` before ever reaching
-        the strategy, the same firewall the backtester applies.
+        ``fundamentals``, ``macros``, ``corps``, ``options``, and
+        ``kalshi``, if given, are each truncated here to
+        ``as_of(asof_ts)`` before ever reaching the strategy, the same
+        firewall the backtester applies.
         """
         warnings: list[str] = []
         view = panel.as_of(asof) if asof is not None else panel
@@ -179,6 +182,7 @@ class LiveSignalRunner:
         mview = macros.as_of(asof_ts) if macros is not None else None
         cview = corps.as_of(asof_ts) if corps is not None else None
         oview = options.as_of(asof_ts) if options is not None else None
+        kview = kalshi.as_of(asof_ts) if kalshi is not None else None
 
         staleness = (pd.Timestamp.today().normalize() - asof_ts).days
         if staleness > 4:
@@ -202,7 +206,7 @@ class LiveSignalRunner:
         peak = state.peak_equity if state.peak_equity is not None else equity
         current_w = state.weights(prices)
 
-        proposed = self.strategy.target_weights(view, fview, mview, cview, oview)
+        proposed = self.strategy.target_weights(view, fview, mview, cview, oview, kview)
         if tradeable is not None:
             blocked = [s for s in proposed.index if s not in set(tradeable)]
             if any(abs(proposed.get(s, 0.0)) > 1e-9 for s in blocked):

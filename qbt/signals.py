@@ -8,18 +8,20 @@ Every strategy implements one method::
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series
 
 ``view`` is already sliced to the decision bar, so the last row of
-``view.close`` is "today". ``fundamentals``, ``macros``, ``corps``, and
-``options``, when the caller has them, have already been through the same
-firewall -- see e.g. :meth:`~qbt.fundamentals.FundamentalsPanel.as_of` -- so
-a strategy is free to call ``.snapshot(view.last_date())`` on any of them
-without re-deriving the cutoff itself. ``fundamentals``, ``corps``, and
-``options`` are per symbol; ``macros`` is economy-wide (no symbol axis --
-every name in the universe sees the same reading). Most strategies here
-don't use any of them and simply ignore the parameters; they exist so the
-ones that do (or that you write) don't need a diverging method signature.
+``view.close`` is "today". ``fundamentals``, ``macros``, ``corps``,
+``options``, and ``kalshi``, when the caller has them, have already been
+through the same firewall -- see e.g. :meth:`~qbt.fundamentals.
+FundamentalsPanel.as_of` -- so a strategy is free to call
+``.snapshot(view.last_date())`` on any of them without re-deriving the
+cutoff itself. ``fundamentals``, ``corps``, and ``options`` are per symbol;
+``macros`` and ``kalshi`` are economy-wide (no symbol axis -- every name in
+the universe sees the same reading). Most strategies here don't use any of
+them and simply ignore the parameters; they exist so the ones that do (or
+that you write) don't need a diverging method signature.
 Strategies are pure: no I/O, no broker calls, no mutation of any input, no
 access to the future. The returned Series is indexed by symbol and holds
 *fractions of equity*; it need not sum to one -- anything unallocated is
@@ -41,6 +43,7 @@ import pandas as pd
 from .corporate import DEFAULT_WINDOW_DAYS, CorpsPanel
 from .data import PricePanel
 from .fundamentals import FundamentalsPanel
+from .kalshi import DEFAULT_MIN_CONFIDENCE, KalshiPanel
 from .macro import MacrosPanel
 from .options import OptionsPanel
 
@@ -54,6 +57,7 @@ __all__ = [
     "FundamentalsValueFilter",
     "MacroRegimeFilter",
     "BreadthRegimeFilter",
+    "KalshiEventRegimeFilter",
     "Composite",
     "InverseVolWeighted",
     "PairsTrading",
@@ -83,6 +87,7 @@ class Strategy(Protocol):
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         """Desired portfolio as fractions of equity, indexed by symbol."""
         ...
@@ -146,6 +151,7 @@ class EqualWeightBuyHold:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
@@ -218,6 +224,7 @@ class CrossSectionalMomentum:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         scores = self.score(view)
@@ -283,6 +290,7 @@ class TimeSeriesMomentum:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         ok = self.qualifies(view)
@@ -345,6 +353,7 @@ class ShortHorizonReversal:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         z = self.score(view)
@@ -393,8 +402,9 @@ class TrendFilter:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
-        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
         if w.abs().sum() == 0:
             return w
         ma, complete = _trailing_ma(view, self.lookback)
@@ -476,8 +486,9 @@ class FundamentalsValueFilter:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
-        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
         if w.abs().sum() == 0:
             return w
         if fundamentals is None or len(fundamentals.frame) == 0:
@@ -590,8 +601,9 @@ class MacroRegimeFilter:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
-        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
         if w.abs().sum() == 0:
             return w
         if self.blocked(view, macros):
@@ -682,11 +694,108 @@ class BreadthRegimeFilter:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
-        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
         if w.abs().sum() == 0:
             return w
         if self.blocked(view):
+            return w * self.scale_when_blocked
+        return w
+
+
+@dataclass
+class KalshiEventRegimeFilter:
+    """Wrap a strategy and de-risk the whole book heading into a scheduled
+    macro release the market itself hasn't converged on.
+
+    Forward-looking counterpart to :class:`MacroRegimeFilter`: that one
+    reacts to a macro reading *after* FRED publishes it; this one reacts to
+    Kalshi's continuously-quoted odds on the *next* scheduled release,
+    before it happens. Same axis as every regime filter in this module --
+    total book exposure, not which names -- and the same asymmetry for
+    missing data, for the same reason: ``kalshi=None``, or a tracked series
+    with no live reading, is a no-op pass-through, not a block. See
+    :mod:`qbt.kalshi` for which series are liquid enough to trust and why.
+
+    Blocks (scales the book down) when, for at least one series in
+    ``min_confidence``, the nearest still-open event closes within
+    ``horizon_days`` *and* the ladder's implied confidence
+    (:meth:`~qbt.kalshi.KalshiPanel.snapshot`) is below that series' own
+    floor -- the market hasn't converged on an outcome for a print that's
+    about to land. An event that's confident, or one that's still far off,
+    passes through unblocked; it's specifically an imminent print the
+    market is still arguing about that trips this.
+
+    ``min_confidence`` is per series rather than one shared bar because the
+    two ladder shapes Kalshi actually uses concentrate very differently --
+    see the module docstring for the live numbers (``cpi``'s finer,
+    wider-spanning ladder tops out well below ``fed_decision``'s coarser
+    one even when both are close to resolved). Passing a bare
+    ``max_level``-style float here the way :class:`MacroRegimeFilter` does
+    would either never fire on one series or fire on nearly every instance
+    of the other.
+    """
+
+    inner: Strategy
+    min_confidence: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_MIN_CONFIDENCE)
+    )
+    horizon_days: int = 3
+    scale_when_blocked: float = 0.5
+    max_age_days: int | None = None
+    name: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = f"{self.inner.name}+kalshievent"
+        if not self.min_confidence:
+            raise ValueError("min_confidence must name at least one series")
+        for series, level in self.min_confidence.items():
+            if not 0.0 <= level <= 1.0:
+                raise ValueError(f"min_confidence[{series!r}] must be in [0, 1]")
+        if not 0.0 <= self.scale_when_blocked <= 1.0:
+            raise ValueError("scale_when_blocked must be in [0, 1]")
+        if self.horizon_days < 0:
+            raise ValueError("horizon_days must be >= 0")
+        if self.max_age_days is not None and self.max_age_days < 1:
+            raise ValueError("max_age_days must be >= 1 (or None to disable)")
+
+    @property
+    def min_history(self) -> int:
+        return self.inner.min_history
+
+    def blocked(self, view: PricePanel, kalshi: KalshiPanel | None) -> bool:
+        """Exposed separately so research code can study the regime read
+        directly, same reason :meth:`MacroRegimeFilter.blocked` is.
+        """
+        if kalshi is None or len(kalshi.frame) == 0:
+            return False
+        today = view.last_date()
+        confidence = kalshi.snapshot(today, max_age_days=self.max_age_days)
+        days = kalshi.days_to_close(today, max_age_days=self.max_age_days)
+        for series, floor in self.min_confidence.items():
+            if series not in confidence.index or series not in days.index:
+                continue
+            if days[series] > self.horizon_days:
+                continue
+            if confidence[series] < floor:
+                return True
+        return False
+
+    def target_weights(
+        self,
+        view: PricePanel,
+        fundamentals: FundamentalsPanel | None = None,
+        macros: MacrosPanel | None = None,
+        corps: CorpsPanel | None = None,
+        options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
+    ) -> pd.Series:
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
+        if w.abs().sum() == 0:
+            return w
+        if self.blocked(view, kalshi):
             return w * self.scale_when_blocked
         return w
 
@@ -723,10 +832,11 @@ class Composite:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         out = _empty(view)
         for (strat, _), share in zip(self.members, self._shares):
-            member_w = strat.target_weights(view, fundamentals, macros, corps, options)
+            member_w = strat.target_weights(view, fundamentals, macros, corps, options, kalshi)
             out = out.add(member_w.reindex(out.index).fillna(0.0) * share)
         return out
 
@@ -741,7 +851,7 @@ class Composite:
         """Per-member weights, for attribution during research."""
         cols = {}
         for (strat, _), share in zip(self.members, self._shares):
-            member_w = strat.target_weights(view, fundamentals, macros, corps, options)
+            member_w = strat.target_weights(view, fundamentals, macros, corps, options, kalshi)
             cols[strat.name] = member_w.reindex(view.symbols).fillna(0.0) * share
         return pd.DataFrame(cols)
 
@@ -784,8 +894,9 @@ class InverseVolWeighted:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
-        w = self.inner.target_weights(view, fundamentals, macros, corps, options)
+        w = self.inner.target_weights(view, fundamentals, macros, corps, options, kalshi)
         held = w[w.abs() > 0]
         if held.empty:
             return w
@@ -892,6 +1003,7 @@ class PairsTrading:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         pairs = self.select_pairs(view)
@@ -1071,6 +1183,7 @@ class MultiFactorCrossSectional:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         scores = self.score(view, fundamentals)
@@ -1146,6 +1259,7 @@ class CalendarSeasonality:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
@@ -1241,6 +1355,7 @@ class RiskParityAllocation:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         names = _tradeable(view, self.min_history)
@@ -1375,6 +1490,7 @@ class OptionsMeanReversion:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         z = self.score(view, options)
@@ -1498,6 +1614,7 @@ class InsiderEventDrift:
         macros: MacrosPanel | None = None,
         corps: CorpsPanel | None = None,
         options: OptionsPanel | None = None,
+        kalshi: KalshiPanel | None = None,
     ) -> pd.Series:
         w = _empty(view)
         candidates = self.score(view, corps)
