@@ -14,7 +14,8 @@ and production to drift apart.
 | `qbt/macro.py` | `MacrosPanel`: point-in-time macro series (CPI, Fed funds rate, unemployment, yield curve, ...) from FRED |
 | `qbt/corporate.py` | `CorpsPanel`: point-in-time SEC filing cadence (10-K/10-Q/8-K) and Form 4 insider-transaction indicators |
 | `qbt/options.py` | `OptionsPanel`: daily-archived options-chain indicators (ATM IV, put/call volume ratio) |
-| `qbt/signals.py` | `Strategy` protocol, 10 strategies, 6 composer/filter wrappers |
+| `qbt/kalshi.py` | `KalshiPanel`: point-in-time Kalshi event-contract odds (CPI, Fed decisions, payrolls, recession) — forward-looking counterpart to `qbt/macro.py`, confirmed against the live public API, no key needed |
+| `qbt/signals.py` | `Strategy` protocol, 10 strategies, 7 composer/filter wrappers |
 | `qbt/risk.py` | `RiskGate` (vol target, caps, drawdown breaker), `DayTradeLedger` (PDT budget, persisted across cycles by `run_cycle.py`) |
 | `qbt/engine.py` | `Backtester` (T+1 fills, costs), performance metrics |
 | `qbt/research.py` | IC grid, autocorrelation, walk-forward, multiple-testing haircut |
@@ -22,7 +23,7 @@ and production to drift apart.
 | `qbt/broker.py` | `BrokerAdapter` protocol, `MockBroker`, `RobinhoodMCPBroker` (equity confirmed live; `asset_class="crypto"`/`crypto_view()` unverified — see "Crypto support") |
 | `qbt/oauth.py` | OAuth 2.0 Authorization Code + PKCE for `RobinhoodMCPBroker`, via the MCP SDK's own client |
 | `qbt/orders.py` | `OrderManager`: journal, preflight, reconciliation, audit |
-| `research.ipynb` | 49-cell research notebook, 30 code cells |
+| `research.ipynb` | 54-cell research notebook, 33 code cells |
 | `run_cycle.py` | One trading cycle: equity `STRATEGY`, plus the crypto sleeve (`--consider-crypto`) as a second, independent pass. Run on a schedule, never from the notebook |
 | `debug_robinhood_crypto.py` | Read-only: dumps the raw crypto tool list/responses, the same role `debug_robinhood_accounts.py` played in confirming the equity shapes |
 | `test_qbt.py` | 129 engine validation checks (strategies, engine, risk gate, research, panel validation) |
@@ -33,20 +34,22 @@ and production to drift apart.
 | `test_options.py` | 39 checks: `OptionsPanel`, daily-archive semantics |
 | `test_options_strategy.py` | 19 checks: `OptionsMeanReversion` |
 | `test_insider_drift_strategy.py` | 21 checks: `InsiderEventDrift` |
-| `test_regime_filters.py` | 43 checks: `MacroRegimeFilter` (incl. a `vix` example)/`FundamentalsValueFilter`/`BreadthRegimeFilter` end-to-end |
+| `test_kalshi.py` | 36 checks: `KalshiPanel` PIT semantics and ladder-confidence math (all three shapes), `KalshiRepository` parsing of the live-confirmed API shapes (stubbed HTTP, no network) |
+| `test_regime_filters.py` | 59 checks: `MacroRegimeFilter` (incl. a `vix` example)/`FundamentalsValueFilter`/`BreadthRegimeFilter`/`KalshiEventRegimeFilter` end-to-end |
 | `test_robinhood_broker.py` | 68 checks: response shapes confirmed against the live Robinhood MCP server, offline crypto capability-dispatch checks (unverified shapes — see file docstring), and the persistent-session lifecycle mechanics (§11, against a faked MCP session — live network behavior unconfirmed) |
 | `test_oauth.py` | 14 checks: PKCE flow, loopback callback server, token-file permissions |
-| `test_run_cycle.py` | 85 checks: `run_cycle.py`'s live `STRATEGY`/`CRYPTO_STRATEGY` composition and thresholds, regime triggering, day-trade ledger persistence, unmanaged holdings, `--max-price`, `--consider-crypto` end to end |
+| `test_run_cycle.py` | 90 checks: `run_cycle.py`'s live `STRATEGY`/`CRYPTO_STRATEGY` composition and thresholds, regime triggering (breadth/VIX/Kalshi), day-trade ledger persistence, unmanaged holdings, `--max-price`, `--consider-crypto` end to end |
 | `build_notebook.py` | Regenerates `research.ipynb` |
 | `smoke_test.py` | Executes every notebook cell in one namespace |
 
 ## Data sources
 
-`qbt/data.py` covers price only. The other four panels exist because a
-strategy that reads fundamentals, macro, filings, or options data off a
-table fetched *today* is reading information the market couldn't see on
-the date it's being joined to — each panel fixes that by keying itself to
-the date the data actually became public, not the date it describes.
+`qbt/data.py` covers price only. The other five panels exist because a
+strategy that reads fundamentals, macro, filings, options, or event-market
+data off a table fetched *today* is reading information the market couldn't
+see on the date it's being joined to — each panel fixes that by keying
+itself to the date the data actually became public, not the date it
+describes.
 
 | Panel | Point-in-time anchor | Provider |
 |---|---|---|
@@ -54,6 +57,7 @@ the date the data actually became public, not the date it describes.
 | `MacrosPanel` | FRED release date — release *and* revision, since GDP/CPI/payrolls get revised after their first print | `pip install openbb openbb-fred` + a free FRED API key |
 | `CorpsPanel` | SEC's own `accepted_date`/`filing_date` — no estimated lag needed, unlike the two above | `pip install openbb openbb-sec` |
 | `OptionsPanel` | Snapshot date (a live quote has no disclosure lag) | `pip install openbb openbb-yfinance` (or `openbb-cboe`) |
+| `KalshiPanel` | Snapshot date, same reasoning as `OptionsPanel` | `pip install requests` (already present) — no key needed, see `qbt/kalshi.py` |
 
 `OptionsPanel` is the one exception to "point-in-time": free options-chain
 providers only return *today's* chain, not history, so it's built by
@@ -63,11 +67,19 @@ no getting last Tuesday's chain from `yfinance`/`cboe`. See the module
 docstring for the two paid providers (`intrinio`, `tmx`) that do support a
 historical `date` parameter.
 
-All four are optional: every strategy's `target_weights()` accepts
-`fundamentals`/`macros`/`corps`/`options` as `None` and either passes
-through unfiltered (`FundamentalsValueFilter`, `MacroRegimeFilter`) or
-returns no positions for names it can't score (`OptionsMeanReversion`,
-`InsiderEventDrift`) rather than raising.
+`KalshiPanel` reads Kalshi's event-contract prices — market-implied odds on
+scheduled macro releases (CPI, FOMC, payrolls) *before* they happen, the
+forward-looking counterpart to `MacrosPanel` reading FRED *after* the fact.
+`qbt/kalshi.py`'s module docstring has the full liquidity survey (which
+series are actually tradeable enough to trust, confirmed against the live
+public API) and the reasoning behind `KalshiEventRegimeFilter`'s per-series
+confidence floors.
+
+All five are optional: every strategy's `target_weights()` accepts
+`fundamentals`/`macros`/`corps`/`options`/`kalshi` as `None` and either
+passes through unfiltered (`FundamentalsValueFilter`, `MacroRegimeFilter`,
+`KalshiEventRegimeFilter`) or returns no positions for names it can't score
+(`OptionsMeanReversion`, `InsiderEventDrift`) rather than raising.
 
 ## Run
 
@@ -78,6 +90,7 @@ pip install openbb-fmp                            # optional, for FundamentalsPa
 pip install openbb-fred                           # optional, for MacrosPanel (needs a free FRED key)
 pip install openbb-sec                            # optional, for CorpsPanel
 pip install mcp                                   # optional, for RobinhoodMCPBroker + oauth
+pip install cryptography                          # optional, for signed (higher rate limit) KalshiRepository requests
 python test_qbt.py                     # 145 engine checks (null test now covers all 10 strategies), ~110s
 python test_orders.py                  # 164 order-path checks, ~10s
 python test_fundamentals.py            # 33 checks
@@ -86,11 +99,12 @@ python test_corporate.py               # 38 checks
 python test_options.py                 # 39 checks
 python test_options_strategy.py        # 19 checks
 python test_insider_drift_strategy.py  # 21 checks
-python test_regime_filters.py          # 43 checks
+python test_kalshi.py                  # 36 checks: KalshiPanel confidence math, KalshiRepository parsing (stubbed HTTP, no network)
+python test_regime_filters.py          # 59 checks, now covers KalshiEventRegimeFilter alongside Macro/Breadth
 python test_robinhood_broker.py        # 68 checks: confirmed live response shapes (equity), unverified crypto dispatch, persistent-session lifecycle
 python test_oauth.py                   # 14 checks
-python test_run_cycle.py               # 85 checks, live STRATEGY/CRYPTO_STRATEGY wiring, --max-price, --consider-crypto end to end
-python smoke_test.py                   # all 30 notebook cells
+python test_run_cycle.py               # 90 checks, live STRATEGY/CRYPTO_STRATEGY wiring, --max-price, --consider-crypto end to end
+python smoke_test.py                   # all 33 notebook cells
 jupyter lab research.ipynb
 
 python debug_robinhood_crypto.py       # run before trusting --consider-crypto --live -- see "Crypto support"
@@ -114,18 +128,21 @@ in cell 1 for real ETF data; nothing else changes.
 | `OptionsMeanReversion` | Buy names where options-implied fear (IV, put/call ratio) is most stretched vs. their own history. |
 | `InsiderEventDrift` | Long fresh open-market insider buying that follows an 8-K, held while the signal stays inside its drift window. |
 
-Plus six composer/filter wrappers that wrap any strategy, each deciding a
+Plus seven composer/filter wrappers that wrap any strategy, each deciding a
 different axis: `TrendFilter` (absolute-momentum gate, per name),
 `FundamentalsValueFilter` (block names failing a fundamentals screen, per
 name), `MacroRegimeFilter` (scale the *whole book* down in an unfavourable
 macro regime — no symbol axis to gate on; `metric="vix"` is the concrete,
 tested example — FRED's `VIXCLS` was already in `MacrosPanel`'s default
-indicators but nothing exercised it end-to-end before), `BreadthRegimeFilter`
-(scale the whole book down when too few names in the *strategy's own
-universe* are above their own trailing moving average — no external data
-source, computed straight from the price panel), `InverseVolWeighted`
-(re-weight picks by inverse vol), and `Composite` (blend several strategies
-by fixed capital share).
+indicators but nothing exercised it end-to-end before), `KalshiEventRegimeFilter`
+(scale the whole book down heading into a scheduled CPI/FOMC/payrolls print
+the market itself hasn't converged on — `MacroRegimeFilter`'s forward-looking
+counterpart, reading Kalshi's continuously-quoted odds instead of FRED's
+after-the-fact release), `BreadthRegimeFilter` (scale the whole book down
+when too few names in the *strategy's own universe* are above their own
+trailing moving average — no external data source, computed straight from
+the price panel), `InverseVolWeighted` (re-weight picks by inverse vol), and
+`Composite` (blend several strategies by fixed capital share).
 
 ## The three tests worth keeping permanently
 
@@ -206,6 +223,19 @@ you should expect to live with than the maximum.
   confirmed data, unlike everything under "Confirmed against the live
   service" below. See "Crypto support" for the full list and
   `debug_robinhood_crypto.py` for the diagnostic to run before trusting it.
+- **`KalshiEventRegimeFilter`'s per-series confidence floors
+  (`DEFAULT_MIN_CONFIDENCE`) are a reasoned starting point, not a
+  backtested-optimal one.** They come from one live ladder snapshot per
+  series (2026-09-19, cited in `qbt/kalshi.py`'s module docstring), the same
+  way `MacroRegimeFilter`'s VIX levels in `run_cycle.py` are reasoned rather
+  than optimised. Also unconfirmed: `KalshiRepository`'s `min_close_ts`
+  market-list filter and cursor pagination, which are used per Kalshi's
+  documented API shape but weren't individually exercised against a real
+  multi-page pull (everything else about the API — field names, the
+  `/markets` and `/.../candlesticks` endpoints, unauthenticated access —
+  *was* confirmed live; see the module docstring for exactly what was and
+  wasn't checked). Authenticated (RSA-signed) requests are implemented but
+  likewise untried against a real key.
 
 ## Suggested next steps
 
@@ -253,17 +283,19 @@ in the account without running or dry-running a full cycle.
 ### The live strategy
 
 `run_cycle.py`'s `STRATEGY` is not just `CrossSectionalMomentum` on its own —
-it's a two-member `Composite` core wrapped in two whole-book de-risking
-overlays, both scaling exposure down (never up, never redistributing into
-fewer names) when their own regime read is unfavourable:
+it's a two-member `Composite` core wrapped in three whole-book de-risking
+overlays, each scaling exposure down (never up, never redistributing into
+fewer names) when its own regime read is unfavourable:
 
 ```
 BreadthRegimeFilter(lookback=200, min_breadth=0.3, scale_when_blocked=0.5)
   -> MacroRegimeFilter(metric="vix", max_level=35.0, max_increase=15.0,
                         lookback=21, scale_when_blocked=0.5)
-       -> Composite("momentum_quality_blend")
-            -> CrossSectionalMomentum(lookback=63, skip=5, top_n=5)              [60%]
-            -> MultiFactorCrossSectional(momentum, low_vol, reversal, quality)  [40%]
+       -> KalshiEventRegimeFilter(horizon_days=3, scale_when_blocked=0.5,
+                                   max_age_days=3)
+            -> Composite("momentum_quality_blend")
+                 -> CrossSectionalMomentum(lookback=63, skip=5, top_n=5)              [60%]
+                 -> MultiFactorCrossSectional(momentum, low_vol, reversal, quality)  [40%]
 ```
 
 The core used to be `CrossSectionalMomentum` alone. One alpha source is one
@@ -284,38 +316,48 @@ just the sum of what each sleeve independently assigned it.
 
 `MacroRegimeFilter` blocks on a VIX level above 35 or a 15-point rise inside
 21 trading days — genuine risk-off territory, not routine noise.
-`BreadthRegimeFilter` blocks when fewer than 30% of `run_cycle.py`'s own
-UNIVERSE (18 ETFs + 12 single names, 30 symbols) is above its own 200-day
-average. Neither overlay changes which names get picked or which Composite
-member picked them; each independently scales total exposure to 50% when
-triggered, so both firing at once compounds to 25% (see the comment above
-`STRATEGY` in `run_cycle.py` for the full rationale). A cycle where either
-overlay is actively scaling prints a `REGIME:` line and emits a
-`breadth_regime_blocked` / `macro_regime_blocked` audit event — without that,
-a de-risk would show up only as an unexplained smaller position size.
-`test_run_cycle.py` (60 checks) is the permanent regression guard on this
-wiring: the composition, the capital shares, the thresholds, that elevated
-VIX alone scales turnover to exactly 50%, and that the quality sleeve
-degrades to cash (not a crash) when fundamentals aren't available.
+`KalshiEventRegimeFilter` blocks when a tracked Kalshi series (CPI,
+`fed_decision`, or `payrolls` by default) has a still-open event closing
+within 3 trading days whose ladder-implied confidence is below that series'
+own floor (see `qbt/kalshi.py`'s module docstring for why the floor is
+per-series, not shared) — the market hasn't converged on an imminent,
+scheduled print. `BreadthRegimeFilter` blocks when fewer than 30% of
+`run_cycle.py`'s own UNIVERSE (18 ETFs + 12 single names, 30 symbols) is
+above its own 200-day average. None of the three overlays changes which
+names get picked or which Composite member picked them; each independently
+scales total exposure to 50% when triggered, so two firing at once compounds
+to 25% and all three to 12.5% (see the comment above `STRATEGY` in
+`run_cycle.py` for the full rationale). A cycle where any overlay is
+actively scaling prints a `REGIME:` line and emits a
+`breadth_regime_blocked` / `macro_regime_blocked` / `kalshi_regime_blocked`
+audit event — without that, a de-risk would show up only as an unexplained
+smaller position size. `test_run_cycle.py` (90 checks) is the permanent
+regression guard on this wiring: the composition, the capital shares, the
+thresholds, that elevated VIX alone scales turnover to exactly 50%, and that
+the quality sleeve degrades to cash (not a crash) when fundamentals aren't
+available.
 
-**The VIX overlay needs a working FRED fetch to do anything, and the quality
-sleeve needs a working FMP fetch.** In `--live` and dry-run
-(non-`--synthetic`) modes, `run_cycle.py` fetches VIX via
-`MacrosRepository`/`openbb-fred` (cached under `.cache/macro`) and ROE via
+**The VIX overlay needs a working FRED fetch, the Kalshi overlay needs a
+working Kalshi fetch, and the quality sleeve needs a working FMP fetch.** In
+`--live` and dry-run (non-`--synthetic`) modes, `run_cycle.py` fetches VIX
+via `MacrosRepository`/`openbb-fred` (cached under `.cache/macro`), Kalshi
+ladders via `KalshiRepository` (cached under `.cache/kalshi`, no API key
+needed — see `qbt/kalshi.py`), and ROE via
 `FundamentalsRepository`/`openbb-fmp` (cached under `.cache/fundamentals`).
-If either fetch fails for any reason — the package not installed, no API
-key configured, the provider itself down — the cycle does **not** abort; it
-emits `macro_fetch_failed` or `fundamentals_fetch_failed`, prints the
-exception, and continues with `macros=None` / `fundamentals=None`.
-`MacroRegimeFilter` treats `macros=None` as a documented no-op pass-through;
+If any fetch fails for any reason — the package not installed, no API key
+configured, the provider itself down — the cycle does **not** abort; it
+emits `macro_fetch_failed` / `kalshi_fetch_failed` / `fundamentals_fetch_failed`,
+prints the exception, and continues with `macros=None` / `kalshi=None` /
+`fundamentals=None`. `MacroRegimeFilter` and `KalshiEventRegimeFilter` both
+treat their data being entirely absent as a documented no-op pass-through;
 `MultiFactorCrossSectional` treats `fundamentals=None` as "no name qualifies
 for the quality factor" (see its own docstring), which — because the quality
 factor is only 40% of one 60/40-split core, not the whole book — degrades
 that 40% share to cash rather than removing it. The practical effect in
 either failure is silent: no `--live` abort, just quietly less of the book
 doing what it's configured to do until access is restored. Safe, but worth
-knowing explicitly rather than assuming both overlays and both `Composite`
-members are live.
+knowing explicitly rather than assuming all three overlays and both
+`Composite` members are live.
 
 ### Crypto support (`--consider-crypto`, unverified)
 
@@ -341,6 +383,13 @@ equities differ on exactly the axes that would break a shared pipeline:
   the `quality` factor entirely and re-normalises `momentum`/`low_vol`/
   `reversal` to still sum to 1.0, rather than silently running at 60% of
   its intended weight the way `fundamentals=None` alone would produce.
+- **No Kalshi overlay (for now).** `CRYPTO_STRATEGY` is structurally wrapped
+  in `KalshiEventRegimeFilter` the same way `STRATEGY` is, but
+  `run_crypto_pipeline()` passes `kalshi=None`, which is `KalshiEventRegimeFilter`'s
+  documented no-op. Whether a scheduled 8:30am ET CPI/FOMC print is as much
+  of a de-risk trigger for a market that trades 24/7 as it is for equities
+  is a real question, not an obviously-yes the way 24/7 trading or the PDT
+  exemption are — left unresolved rather than guessed at.
 - **Two separate balance sheets.** `qbt/broker.py`'s `RobinhoodMCPBroker`
   gained an `asset_class` parameter threaded through `get_account`/
   `get_quotes`/`get_orders`/`review_order`/`place_order`/`cancel_order`,

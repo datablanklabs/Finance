@@ -41,7 +41,8 @@ import pandas as pd
 
 from qbt import (
     BreadthRegimeFilter, Composite, CrossSectionalMomentum, DayTradeLedger,
-    FundamentalsPanel, FundamentalsRepository, LiveSignalRunner,
+    FundamentalsPanel, FundamentalsRepository, KalshiEventRegimeFilter,
+    KalshiPanel, KalshiRepository, LiveSignalRunner,
     MacroRegimeFilter, MacrosPanel, MacrosRepository, MultiFactorCrossSectional,
     OpenBBRepository, PortfolioState, RiskGate, SyntheticRepository,
 )
@@ -97,9 +98,9 @@ CRYPTOS = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "LTC-USD",
           "BCH-USD", "AVAX-USD", "SHIB-USD", "XRP-USD", "ADA-USD",
           "LINK-USD", "UNI-USD", "AAVE-USD", "ETC-USD", "XLM-USD"]
 
-# Two whole-book de-risking overlays around the same momentum core, neither
-# changing which names get picked -- both just scale total exposure down
-# (never up) when their own regime read is unfavourable, the same role
+# Three whole-book de-risking overlays around the same momentum core, none
+# changing which names get picked -- each just scales total exposure down
+# (never up) when its own regime read is unfavourable, the same role
 # vol targeting plays in RiskGate:
 #
 # - MacroRegimeFilter(metric="vix"): elevated or sharply-rising implied
@@ -108,15 +109,21 @@ CRYPTOS = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "LTC-USD",
 #   noise). max_increase=15 over 21 trading days (~1 month) catches a fast
 #   spike even before the absolute level crosses 35 -- 2018-Q4 and
 #   2020-Q1 both moved VIX by more than that in under a month.
+# - KalshiEventRegimeFilter: forward-looking counterpart to the VIX read --
+#   de-risks heading into a scheduled CPI/FOMC/payrolls print the market
+#   itself hasn't converged on, rather than reacting to volatility already
+#   realised. See qbt/kalshi.py's module docstring for the live-liquidity
+#   survey and why its per-series confidence floors differ.
 # - BreadthRegimeFilter: participation *within this strategy's own
 #   UNIVERSE* (18 ETFs + 12 single names, 30 symbols) -- fewer than 30% of
 #   the sleeves above their own 200-day average (the same lookback
-#   TrendFilter uses) is a narrow, fragile tape, independent of what the
-#   VIX-based read says.
+#   TrendFilter uses) is a narrow, fragile tape, independent of what either
+#   the VIX- or Kalshi-based reads say.
 #
-# scale_when_blocked=0.5 on both, not a full flatten -- de-risk, don't
-# bet the regime read is certainly right, and if both fire at once the
-# combined 0.5 x 0.5 = 25% exposure is a real, but not total, retreat.
+# scale_when_blocked=0.5 on all three, not a full flatten -- de-risk, don't
+# bet any one regime read is certainly right, and if more than one fires at
+# once the combined scale (e.g. 0.5 x 0.5 = 25% exposure with two, 12.5%
+# with all three) is a real, but not total, retreat.
 #
 # The core itself is a two-member Composite, not a bare CrossSectionalMomentum,
 # for the same reason the overlays above scale rather than flatten: one
@@ -134,31 +141,46 @@ CRYPTOS = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "LTC-USD",
 # each sleeve independently assigned it.
 STRATEGY = BreadthRegimeFilter(
     inner=MacroRegimeFilter(
-        inner=Composite(
-            members=[
-                (CrossSectionalMomentum(lookback=63, skip=5, top_n=5), 0.6),
-                (
-                    MultiFactorCrossSectional(
-                        momentum_lookback=126, momentum_skip=5,
-                        vol_lookback=63, reversal_lookback=5,
-                        factor_weights={
-                            "momentum": 0.3, "low_vol": 0.3,
-                            "reversal": 0.1, "quality": 0.3,
-                        },
-                        # Verify against fundamentals.metrics once openbb-fmp
-                        # is actually pulling live data -- see the fundamentals
-                        # fetch below and FundamentalsValueFilter's own
-                        # docstring for the same caveat: this name is what the
-                        # FMP `ratios` statement is expected to produce, not
-                        # independently confirmed against a live response the
-                        # way the Robinhood broker's response shapes are.
-                        quality_metric="ratios_return_on_equity",
-                        top_n=5,
+        inner=KalshiEventRegimeFilter(
+            inner=Composite(
+                members=[
+                    (CrossSectionalMomentum(lookback=63, skip=5, top_n=5), 0.6),
+                    (
+                        MultiFactorCrossSectional(
+                            momentum_lookback=126, momentum_skip=5,
+                            vol_lookback=63, reversal_lookback=5,
+                            factor_weights={
+                                "momentum": 0.3, "low_vol": 0.3,
+                                "reversal": 0.1, "quality": 0.3,
+                            },
+                            # Verify against fundamentals.metrics once openbb-fmp
+                            # is actually pulling live data -- see the fundamentals
+                            # fetch below and FundamentalsValueFilter's own
+                            # docstring for the same caveat: this name is what the
+                            # FMP `ratios` statement is expected to produce, not
+                            # independently confirmed against a live response the
+                            # way the Robinhood broker's response shapes are.
+                            quality_metric="ratios_return_on_equity",
+                            top_n=5,
+                        ),
+                        0.4,
                     ),
-                    0.4,
-                ),
-            ],
-            name="momentum_quality_blend",
+                ],
+                name="momentum_quality_blend",
+            ),
+            # 3 trading days: close enough to a scheduled CPI/FOMC/payrolls
+            # print that the de-risk actually covers the release itself
+            # (these all close within a day or two of 8:25-8:30am ET on the
+            # data day), not so wide that a routine month-long run-up to the
+            # next print gets caught too. scale_when_blocked matches the VIX
+            # overlay below rather than flattening outright, for the same
+            # "don't bet the regime read is certainly right" reasoning.
+            horizon_days=3, scale_when_blocked=0.5,
+            # Kalshi prices continuously, so a reading older than a few days
+            # means the feed died, not that nothing changed -- same
+            # reasoning as max_age_days below, tighter because there's no
+            # equivalent of a monthly release cadence excusing a stale read.
+            max_age_days=3,
         ),
         metric="vix", max_level=35.0, max_increase=15.0, lookback=21,
         scale_when_blocked=0.5,
@@ -197,7 +219,7 @@ POSITION_BACKSTOP_MARGIN = 0.05
 # short version of what's different from STRATEGY/GATE and why:
 #
 # - Same two-member Composite core (60% CrossSectionalMomentum, 40%
-#   MultiFactorCrossSectional), same two regime overlays -- these are
+#   MultiFactorCrossSectional), same three regime overlays -- these are
 #   price-derived and VIX is a general risk-off gauge, not equity-specific,
 #   so both transfer. The one thing that does NOT transfer is the quality
 #   factor: it reads FundamentalsPanel, and there is no such thing as an SEC
@@ -206,6 +228,12 @@ POSITION_BACKSTOP_MARGIN = 0.05
 #   silently zero it, the way MultiFactorCrossSectional already tolerates)
 #   means the other three factors' weights actually sum to what they claim
 #   to, instead of 60% of the intended weight quietly doing 100% of the work.
+#   KalshiEventRegimeFilter is present in the structure below for the same
+#   reason MacroRegimeFilter is -- but see run_crypto_pipeline(), which
+#   passes kalshi=None here for now, same open question as macros=None:
+#   whether a scheduled 8:30am ET CPI/FOMC print is a de-risk trigger for a
+#   market that trades 24/7 the same way it is for equities is a second,
+#   independent judgement call this file isn't taking a position on yet.
 # - max_weight/max_drawdown are tighter than GATE's: crypto's realised vol
 #   typically runs several times an equity sector ETF's, so target_vol=0.12
 #   (unchanged -- let RiskGate's existing vol-target scaling do its job
@@ -216,22 +244,25 @@ POSITION_BACKSTOP_MARGIN = 0.05
 #   forecast being right.
 CRYPTO_STRATEGY = BreadthRegimeFilter(
     inner=MacroRegimeFilter(
-        inner=Composite(
-            members=[
-                (CrossSectionalMomentum(lookback=63, skip=5, top_n=5), 0.6),
-                (
-                    MultiFactorCrossSectional(
-                        momentum_lookback=126, momentum_skip=5,
-                        vol_lookback=63, reversal_lookback=5,
-                        factor_weights={
-                            "momentum": 0.5, "low_vol": 0.3, "reversal": 0.2,
-                        },
-                        top_n=5,
+        inner=KalshiEventRegimeFilter(
+            inner=Composite(
+                members=[
+                    (CrossSectionalMomentum(lookback=63, skip=5, top_n=5), 0.6),
+                    (
+                        MultiFactorCrossSectional(
+                            momentum_lookback=126, momentum_skip=5,
+                            vol_lookback=63, reversal_lookback=5,
+                            factor_weights={
+                                "momentum": 0.5, "low_vol": 0.3, "reversal": 0.2,
+                            },
+                            top_n=5,
+                        ),
+                        0.4,
                     ),
-                    0.4,
-                ),
-            ],
-            name="crypto_momentum_blend",
+                ],
+                name="crypto_momentum_blend",
+            ),
+            horizon_days=3, scale_when_blocked=0.5, max_age_days=3,
         ),
         metric="vix", max_level=35.0, max_increase=15.0, lookback=21,
         scale_when_blocked=0.5, max_age_days=7,
@@ -601,6 +632,42 @@ def main() -> int:
         print(f"  (macro/VIX fetch failed, continuing without it: {exc!r})")
         macros = None
 
+    # ---- kalshi (forward-looking macro-event odds, for
+    # KalshiEventRegimeFilter wrapped around STRATEGY) ----------------------
+    # Same degrade-not-abort shape as the macro block above, for the same
+    # reason: KalshiEventRegimeFilter already treats kalshi=None (or a
+    # tracked series with no live reading) as a no-op pass-through by
+    # design, so a Kalshi outage should degrade today's cycle back to
+    # VIX+breadth-only risk management, not abort a trading day over the
+    # most optional of the three overlays.
+    try:
+        if args.synthetic:
+            # No real Kalshi ladder to fetch offline -- a single always-open,
+            # always-confident synthetic reading exercises the wiring
+            # (KalshiEventRegimeFilter actually receiving and reading a
+            # panel) without claiming to be a real forecast. close_time is
+            # fixed a year past the panel's last bar, so days_to_close never
+            # falls inside horizon_days and this never actually fires --
+            # the point is exercising the plumbing, not simulating an event.
+            far_close = panel.dates[-1] + pd.Timedelta(days=365)
+            kalshi = KalshiPanel(frame=pd.DataFrame(
+                [
+                    ("cpi", "SYN-CPI", "SYN-CPI-T0", float("nan"), d, far_close,
+                     0.95, 1.0, 1.0)
+                    for d in panel.dates
+                ],
+                columns=["series", "event_ticker", "market_ticker", "strike",
+                         "snapshot_date", "close_time", "yes_price",
+                         "volume", "open_interest"],
+            ))
+        else:
+            kalshi = KalshiRepository(cache_dir=".cache/kalshi").fetch(
+                "2010-01-01", end)
+    except Exception as exc:
+        audit.emit("kalshi_fetch_failed", error=repr(exc))
+        print(f"  (Kalshi fetch failed, continuing without it: {exc!r})")
+        kalshi = None
+
     # ---- fundamentals (quality factor for the MultiFactorCrossSectional
     # sleeve of STRATEGY's Composite core) ---------------------------------
     # Same reasoning as the macro block above, and the same degrade-not-abort
@@ -671,7 +738,8 @@ def main() -> int:
     try:
         equity_rc = run_pipeline(
             label="equity", panel=panel, strategy=STRATEGY,
-            gate_kwargs=gate_kwargs, macros=macros, fundamentals=fundamentals,
+            gate_kwargs=gate_kwargs, macros=macros, kalshi=kalshi,
+            fundamentals=fundamentals,
             broker_view=broker,
             policy=ExecutionPolicy(
                 max_order_notional=args.max_order,
@@ -792,7 +860,7 @@ def run_crypto_pipeline(
             # nothing for crypto today, same as it silently does nothing
             # for equities too when the VIX fetch itself fails (see the
             # macro fetch block above).
-            macros=None, fundamentals=None,
+            macros=None, kalshi=None, fundamentals=None,
             broker_view=broker_view,
             policy=ExecutionPolicy(
                 max_order_notional=args.max_crypto_order,
@@ -833,7 +901,7 @@ def run_crypto_pipeline(
 
 
 def run_pipeline(
-    *, label: str, panel, strategy, gate_kwargs: dict, macros, fundamentals,
+    *, label: str, panel, strategy, gate_kwargs: dict, macros, kalshi, fundamentals,
     broker_view, policy: ExecutionPolicy, ledger: DayTradeLedger,
     day_trades_path: str | None, peak_file: str, journal_path: str,
     max_turnover: float, audit: AuditLog,
@@ -926,7 +994,7 @@ def run_pipeline(
         plan = LiveSignalRunner(strategy=strategy, risk_gate=RiskGate(**gate_kwargs),
                                 max_turnover=max_turnover,
                                 day_trade_ledger=ledger).plan(
-            panel, state, fundamentals=fundamentals, macros=macros)
+            panel, state, fundamentals=fundamentals, macros=macros, kalshi=kalshi)
 
         # Surface *why* the plan looks the way it does -- these were
         # computed but never printed anywhere, which is exactly how the
@@ -942,18 +1010,21 @@ def run_pipeline(
                 print(f"  RISK GATE: {n}")
             audit.emit("risk_gate_notes", notes="; ".join(plan.decision.notes), sleeve=label)
 
-        # BreadthRegimeFilter/MacroRegimeFilter just scale target_weights()
-        # down silently -- neither goes through plan.warnings, so without
-        # this a de-risk from either would show up only as unexplained
-        # smaller position sizes. Same view LiveSignalRunner.plan() used
-        # internally, reconstructed here purely for this diagnostic. Both
-        # STRATEGY and CRYPTO_STRATEGY share this exact
-        # BreadthRegimeFilter(inner=MacroRegimeFilter(inner=Composite))
-        # nesting, which is what this diagnostic assumes.
+        # BreadthRegimeFilter/MacroRegimeFilter/KalshiEventRegimeFilter just
+        # scale target_weights() down silently -- none of them go through
+        # plan.warnings, so without this a de-risk from any of them would
+        # show up only as unexplained smaller position sizes. Same view
+        # LiveSignalRunner.plan() used internally, reconstructed here purely
+        # for this diagnostic. Both STRATEGY and CRYPTO_STRATEGY share this
+        # exact BreadthRegimeFilter(inner=MacroRegimeFilter(inner=
+        # KalshiEventRegimeFilter(inner=Composite))) nesting, which is what
+        # this diagnostic assumes.
         regime_view = panel.as_of(plan.asof)
         regime_macros = macros.as_of(plan.asof) if macros is not None else None
+        regime_kalshi = kalshi.as_of(plan.asof) if kalshi is not None else None
         breadth_filter = strategy
         macro_filter = strategy.inner
+        kalshi_filter = strategy.inner.inner
         if breadth_filter.blocked(regime_view):
             print(f"  REGIME: market breadth below {breadth_filter.min_breadth:.0%} "
                   f"-- book scaled to {breadth_filter.scale_when_blocked:.0%} "
@@ -966,6 +1037,12 @@ def run_pipeline(
                   f"{macro_filter.scale_when_blocked:.0%}")
             audit.emit("macro_regime_blocked", metric=macro_filter.metric,
                        scale=macro_filter.scale_when_blocked, sleeve=label)
+        if kalshi_filter.blocked(regime_view, regime_kalshi):
+            print(f"  REGIME: an imminent Kalshi-tracked print is still "
+                  f"unresolved -- book scaled to "
+                  f"{kalshi_filter.scale_when_blocked:.0%}")
+            audit.emit("kalshi_regime_blocked",
+                       scale=kalshi_filter.scale_when_blocked, sleeve=label)
 
         report = manager.execute(plan, strategy_name=strategy.name)
     except Exception as exc:

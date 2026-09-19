@@ -1,13 +1,15 @@
-"""Validate FundamentalsValueFilter, MacroRegimeFilter, and BreadthRegimeFilter."""
+"""Validate FundamentalsValueFilter, MacroRegimeFilter, BreadthRegimeFilter,
+and KalshiEventRegimeFilter."""
 
 import numpy as np
 import pandas as pd
 
 from qbt import (
     Backtester, BreadthRegimeFilter, CrossSectionalMomentum, EqualWeightBuyHold,
-    FundamentalsPanel, FundamentalsValueFilter, MacroRegimeFilter, MacrosPanel,
-    PricePanel, SyntheticRepository,
+    FundamentalsPanel, FundamentalsValueFilter, KalshiEventRegimeFilter,
+    MacroRegimeFilter, MacrosPanel, PricePanel, SyntheticRepository,
 )
+from qbt.kalshi import KalshiPanel
 
 FAILS = []
 
@@ -351,6 +353,157 @@ check("exposure is scaled down (not necessarily zero), not fully flat, "
       "after the VIX spike",
       (after_spike.abs().sum(axis=1) <= 0.25 + 1e-9).all(),
       f"max gross after spike: {after_spike.abs().sum(axis=1).max():.3f}")
+
+print()
+print("=" * 72)
+print("10. KalshiEventRegimeFilter -- construction and validation")
+print("=" * 72)
+
+try:
+    KalshiEventRegimeFilter(inner=EqualWeightBuyHold(), min_confidence={})
+    check("rejects an empty min_confidence mapping", False)
+except ValueError:
+    check("rejects an empty min_confidence mapping", True)
+
+try:
+    KalshiEventRegimeFilter(inner=EqualWeightBuyHold(), min_confidence={"cpi": 1.5})
+    check("rejects a per-series floor outside [0, 1]", False)
+except ValueError:
+    check("rejects a per-series floor outside [0, 1]", True)
+
+try:
+    KalshiEventRegimeFilter(inner=EqualWeightBuyHold(), scale_when_blocked=1.1)
+    check("rejects scale_when_blocked outside [0, 1]", False)
+except ValueError:
+    check("rejects scale_when_blocked outside [0, 1]", True)
+
+try:
+    KalshiEventRegimeFilter(inner=EqualWeightBuyHold(), horizon_days=-1)
+    check("rejects a negative horizon_days", False)
+except ValueError:
+    check("rejects a negative horizon_days", True)
+
+kf = KalshiEventRegimeFilter(inner=EqualWeightBuyHold())
+check("auto-names itself", kf.name == "equal_weight+kalshievent")
+check("min_history passes through from the inner strategy",
+      kf.min_history == EqualWeightBuyHold().min_history)
+check("ships with a floor for every series it watches by default",
+      set(kf.min_confidence) == {"cpi", "fed_decision", "payrolls", "recession"})
+
+print()
+print("=" * 72)
+print("11. KalshiEventRegimeFilter -- gating behaviour")
+print("=" * 72)
+
+
+def _kframe(rows):
+    df = pd.DataFrame(
+        rows,
+        columns=["series", "event_ticker", "market_ticker", "strike",
+                 "snapshot_date", "close_time", "yes_price", "volume", "open_interest"],
+    )
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+    df["close_time"] = pd.to_datetime(df["close_time"])
+    return df
+
+
+kev_repo = SyntheticRepository(n_symbols=4, seed=41)
+kev_panel = kev_repo.fetch(start="2020-01-01", end="2020-06-30")
+kev_view = kev_panel.as_of(kev_panel.dates[120])
+today = kev_view.last_date()
+
+check("kalshi=None is a no-op pass-through, not a block",
+      kf.blocked(kev_view, None) is False)
+
+# An imminent CPI print (closes in 2 days) the market hasn't converged on
+# (confidence 0.20, well under cpi's 0.40 default floor) -- should block.
+imminent_unsure = KalshiPanel(frame=_kframe([
+    # buckets = [0.35, 0.30, 0.35] -> confidence 0.35, under cpi's 0.40 floor.
+    ("cpi", "KXCPI-X", "KXCPI-X-T0.1", 0.1, today, today + pd.Timedelta(days=2), 0.65, 1, 1),
+    ("cpi", "KXCPI-X", "KXCPI-X-T0.2", 0.2, today, today + pd.Timedelta(days=2), 0.35, 1, 1),
+]))
+check("an imminent, low-confidence print blocks",
+      kf.blocked(kev_view, imminent_unsure) is True,
+      imminent_unsure.snapshot(today).to_dict())
+
+# Same low confidence, but the event is well past horizon_days -- must not block.
+far_out_unsure = KalshiPanel(frame=_kframe([
+    ("cpi", "KXCPI-Y", "KXCPI-Y-T0.1", 0.1, today, today + pd.Timedelta(days=30), 0.65, 1, 1),
+    ("cpi", "KXCPI-Y", "KXCPI-Y-T0.2", 0.2, today, today + pd.Timedelta(days=30), 0.35, 1, 1),
+]))
+check("a low-confidence print far past the horizon does not block",
+      kf.blocked(kev_view, far_out_unsure) is False)
+
+# Imminent, but the market has converged (confidence well above the floor).
+imminent_confident = KalshiPanel(frame=_kframe([
+    ("cpi", "KXCPI-Z", "KXCPI-Z-T0.1", 0.1, today, today + pd.Timedelta(days=2), 0.97, 1, 1),
+    ("cpi", "KXCPI-Z", "KXCPI-Z-T0.2", 0.2, today, today + pd.Timedelta(days=2), 0.02, 1, 1),
+]))
+check("an imminent but confident print does not block",
+      kf.blocked(kev_view, imminent_confident) is False,
+      imminent_confident.snapshot(today).to_dict())
+
+# Per-series floors: the same 0.55 confidence reads as "unsure" for
+# fed_decision (default floor 0.65) but "confident enough" for payrolls
+# (default floor 0.45) -- exactly why min_confidence is per series.
+mixed = KalshiPanel(frame=_kframe([
+    ("fed_decision", "FED-X", "FED-X-A", float("nan"), today, today + pd.Timedelta(days=1), 0.55, 1, 1),
+    ("fed_decision", "FED-X", "FED-X-B", float("nan"), today, today + pd.Timedelta(days=1), 0.45, 1, 1),
+    ("payrolls", "PAY-X", "PAY-X-T10", 10.0, today, today + pd.Timedelta(days=1), 0.55, 1, 1),
+    ("payrolls", "PAY-X", "PAY-X-T20", 20.0, today, today + pd.Timedelta(days=1), 0.0, 1, 1),
+]))
+check("0.55 confidence blocks against fed_decision's higher floor but not "
+      "payrolls' lower one -- per-series calibration actually matters",
+      KalshiEventRegimeFilter(
+          inner=EqualWeightBuyHold(), min_confidence={"fed_decision": 0.65},
+      ).blocked(kev_view, mixed) is True
+      and KalshiEventRegimeFilter(
+          inner=EqualWeightBuyHold(), min_confidence={"payrolls": 0.45},
+      ).blocked(kev_view, mixed) is False)
+
+w_noop = kf.target_weights(kev_view, kalshi=None)
+check("target_weights with kalshi=None matches the unwrapped inner strategy",
+      np.allclose(w_noop.to_numpy(), EqualWeightBuyHold().target_weights(kev_view).to_numpy()))
+
+kf_scale = KalshiEventRegimeFilter(inner=EqualWeightBuyHold(), scale_when_blocked=0.5)
+w_blocked = kf_scale.target_weights(kev_view, kalshi=imminent_unsure)
+w_unblocked = kf_scale.target_weights(kev_view, kalshi=None)
+check("a block scales the book down by scale_when_blocked, not to zero",
+      np.allclose(w_blocked.to_numpy(), w_unblocked.to_numpy() * 0.5))
+
+print()
+print("=" * 72)
+print("12. KalshiEventRegimeFilter -- wired into Backtester")
+print("=" * 72)
+
+repo4 = SyntheticRepository(n_symbols=6, seed=53)
+panel4 = repo4.fetch(start="2019-01-01", end="2021-12-31")
+inner4 = CrossSectionalMomentum(lookback=63, top_n=3)
+
+# A recurring monthly CPI-style event, alternating confident/unsure prints,
+# spanning the whole backtest window -- exercises the roll from one event
+# to the next through KalshiPanel.as_of(), not just a single snapshot.
+kalshi_rows = []
+event_starts = pd.date_range(panel4.dates[0], panel4.dates[-1], freq="MS")
+for i, start in enumerate(event_starts):
+    close = start + pd.Timedelta(days=25)
+    p_low, p_high = (0.65, 0.35) if i % 2 == 0 else (0.97, 0.02)
+    for snap in pd.date_range(start, close, freq="D"):
+        kalshi_rows.append(("cpi", f"KXCPI-{i}", f"KXCPI-{i}-T0.1", 0.1, snap, close, p_low, 1, 1))
+        kalshi_rows.append(("cpi", f"KXCPI-{i}", f"KXCPI-{i}-T0.2", 0.2, snap, close, p_high, 1, 1))
+kalshi_panel4 = KalshiPanel(frame=_kframe(kalshi_rows))
+
+gated_kalshi = KalshiEventRegimeFilter(
+    inner=inner4, min_confidence={"cpi": 0.40}, horizon_days=5, scale_when_blocked=0.5,
+)
+bt4 = Backtester(panel=panel4, strategy=gated_kalshi, kalshi=kalshi_panel4,
+                 rebalance="W", initial_equity=50_000)
+result4 = bt4.run()
+check("a live Kalshi-gated backtest runs cleanly end to end",
+      result4.equity.notna().all())
+check("the book is scaled down on some rebalances and not on others "
+      "(the filter actually toggles, not stuck one way)",
+      result4.targets.abs().sum(axis=1).nunique() > 1)
 
 print()
 print("=" * 72)

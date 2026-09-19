@@ -60,7 +60,7 @@ class PeekingStrategy:
     def min_history(self):
         return 10
 
-    def target_weights(self, view, fundamentals=None, macros=None, corps=None, options=None):
+    def target_weights(self, view, fundamentals=None, macros=None, corps=None, options=None, kalshi=None):
         last = view.last_date()
         self.max_seen = last if self.max_seen is None else max(self.max_seen, last)
         return pd.Series(1.0 / len(view.symbols), index=view.symbols)
@@ -347,7 +347,7 @@ class _AlternatingStrategy:
     min_history = 1
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         syms = view.symbols
         half = pd.Series({syms[0]: 0.5, syms[1]: 0.5}).reindex(syms).fillna(0.0)
         other_half = pd.Series({syms[2]: 0.5, syms[3]: 0.5}).reindex(syms).fillna(0.0)
@@ -611,7 +611,7 @@ class _TrendStubInner:
     min_history = 5
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         return pd.Series({"OLD": 0.5, "NEW": 0.5}).reindex(view.symbols).fillna(0.0)
 
 
@@ -642,7 +642,7 @@ class _PartialStubInner:
     min_history = 5
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         return pd.Series({"FULL": 0.5, "YOUNG": 0.5}).reindex(
             view.symbols).fillna(0.0)
 
@@ -706,7 +706,7 @@ class _IVolPicks:
     min_history = 5
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         return pd.Series({"GOOD": 0.5, "NOVOL": 0.5}).reindex(
             view.symbols).fillna(0.0)
 
@@ -971,7 +971,7 @@ class _FixedWeights:
         self._weights = weights
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         return pd.Series(self._weights).reindex(view.symbols).fillna(0.0)
 
 

@@ -1,15 +1,17 @@
 """Validate run_cycle.py's live STRATEGY wiring (BreadthRegimeFilter +
-MacroRegimeFilter wrapped around a two-member Composite core).
+MacroRegimeFilter + KalshiEventRegimeFilter wrapped around a two-member
+Composite core).
 
 This is a script, not a package module, so it's loaded here via importlib
 rather than a normal import. The point of this file is narrow: prove the
 composition on disk is what the docstring/README claim (right nesting, right
-capital shares, right thresholds), that both overlays actually fire and
+capital shares, right thresholds), that all three overlays actually fire and
 compound correctly when their regime read is unfavourable, and that the
 Composite core's fundamentals-dependent member degrades to cash rather than
 crashing when fundamentals aren't available -- not to re-test
-BreadthRegimeFilter, MacroRegimeFilter, or MultiFactorCrossSectional
-themselves (that's test_regime_filters.py's and test_qbt.py's job).
+BreadthRegimeFilter, MacroRegimeFilter, KalshiEventRegimeFilter, or
+MultiFactorCrossSectional themselves (that's test_regime_filters.py's and
+test_qbt.py's job).
 """
 
 import importlib.util
@@ -27,8 +29,8 @@ import pandas as pd
 
 from qbt import (
     Backtester, BreadthRegimeFilter, Composite, CrossSectionalMomentum,
-    DayTradeLedger, ExecutionConfig, FundamentalsPanel, LiveSignalRunner,
-    MacroRegimeFilter, MacrosPanel, MultiFactorCrossSectional,
+    DayTradeLedger, ExecutionConfig, FundamentalsPanel, KalshiEventRegimeFilter,
+    LiveSignalRunner, MacroRegimeFilter, MacrosPanel, MultiFactorCrossSectional,
     PortfolioState, PricePanel, RiskGate, ShortHorizonReversal,
     SyntheticRepository,
 )
@@ -57,11 +59,14 @@ print("=" * 72)
 
 breadth = run_cycle.STRATEGY
 macro = breadth.inner
-core = macro.inner
+kalshi_filter = macro.inner
+core = kalshi_filter.inner
 
 check("outer wrapper is BreadthRegimeFilter", isinstance(breadth, BreadthRegimeFilter))
 check("middle wrapper is MacroRegimeFilter", isinstance(macro, MacroRegimeFilter))
-check("inner strategy is a two-member Composite", isinstance(core, Composite))
+check("innermost overlay is KalshiEventRegimeFilter",
+      isinstance(kalshi_filter, KalshiEventRegimeFilter))
+check("core strategy is a two-member Composite", isinstance(core, Composite))
 check("Composite has exactly two members", len(core.members) == 2)
 
 check("breadth lookback is 200", breadth.lookback == 200)
@@ -73,6 +78,10 @@ check("macro max_level is 35.0", macro.max_level == 35.0)
 check("macro max_increase is 15.0", macro.max_increase == 15.0)
 check("macro lookback is 21", macro.lookback == 21)
 check("macro scale_when_blocked is 0.5", macro.scale_when_blocked == 0.5)
+
+check("kalshi horizon_days is 3", kalshi_filter.horizon_days == 3)
+check("kalshi scale_when_blocked is 0.5", kalshi_filter.scale_when_blocked == 0.5)
+check("kalshi max_age_days is 3", kalshi_filter.max_age_days == 3)
 
 mom_member, mom_share = core.members[0]
 mf_member, mf_share = core.members[1]
@@ -407,7 +416,7 @@ class _AllIn:
     min_history = 5
 
     def target_weights(self, view, fundamentals=None, macros=None,
-                       corps=None, options=None):
+                       corps=None, options=None, kalshi=None):
         return pd.Series({view.symbols[0]: 1.0}).reindex(view.symbols).fillna(0.0)
 
 
@@ -463,10 +472,13 @@ check("CRYPTOS is a non-empty list of yfinance-style tickers",
 
 crypto_breadth = run_cycle.CRYPTO_STRATEGY
 crypto_macro = crypto_breadth.inner
-crypto_core = crypto_macro.inner
+crypto_kalshi_filter = crypto_macro.inner
+crypto_core = crypto_kalshi_filter.inner
 check("crypto outer wrapper is BreadthRegimeFilter", isinstance(crypto_breadth, BreadthRegimeFilter))
 check("crypto middle wrapper is MacroRegimeFilter", isinstance(crypto_macro, MacroRegimeFilter))
-check("crypto inner strategy is a two-member Composite", isinstance(crypto_core, Composite))
+check("crypto innermost overlay is KalshiEventRegimeFilter",
+      isinstance(crypto_kalshi_filter, KalshiEventRegimeFilter))
+check("crypto core strategy is a two-member Composite", isinstance(crypto_core, Composite))
 check("crypto Composite has exactly two members", len(crypto_core.members) == 2)
 
 crypto_mom_member, crypto_mom_share = crypto_core.members[0]

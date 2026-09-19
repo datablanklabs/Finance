@@ -223,7 +223,7 @@ class ProbeStrategy:
     def min_history(self):
         return 30
 
-    def target_weights(self, view, fundamentals=None, macros=None, corps=None, options=None):
+    def target_weights(self, view, fundamentals=None, macros=None, corps=None, options=None, kalshi=None):
         seen_calls["n"] += 1
         decision_date = view.last_date()
         if macros is not None and len(macros.frame):
