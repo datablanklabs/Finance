@@ -22,6 +22,7 @@ import glob
 import hashlib
 import os
 import time
+import warnings
 from dataclasses import dataclass, replace
 from typing import Iterable, Protocol, Sequence
 
@@ -37,6 +38,7 @@ __all__ = [
     "prune_cache",
     "touch_cache",
     "as_merge_key",
+    "trim_incomplete_tail",
 ]
 
 
@@ -202,6 +204,64 @@ class PricePanel:
         )
 
 
+def trim_incomplete_tail(
+    panel: PricePanel, max_bars: int = 3
+) -> tuple[PricePanel, list[tuple[pd.Timestamp, list[str]]]]:
+    """Drop trailing bars the provider hadn't finished filling in.
+
+    A bar is incomplete when some symbol that closed on the bar before it
+    has no close on it. Seen live (yfinance, 2026-09-23 08:19 ET): the
+    previous session's row came back with ``open`` and ``volume`` but every
+    ``close`` NaN. Left in place, that row becomes ``last_close()``, every
+    held position is valued at nothing, and ``RiskGate``'s drawdown breaker
+    trips on an account that hadn't lost a cent. Dropping it makes the cycle
+    run on the last complete bar instead -- a day older, which
+    ``LiveSignalRunner``'s own staleness warning already covers.
+
+    Only the tail is checked. A gap mid-history (a halt, a listing date) is
+    real data and stays as it is; and a symbol NaN on *both* of the last
+    two bars (delisted, not yet listed) isn't evidence the newest bar is
+    unfinished, so it never triggers a trim either.
+
+    Returns the trimmed panel and ``[(dropped_date, [missing symbols]),
+    ...]``, newest first. More than ``max_bars`` incomplete bars in a row is
+    no longer "the provider is a few hours behind" -- raises ``ValueError``
+    instead of quietly planning off data that old.
+    """
+    close = panel.close
+    dropped: list[tuple[pd.Timestamp, list[str]]] = []
+    while len(close) >= 2:
+        missing = close.iloc[-1].isna() & close.iloc[-2].notna()
+        if not missing.any():
+            break
+        dropped.append((close.index[-1], list(missing[missing].index)))
+        close = close.iloc[:-1]
+        if len(dropped) > max_bars:
+            raise ValueError(
+                f"price data incomplete on each of the last {len(dropped)} bars "
+                f"(max_trim_bars={max_bars}); most recent: "
+                f"{dropped[0][0].date()} missing {', '.join(dropped[0][1])}"
+            )
+    if not dropped:
+        return panel, dropped
+    for date, syms in dropped:
+        warnings.warn(
+            f"dropped incomplete price bar {date.date()}: no close for "
+            f"{len(syms)} symbol(s) priced the bar before ({', '.join(syms)})",
+            stacklevel=3,
+        )
+    return panel.as_of(close.index[-1]), dropped
+
+
+def _remove_quietly(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def touch_cache(path: str | None) -> None:
     """Mark a cache entry as used, now.
 
@@ -361,6 +421,7 @@ class OpenBBRepository:
         include_open: bool = True,
         include_volume: bool = True,
         asset_class: str = "equity",
+        max_trim_bars: int = 3,
     ) -> None:
         if asset_class not in ("equity", "crypto"):
             raise ValueError(f"asset_class must be 'equity' or 'crypto', got {asset_class!r}")
@@ -369,6 +430,11 @@ class OpenBBRepository:
         self.include_open = include_open
         self.include_volume = include_volume
         self.asset_class = asset_class
+        self.max_trim_bars = max_trim_bars
+        # What the most recent fetch() dropped off the end -- see
+        # trim_incomplete_tail. Exposed so a caller (run_cycle.py) can put
+        # it in its audit log, not just the warning.
+        self.last_trimmed: list[tuple[pd.Timestamp, list[str]]] = []
 
     # -- cache ------------------------------------------------------------
 
@@ -395,11 +461,31 @@ class OpenBBRepository:
         end_s = str(pd.Timestamp(end).date())
 
         path = self._cache_path(symbols, start_s, end_s)
-        if path and os.path.exists(path):
+        from_cache = bool(path and os.path.exists(path))
+        if from_cache:
             touch_cache(path)          # a hit keeps it alive; see prune_cache
             tidy = pd.read_csv(path, parse_dates=["date"])
         else:
             tidy = self._fetch_remote(symbols, start_s, end_s)
+
+        # Never keep a response the provider hadn't finished: written (or
+        # left) in the cache, it would pin today's incomplete bar for every
+        # rerun under the same key, long after the provider has filled the
+        # close in -- so a trimmed fetch isn't written, and a trimmed (or
+        # untrimmably broken) cache entry is removed.
+        try:
+            panel, trimmed = trim_incomplete_tail(
+                self._to_panel(tidy, symbols), max_bars=self.max_trim_bars
+            )
+        except ValueError:
+            if from_cache:
+                _remove_quietly(path)
+            raise
+        self.last_trimmed = trimmed
+        if trimmed:
+            if from_cache:
+                _remove_quietly(path)
+        elif not from_cache:
             if path:
                 # Sweep dead entries before adding a new one -- see
                 # prune_cache's own docstring for why this matters
@@ -414,7 +500,7 @@ class OpenBBRepository:
                 prune_cache(self.cache_dir)
                 tidy.to_csv(path, index=False)
 
-        return self._to_panel(tidy, symbols)
+        return panel
 
     def _fetch_remote(
         self, symbols: Sequence[str], start: str, end: str

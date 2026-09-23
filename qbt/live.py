@@ -50,8 +50,25 @@ class PortfolioState:
     peak_equity: float | None = None
 
     def equity(self, prices: pd.Series) -> float:
+        """Cash plus holdings at ``prices``. A held symbol whose price is
+        missing contributes $0 here -- check :meth:`unpriced` first wherever
+        that would matter (see :meth:`LiveSignalRunner.plan`).
+        """
         held = self.shares.reindex(prices.index).fillna(0.0)
         return float(self.cash + (held * prices).fillna(0.0).sum())
+
+    def unpriced(self, prices: pd.Series) -> list[str]:
+        """Held symbols in ``prices``'s index with no usable price (NaN,
+        non-finite, or <= 0) -- the positions :meth:`equity` and
+        :meth:`weights` would silently value at nothing. Holdings outside
+        ``prices``'s index aren't this method's concern: run_cycle.py
+        excludes and reports those separately as unmanaged holdings.
+        """
+        held = self.shares[self.shares.abs() > 1e-9]
+        held = held[held.index.isin(prices.index)]
+        p = prices.reindex(held.index).astype(float)
+        bad = ~(np.isfinite(p) & (p > 0))
+        return list(held.index[bad])
 
     def weights(self, prices: pd.Series) -> pd.Series:
         eq = self.equity(prices)
@@ -202,6 +219,30 @@ class LiveSignalRunner:
             )
 
         prices = view.last_close()
+        # A held position with no price would be valued at $0 below. That
+        # understates equity -- and with it every weight, the vol-target
+        # scale, and the drawdown RiskGate measures -- by the whole
+        # position: seen live 2026-09-23, when a blank provider bar valued
+        # a ~$990 account at its $107 of cash and tripped the breaker at
+        # 89%. A breaker trip means "sell"; there is no safe plan to make
+        # off a valuation known to be wrong, so make none.
+        unpriced = state.unpriced(prices)
+        if unpriced:
+            warnings.append(
+                f"no usable {asof_ts.date()} price for held position(s) "
+                f"{', '.join(unpriced)} -- refusing to plan rather than value "
+                f"them at $0 (equity below excludes them)"
+            )
+            return LivePlan(
+                asof=asof_ts,
+                equity=state.equity(prices),
+                intents=[],
+                target_weights=pd.Series(dtype=float),
+                current_weights=pd.Series(dtype=float),
+                decision=None,
+                warnings=warnings,
+            )
+
         equity = state.equity(prices)
         peak = state.peak_equity if state.peak_equity is not None else equity
         current_w = state.weights(prices)
