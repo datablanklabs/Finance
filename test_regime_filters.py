@@ -388,7 +388,9 @@ check("auto-names itself", kf.name == "equal_weight+kalshievent")
 check("min_history passes through from the inner strategy",
       kf.min_history == EqualWeightBuyHold().min_history)
 check("ships with a floor for every series it watches by default",
-      set(kf.min_confidence) == {"cpi", "fed_decision", "payrolls", "recession"})
+      set(kf.min_confidence) == {
+          "cpi", "fed_decision", "payrolls", "recession", "unemployment", "pce_core",
+      })
 
 print()
 print("=" * 72)
@@ -460,6 +462,24 @@ check("0.55 confidence blocks against fed_decision's higher floor but not "
       and KalshiEventRegimeFilter(
           inner=EqualWeightBuyHold(), min_confidence={"payrolls": 0.45},
       ).blocked(kev_view, mixed) is False)
+
+# Same idea for the two series added from the 2026-09-20 survey: a shared
+# 0.50 confidence reads as "unsure" against pce_core's floor (0.60) but
+# "confident enough" against unemployment's (0.35).
+mixed2 = KalshiPanel(frame=_kframe([
+    ("unemployment", "U3-X", "U3-X-T4.0", 4.0, today, today + pd.Timedelta(days=1), 0.75, 1, 1),
+    ("unemployment", "U3-X", "U3-X-T4.1", 4.1, today, today + pd.Timedelta(days=1), 0.25, 1, 1),
+    ("pce_core", "PCE-X", "PCE-X-T0.2", 0.2, today, today + pd.Timedelta(days=1), 0.75, 1, 1),
+    ("pce_core", "PCE-X", "PCE-X-T0.3", 0.3, today, today + pd.Timedelta(days=1), 0.25, 1, 1),
+]))
+check("0.50 confidence blocks against pce_core's higher floor but not "
+      "unemployment's lower one",
+      KalshiEventRegimeFilter(
+          inner=EqualWeightBuyHold(), min_confidence={"pce_core": 0.60},
+      ).blocked(kev_view, mixed2) is True
+      and KalshiEventRegimeFilter(
+          inner=EqualWeightBuyHold(), min_confidence={"unemployment": 0.35},
+      ).blocked(kev_view, mixed2) is False)
 
 w_noop = kf.target_weights(kev_view, kalshi=None)
 check("target_weights with kalshi=None matches the unwrapped inner strategy",

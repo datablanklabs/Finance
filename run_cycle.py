@@ -202,6 +202,16 @@ STRATEGY = BreadthRegimeFilter(
 # back to RiskGate's own 0.25 default instead of the 0.30 configured here.
 GATE = dict(target_vol=0.12, max_weight=0.30, max_gross=1.0, max_drawdown=0.25)
 
+# How far back the live cycle pulls Kalshi quotes. This bounds *history*,
+# not which events are seen: every still-open market (next month's ladders,
+# future FOMC meetings) is fetched whatever this is, since the /markets
+# filter only drops markets that closed before the window start.
+# KalshiEventRegimeFilter reads just the latest quote of the nearest open
+# event per series, and open markets carry a daily bid/ask row even on
+# no-trade days, so a couple of weeks is ample. Longer only pulls settled
+# ladders nothing live reads -- extra requests against Kalshi's rate limit.
+KALSHI_LOOKBACK_DAYS = 14
+
 # How much looser ExecutionPolicy's backstop sits than the gate that actually
 # shapes the book. The two caps are not redundant, they are layered:
 # RiskGate.max_weight *clips* proposed weights, so under normal operation no
@@ -382,6 +392,20 @@ def apply_price_cap(panel, max_price: float | None, label: str, audit: AuditLog)
                    symbols=", ".join(expensive), n=len(expensive))
         panel = panel.select(affordable)
     return panel
+
+
+def report_trimmed_bars(repo, label: str, audit: AuditLog) -> None:
+    """Surface any incomplete trailing bars ``repo``'s last fetch dropped
+    (see qbt.data.trim_incomplete_tail) in the audit log and the console --
+    otherwise the only trace a cycle ran on yesterday's closes would be a
+    Python warning and a slightly older ``asof``.
+    """
+    for date, symbols in repo.last_trimmed:
+        print(f"  {label} prices: dropped incomplete bar {date.date()} "
+              f"(no close for {len(symbols)} symbol(s)) -- planning on the "
+              f"last complete bar instead")
+        audit.emit("price_bar_trimmed", sleeve=label, date=str(date.date()),
+                   symbols=", ".join(symbols), n=len(symbols))
 
 
 def _print_holdings(broker_view, label: str) -> None:
@@ -596,9 +620,10 @@ def main() -> int:
             panel = SyntheticRepository(n_symbols=18, seed=42).fetch(
                 start="2010-01-01", end=end)
         else:
-            panel = OpenBBRepository(provider="yfinance",
-                                     cache_dir=".cache/prices").fetch(
-                UNIVERSE, "2010-01-01", end)
+            price_repo = OpenBBRepository(provider="yfinance",
+                                          cache_dir=".cache/prices")
+            panel = price_repo.fetch(UNIVERSE, "2010-01-01", end)
+            report_trimmed_bars(price_repo, "equity", audit)
         panel = apply_price_cap(panel, args.max_price, "equity", audit)
     except Exception as exc:
         audit.emit("data_fetch_failed", error=repr(exc))
@@ -661,8 +686,15 @@ def main() -> int:
                          "volume", "open_interest"],
             ))
         else:
+            # A recent window only, not 2010-onward like the other panels:
+            # the filter reads just the nearest still-open event per series
+            # (horizon_days out), so years of settled ladders are a few
+            # hundred extra candlestick requests -- enough to trip Kalshi's
+            # rate limit on their own -- for nothing the live cycle reads.
+            kalshi_start = str((pd.Timestamp(end) - pd.Timedelta(
+                days=KALSHI_LOOKBACK_DAYS)).date())
             kalshi = KalshiRepository(cache_dir=".cache/kalshi").fetch(
-                "2010-01-01", end)
+                kalshi_start, end)
     except Exception as exc:
         audit.emit("kalshi_fetch_failed", error=repr(exc))
         print(f"  (Kalshi fetch failed, continuing without it: {exc!r})")
@@ -810,10 +842,12 @@ def run_crypto_pipeline(
             crypto_panel = SyntheticRepository(n_symbols=8, seed=99).fetch(
                 start="2010-01-01", end=end)
         else:
-            crypto_panel = OpenBBRepository(
+            crypto_repo = OpenBBRepository(
                 provider="yfinance", cache_dir=".cache/prices",
                 asset_class="crypto",
-            ).fetch(CRYPTOS, "2010-01-01", end)
+            )
+            crypto_panel = crypto_repo.fetch(CRYPTOS, "2010-01-01", end)
+            report_trimmed_bars(crypto_repo, "crypto", audit)
         crypto_panel = apply_price_cap(crypto_panel, args.max_crypto_price,
                                        "crypto", audit)
     except Exception as exc:

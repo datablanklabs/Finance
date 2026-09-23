@@ -20,7 +20,7 @@ from qbt import (
     return_autocorrelation, trailing_signal, walk_forward_splits,
     ParameterSweep, sharpe_haircut,
 )
-from qbt.data import prune_cache, touch_cache
+from qbt.data import prune_cache, touch_cache, trim_incomplete_tail
 from qbt.risk import RiskContext
 
 FAILS = []
@@ -929,6 +929,48 @@ check("live runner weights match a direct gate call",
 
 print("\n  audit record:", plan.audit_record())
 
+# A held position with no price on the decision bar used to be valued at $0
+# -- seen live 2026-09-23, when a blank provider bar made a ~$990 account
+# look like its $107 of cash and tripped the drawdown breaker at 89%. The
+# runner must refuse to plan instead of planning off that valuation.
+_held_sym, _other_sym = panel.symbols[0], panel.symbols[1]
+_blank_close = panel.close.copy()
+_blank_close.iloc[-1, 0] = np.nan              # _held_sym, decision bar only
+_blank_panel = PricePanel(close=_blank_close)
+_held_state = PortfolioState(
+    cash=1_000.0,
+    shares=pd.Series(0.0, index=panel.symbols).add(
+        pd.Series({_held_sym: 10.0, _other_sym: 5.0}), fill_value=0.0),
+    peak_equity=None,
+)
+_refused = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                            min_trade_notional=10.0, max_turnover=None
+                            ).plan(_blank_panel, _held_state)
+check("an unpriced held position means no plan at all, not a $0 valuation",
+      _refused.intents == [] and _refused.decision is None, _refused.warnings)
+check("and the plan says which position and why",
+      any(_held_sym in w and "refusing to plan" in w for w in _refused.warnings),
+      _refused.warnings)
+
+_unheld_state = PortfolioState(
+    cash=1_000.0,
+    shares=pd.Series(0.0, index=panel.symbols).add(
+        pd.Series({_other_sym: 5.0}), fill_value=0.0),
+    peak_equity=None,
+)
+_still_plans = LiveSignalRunner(strategy=strategy, risk_gate=live_gate,
+                                min_trade_notional=10.0, max_turnover=None
+                                ).plan(_blank_panel, _unheld_state)
+check("a missing price on a symbol that isn't held doesn't block planning",
+      not any("refusing to plan" in w for w in _still_plans.warnings)
+      and _still_plans.decision is not None, _still_plans.warnings)
+
+_prices = pd.Series({"A": np.nan, "B": 0.0, "C": np.inf, "D": 5.0, "E": np.nan})
+_ps = PortfolioState(cash=0.0, shares=pd.Series(
+    {"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0, "E": 0.0, "OUTSIDE": 3.0}))
+check("unpriced() flags NaN, zero and infinite prices on held symbols only",
+      _ps.unpriced(_prices) == ["A", "B", "C"], _ps.unpriced(_prices))
+
 # Turnover guard should scale an oversized plan down to fit the cap, not
 # discard it -- except `state` here is a flat book (all-zero shares), and
 # allow_full_turnover_from_flat defaults to True, so the exemption needs to
@@ -1182,6 +1224,118 @@ check("omitting symbols entirely still yields the default universe",
       SyntheticRepository(n_symbols=4).fetch(
           start="2020-01-01", end="2020-03-01").symbols
       == ["SYN000", "SYN001", "SYN002", "SYN003"])
+
+# ---- incomplete trailing bars -------------------------------------------
+# yfinance, 2026-09-23 08:19 ET, returned the previous session's row with
+# open and volume but every close NaN. As the last bar, that valued every
+# held position at nothing and tripped the drawdown breaker at 89% on an
+# account that hadn't lost anything. The fetch must drop such a bar, and
+# must not let the cache pin it.
+import warnings as _warnings
+
+_idx = pd.to_datetime(["2026-09-18", "2026-09-21", "2026-09-22"])
+_nan = float("nan")
+
+
+def _tail_panel(rows):
+    close = pd.DataFrame(rows, index=_idx[-len(rows):], columns=["A", "B"])
+    return PricePanel(close=close, volume=close.fillna(0.0) * 0 + 1.0)
+
+
+with _warnings.catch_warnings(record=True) as _caught:
+    _warnings.simplefilter("always")
+    _trimmed, _dropped = trim_incomplete_tail(
+        _tail_panel([[1.0, 2.0], [1.1, 2.1], [_nan, _nan]]))
+check("an all-NaN-close last bar is dropped",
+      _trimmed.last_date() == pd.Timestamp("2026-09-21")
+      and _dropped == [(pd.Timestamp("2026-09-22"), ["A", "B"])], _dropped)
+check("the drop trims open/volume in step with close",
+      _trimmed.volume.index.equals(_trimmed.close.index))
+check("and says so with a warning naming the date",
+      any("2026-09-22" in str(w.message) for w in _caught),
+      [str(w.message) for w in _caught])
+
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore")
+    _trimmed, _dropped = trim_incomplete_tail(
+        _tail_panel([[1.0, 2.0], [1.1, 2.1], [_nan, 2.2]]))
+check("one symbol missing on the last bar is enough to drop it",
+      _trimmed.last_date() == pd.Timestamp("2026-09-21")
+      and _dropped[0][1] == ["A"], _dropped)
+
+_clean = _tail_panel([[1.0, _nan], [_nan, 2.1], [1.2, 2.2]])
+_trimmed, _dropped = trim_incomplete_tail(_clean)
+check("a gap mid-history is real data and is left alone",
+      _trimmed is _clean and _dropped == [], _dropped)
+
+_delisted = _tail_panel([[1.0, 2.0], [1.1, _nan], [1.2, _nan]])
+_trimmed, _dropped = trim_incomplete_tail(_delisted)
+check("a symbol missing on both of the last two bars doesn't trigger a trim",
+      _trimmed is _delisted and _dropped == [], _dropped)
+
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore")
+    try:
+        trim_incomplete_tail(
+            _tail_panel([[1.0, 2.0], [_nan, 2.1], [_nan, _nan]]), max_bars=1)
+        check("more incomplete bars than max_bars raises rather than planning off old data",
+              False)
+    except ValueError as exc:
+        check("more incomplete bars than max_bars raises rather than planning off old data",
+              "max_trim_bars=1" in str(exc), str(exc))
+
+
+class _TailRepo(OpenBBRepository):
+    """OpenBBRepository with the provider call replaced by a canned tidy
+    frame -- exercises fetch()'s own trim-and-cache logic, no network."""
+
+    def __init__(self, tidy, **kwargs):
+        super().__init__(**kwargs)
+        self.tidy = tidy
+        self.remote_calls = 0
+
+    def _fetch_remote(self, symbols, start, end):
+        self.remote_calls += 1
+        return self.tidy
+
+
+_bad_tidy = pd.DataFrame({
+    "date": pd.to_datetime(["2026-09-21", "2026-09-21", "2026-09-22", "2026-09-22"]),
+    "symbol": ["A", "B", "A", "B"],
+    "close": [1.1, 2.1, _nan, _nan],
+    "open": [1.0, 2.0, 1.2, 2.2],
+    "volume": [10.0, 20.0, 11.0, 21.0],
+})
+_good_tidy = _bad_tidy.assign(close=[1.1, 2.1, 1.2, 2.2])
+
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore")
+    _tail_dir = tempfile.mkdtemp()
+    _bad_repo = _TailRepo(_bad_tidy, cache_dir=_tail_dir)
+    _p = _bad_repo.fetch(["A", "B"], "2026-09-01", "2026-09-23")
+    check("fetch() drops a provider's incomplete last bar",
+          _p.last_date() == pd.Timestamp("2026-09-21")
+          and _p.last_close().notna().all(), _p.last_close().to_dict())
+    check("fetch() reports what it dropped via last_trimmed",
+          [d for d, _ in _bad_repo.last_trimmed] == [pd.Timestamp("2026-09-22")],
+          _bad_repo.last_trimmed)
+    check("a trimmed fetch is not written to the cache",
+          os.listdir(_tail_dir) == [], os.listdir(_tail_dir))
+
+    # An entry cached *before* this guard existed (today's real failure):
+    # served once, trimmed, and removed so the next run refetches.
+    _stale_entry = _bad_repo._cache_path(["A", "B"], "2026-09-01", "2026-09-23")
+    _bad_tidy.to_csv(_stale_entry, index=False)
+    _cached_repo = _TailRepo(_good_tidy, cache_dir=_tail_dir)
+    _p = _cached_repo.fetch(["A", "B"], "2026-09-01", "2026-09-23")
+    check("a cached incomplete bar is trimmed too",
+          _p.last_date() == pd.Timestamp("2026-09-21") and _cached_repo.remote_calls == 0)
+    check("and that cache entry is removed so the next run refetches",
+          not os.path.exists(_stale_entry))
+    _p = _cached_repo.fetch(["A", "B"], "2026-09-01", "2026-09-23")
+    check("the refetch picks up the provider's filled-in close and caches it",
+          _p.last_date() == pd.Timestamp("2026-09-22") and _cached_repo.remote_calls == 1
+          and _cached_repo.last_trimmed == [] and os.path.exists(_stale_entry))
 
 print()
 print("=" * 72)
